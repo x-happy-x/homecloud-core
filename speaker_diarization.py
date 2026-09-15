@@ -25,6 +25,13 @@ import numpy as np
 
 DEFAULT_MODEL = 'pyannote/speaker-diarization-community-1'
 
+# На длинных роликах со сменой акустики (шум, музыка, разное расстояние до
+# микрофона) один и тот же человек иногда расходится на два кластера — их
+# эмбеддинги при этом остаются заметно ближе друг к другу, чем к чужим
+# голосам. Порог подобран по разнице между «тем же человеком» (~0.69–0.70
+# на проверенном ролике) и «разными людьми» (~0.12–0.31) — с запасом.
+MERGE_SIMILARITY = 0.6
+
 
 def connect(catalog):
     db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=30)
@@ -171,6 +178,55 @@ def fail(db, path, size, modified, model, status, message):
             (path, size, modified, model, status, message[:500], now))
 
 
+def merge_close_speakers(turns, speakers, threshold=MERGE_SIMILARITY):
+    """Склеивает кластеры, которые почти наверняка один и тот же голос.
+
+    pyannote иногда разводит одного человека на два кластера, если акустика
+    ролика меняется по ходу записи. Эмбеддинги такой пары остаются заметно
+    ближе друг к другу, чем к любому третьему голосу, — это и есть сигнал
+    для склейки, без разметки руками.
+    """
+    if len(speakers) < 2:
+        return turns, speakers
+    labels = [label for label, _, _ in speakers]
+    vectors = {label: embedding / (np.linalg.norm(embedding) or 1)
+               for label, _, embedding in speakers}
+    parent = {label: label for label in labels}
+
+    def find(label):
+        while parent[label] != label:
+            parent[label] = parent[parent[label]]
+            label = parent[label]
+        return label
+
+    def union(a, b):
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    for i, a in enumerate(labels):
+        for b in labels[i + 1:]:
+            if float(np.dot(vectors[a], vectors[b])) >= threshold:
+                union(a, b)
+
+    mapping = {label: find(label) for label in labels}
+    if len(set(mapping.values())) == len(labels):
+        return turns, speakers  # склеивать было нечего
+
+    merged_turns = [(start, stop, mapping[speaker]) for start, stop, speaker in turns]
+    seconds = {label: total for label, total, _ in speakers}
+    merged_speakers = []
+    for canonical in sorted(set(mapping.values())):
+        members = [label for label in labels if mapping[label] == canonical]
+        total = sum(seconds[label] for label in members)
+        # Эмбеддинг склеенного голоса — средний по говорившей доле времени,
+        # а не по кластерам: длинный кусок должен весить больше короткого.
+        weighted = sum(vectors[label] * seconds[label] for label in members)
+        weighted = weighted / (np.linalg.norm(weighted) or 1)
+        merged_speakers.append((canonical, round(total, 2), weighted))
+    return merged_turns, merged_speakers
+
+
 def diarize(pipeline, audio):
     """Интервалы говорящих и их эмбеддинги — простыми объектами, без pyannote наружу."""
     import torch
@@ -260,6 +316,7 @@ def main():
         try:
             audio = decode_audio(path, sampling_rate=16000)
             turns, speakers = diarize(pipeline, audio)
+            turns, speakers = merge_close_speakers(turns, speakers)
             save(db, path, size, modified, args.model, turns, speakers)
             state['multi_speaker' if len(speakers) > 1 else 'single_speaker'] += 1
         except Exception as exc:
