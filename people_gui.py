@@ -49,8 +49,15 @@ class CatalogStore:
             self.db.execute('ALTER TABLE people ADD COLUMN bigfam_id TEXT')
             self.db.commit()
         # Лицо из ролика помнит свою секунду; в каталоге без видео колонки ещё нет.
-        if 'frame_time' not in {row[1] for row in self.db.execute('PRAGMA table_info(faces)')}:
+        face_columns = {row[1] for row in self.db.execute('PRAGMA table_info(faces)')}
+        if 'frame_time' not in face_columns:
             self.db.execute('ALTER TABLE faces ADD COLUMN frame_time REAL')
+            self.db.commit()
+        if 'track_start' not in face_columns:
+            # Трек — промежуток времени, а не одна секунда; у фото и старых
+            # видеозаписей, снятых ещё покадрово, эти колонки пустые.
+            self.db.execute('ALTER TABLE faces ADD COLUMN track_start REAL')
+            self.db.execute('ALTER TABLE faces ADD COLUMN track_stop REAL')
             self.db.commit()
         self.min_cluster_size = min_cluster_size
         self.chunk = max(200, chunk)

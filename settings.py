@@ -20,7 +20,12 @@ CREATE TABLE IF NOT EXISTS settings (
 DEFAULTS = {
     # видео
     'video_enabled': True,
-    'video_frames': 12,
+    # раз в сколько секунд искать лица: чаще — плотнее треки, но дольше счёт
+    'video_track_step': 0.5,
+    # если трек не удалось продолжить дольше стольких секунд — он закрывается
+    'video_track_gap': 1.2,
+    # сколько самых уверенных кадров трека усредняется в итоговый эмбеддинг
+    'video_track_best': 8,
     'video_min_seconds': 0.0,
     'video_max_seconds': 0.0,
     # сколько кадров ролика смотрит проверка 18+: одного кадра из начала мало —
@@ -54,7 +59,9 @@ DEFAULTS = {
 }
 
 LIMITS = {
-    'video_frames': (1, 300),
+    'video_track_step': (0.1, 5.0),
+    'video_track_gap': (0.3, 10.0),
+    'video_track_best': (1, 30),
     'adult_video_frames': (1, 20),
     'video_min_seconds': (0.0, 3600.0),
     'video_max_seconds': (0.0, 86400.0),

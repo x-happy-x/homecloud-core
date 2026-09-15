@@ -16,6 +16,7 @@ os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
 import pathrules
 import settings as catalog_settings
 import video as video_media
+import video_tracks
 
 PICTURES = {'.jpg', '.jpeg', '.png', '.webp'}
 SUPPORTED = PICTURES | video_media.SUPPORTED
@@ -58,9 +59,15 @@ def database(folder, check_same_thread=True):
         db.execute("ALTER TABLE photos ADD COLUMN kind TEXT NOT NULL DEFAULT 'photo'")
     if 'duration' not in columns:
         db.execute('ALTER TABLE photos ADD COLUMN duration REAL')
-    if 'frame_time' not in {row[1] for row in db.execute('PRAGMA table_info(faces)')}:
+    face_columns = {row[1] for row in db.execute('PRAGMA table_info(faces)')}
+    if 'frame_time' not in face_columns:
         # Лицо из ролика помнит, на какой секунде его нашли.
         db.execute('ALTER TABLE faces ADD COLUMN frame_time REAL')
+    if 'track_start' not in face_columns:
+        # Трек — не один момент, а промежуток: с какой секунды по какую
+        # лицо было в кадре. У фотографий и старых записей — NULL.
+        db.execute('ALTER TABLE faces ADD COLUMN track_start REAL')
+        db.execute('ALTER TABLE faces ADD COLUMN track_stop REAL')
     db.commit()
     return db
 
@@ -188,7 +195,7 @@ def scan(args):
             'completed': processed + ignored + skipped + errors,
             'processed': processed, 'ignored': ignored, 'skipped': skipped,
             'errors': errors, 'faces_found': faces_found, 'videos_done': videos_done,
-            'videos_total': videos_total, 'video_frames': options['video_frames'],
+            'videos_total': videos_total, 'video_track_step': options['video_track_step'],
             'pid': os.getpid(), 'started_at': started_at, 'updated_at': now,
         }
         temporary = progress_file.with_suffix(progress_file.suffix + '.tmp')
@@ -292,10 +299,11 @@ def scan(args):
     if min_side:
         signature = stamp('scan-filters-v2', {'min_side': min_side})
     legacy.discard(signature)
-    # У роликов своя подпись: поменяли число кадров — пересчитываются только они,
-    # фотографии остаются нетронутыми.
-    video_signature = stamp('video-v1', {
-        'frames': options['video_frames'], 'min_side': min_side,
+    # У роликов своя подпись: поменяли параметры трекинга — пересчитываются
+    # только они, фотографии остаются нетронутыми.
+    video_signature = stamp('video-tracks-v1', {
+        'step': options['video_track_step'], 'gap': options['video_track_gap'],
+        'best': options['video_track_best'], 'min_side': min_side,
         'from': options['video_min_seconds'], 'to': options['video_max_seconds']})
 
     db = database(data)
@@ -397,14 +405,24 @@ def scan(args):
                         ignored += 1
                         publish('running', str(path))
                         continue
-                    taken = 0
-                    for moment, frame in video_media.frames(
-                            path, options['video_frames'], stop=options['video_max_seconds'],
-                            stop_check=lambda: bool(stop_file and stop_file.exists())):
-                        results.extend(find_faces(video_media.to_image(frame), round(moment, 3),
-                                                  f'{taken}:'))
-                        taken += 1
-                    print(f'  {filename}: кадров {taken} из {info["frames"]}', flush=True)
+                    tracks = video_tracks.find_tracks(
+                        path, models, step_seconds=options['video_track_step'],
+                        gap_seconds=options['video_track_gap'],
+                        best_frames=options['video_track_best'],
+                        stop_seconds=options['video_max_seconds'],
+                        stop_check=lambda: bool(stop_file and stop_file.exists()))
+                    for number, track in enumerate(tracks):
+                        token = hashlib.sha256(
+                            f'{key}:{stat.st_mtime_ns}:{kind_signature}:{number}'.encode()
+                        ).hexdigest()
+                        thumbnail = f'thumbnails/{token}.jpg'
+                        track['extra'].save(data / thumbnail)
+                        results.append((
+                            key, json.dumps([round(value, 1) for value in track['box']]),
+                            track['embedding'].tobytes(), thumbnail,
+                            round(track['frame_time'], 3),
+                            round(track['start'], 3), round(track['stop'], 3)))
+                    print(f'  {filename}: треков {len(tracks)}', flush=True)
                 else:
                     with Image.open(path) as original:
                         img = ImageOps.exif_transpose(original).convert('RGB')
@@ -465,39 +483,74 @@ def same_moment(first, second, tolerance=0.25):
     return abs(float(first) - float(second)) <= tolerance
 
 
-def merge_faces(db, key, results, threshold=0.45):
-    """Обновляем прежние лица файла вместо удаления: к ним привязаны имена."""
+def ranges_close(first_start, first_stop, second_start, second_stop, gap=0.75):
+    """Пересекаются ли два промежутка времени (с небольшим запасом)."""
+    if None in (first_start, first_stop, second_start, second_stop):
+        return False
+    return first_start <= second_stop + gap and second_start <= first_stop + gap
+
+
+def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5):
+    """Обновляем прежние лица файла вместо удаления: к ним привязаны имена.
+
+    У фото и старых покадровых видеозаписей результат совпадает с прежним
+    лицом по рамке в тот же момент. У треков момента одного нет — трек это
+    промежуток, а рамка по ходу трека меняется, — поэтому им подошло бы
+    только сравнение с прежним треком, который пересекается по времени и
+    похож по голосу эмбеддинга: это тот же человек в том же куске ролика.
+    """
+    import numpy as np
     previous = []
-    for face_id, raw_box, moment in db.execute(
-            'SELECT id,box,frame_time FROM faces WHERE path=?', (key,)):
+    for face_id, raw_box, moment, track_start, track_stop, raw_embedding in db.execute(
+            'SELECT id,box,frame_time,track_start,track_stop,embedding FROM faces '
+            'WHERE path=?', (key,)):
         try:
-            previous.append((face_id, [float(value) for value in json.loads(raw_box)], moment))
+            box = [float(value) for value in json.loads(raw_box)]
         except (TypeError, ValueError, json.JSONDecodeError):
-            previous.append((face_id, None, moment))
+            box = None
+        embedding = np.frombuffer(raw_embedding, dtype='<f4') if raw_embedding else None
+        previous.append((face_id, box, moment, track_start, track_stop, embedding))
     taken = set()
     for item in results:
         path_key, box_json, embedding, thumbnail = item[:4]
         moment = item[4] if len(item) > 4 else None
+        track_start = item[5] if len(item) > 5 else None
+        track_stop = item[6] if len(item) > 6 else None
         box = [float(value) for value in json.loads(box_json)]
-        best, best_overlap = None, threshold
-        for face_id, old_box, old_moment in previous:
-            # Кадры ролика — разные сцены: рамки сравниваем только внутри секунды.
-            if face_id in taken or old_box is None or not same_moment(moment, old_moment):
-                continue
-            value = overlap(box, old_box)
-            if value >= best_overlap:
-                best, best_overlap = face_id, value
+        best, best_score = None, 0.0
+        if track_start is not None:
+            vector = np.frombuffer(embedding, dtype='<f4')
+            for face_id, _, _, old_start, old_stop, old_vector in previous:
+                if (face_id in taken or old_vector is None
+                        or not ranges_close(track_start, track_stop, old_start, old_stop)):
+                    continue
+                denom = (np.linalg.norm(vector) * np.linalg.norm(old_vector)) or 1.0
+                score = float(np.dot(vector, old_vector) / denom)
+                if score >= track_embedding_threshold and score > best_score:
+                    best, best_score = face_id, score
+        else:
+            for face_id, old_box, old_moment, old_start, _, _ in previous:
+                # Кадры ролика — разные сцены: рамки сравниваем только внутри секунды.
+                # Прежний трек рамкой не сравниваем — она за трек успела уехать.
+                if (face_id in taken or old_box is None or old_start is not None
+                        or not same_moment(moment, old_moment)):
+                    continue
+                score = overlap(box, old_box)
+                if score >= threshold and score > best_score:
+                    best, best_score = face_id, score
         if best is None:
             db.execute(
-                'INSERT INTO faces(path,box,embedding,thumbnail,frame_time) VALUES(?,?,?,?,?)',
-                (path_key, box_json, embedding, thumbnail, moment))
+                'INSERT INTO faces(path,box,embedding,thumbnail,frame_time,'
+                'track_start,track_stop) VALUES(?,?,?,?,?,?,?)',
+                (path_key, box_json, embedding, thumbnail, moment, track_start, track_stop))
             continue
         taken.add(best)
-        db.execute('UPDATE faces SET box=?,embedding=?,thumbnail=?,frame_time=? WHERE id=?',
-                   (box_json, embedding, thumbnail, moment, best))
+        db.execute('UPDATE faces SET box=?,embedding=?,thumbnail=?,frame_time=?,'
+                  'track_start=?,track_stop=? WHERE id=?',
+                   (box_json, embedding, thumbnail, moment, track_start, track_stop, best))
         # Вектор изменился — метку кластера пересчитаем, имя остаётся.
         db.execute('DELETE FROM face_clusters WHERE face_id=?', (best,))
-    stale = [(face_id,) for face_id, _, _ in previous if face_id not in taken]
+    stale = [(face_id,) for face_id, *_ in previous if face_id not in taken]
     if stale:
         db.executemany('DELETE FROM faces WHERE id=?', stale)
     return len(taken), len(results) - len(taken), len(stale)
