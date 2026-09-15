@@ -790,15 +790,18 @@ class App:
             if not path.is_file():
                 continue
             try:
-                image = video_media.open_frame(path)
+                source_image = video_media.open_frame(path)
                 try:
-                    image = image.convert('RGB')
-                    image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-                    output = io.BytesIO()
-                    image.save(output, 'JPEG', quality=88, optimize=True)
-                    encoded.append((raw_path, output.getvalue()))
+                    image = source_image.convert('RGB')
+                    try:
+                        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+                        output = io.BytesIO()
+                        image.save(output, 'JPEG', quality=88, optimize=True)
+                        encoded.append((raw_path, output.getvalue()))
+                    finally:
+                        image.close()
                 finally:
-                    image.close()
+                    source_image.close()
             except (OSError, ValueError) as exc:
                 print(f'Router batch skipped {raw_path}: {exc}', file=sys.stderr, flush=True)
                 continue
