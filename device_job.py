@@ -139,7 +139,8 @@ def run(args):
             publish(args, 'stopped', 'inventory', inventory=summary)
             return
         if not any(args.features.get(name) for name in
-                   ('faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize')):
+                   ('faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize',
+                    'authenticity')):
             publish(args, 'completed', 'complete', completed=summary.get('total', 0),
                     total=summary.get('total', 0),
                     finished_at=datetime.now(timezone.utc).isoformat(),
@@ -152,6 +153,7 @@ def run(args):
     vision_python = workspace / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
     ocr_python = Path(r'C:\cv-ocr\Scripts\python.exe')
     audio_python = workspace / 'work' / 'audio-venv' / 'Scripts' / 'python.exe'
+    imgutils_python = workspace / 'work' / 'imgutils-venv' / 'Scripts' / 'python.exe'
     stage = args.progress_file.with_name('device-stage-progress.json')
 
     if args.features.get('faces') and args.path:
@@ -183,7 +185,7 @@ def run(args):
                 publish(args, 'stopped', 'faces')
                 return
     elif any(args.features.get(name) for name in
-             ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize')):
+             ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', 'authenticity')):
         if inventory(args).get('stopped'):
             publish(args, 'stopped', 'inventory')
             return
@@ -261,6 +263,15 @@ def run(args):
                   *force, *root_args], 'speech')
     if args.stop_file.exists():
         publish(args, 'stopped', 'speech')
+        return
+
+    if args.features.get('authenticity'):
+        run_child(args, [str(imgutils_python), str(here / 'authenticity_photos.py'),
+                  '--catalog', str(args.catalog), '--limit', '1000000',
+                  '--progress-file', str(stage), '--stop-file', str(args.stop_file),
+                  *force, *root_args], 'authenticity')
+    if args.stop_file.exists():
+        publish(args, 'stopped', 'authenticity')
         return
 
     if args.features.get('diarize'):

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
+from authenticity_photos import ANIME_THRESHOLD
 from prototype import cluster_embeddings, database
 
 
@@ -59,6 +60,15 @@ class CatalogStore:
             self.db.execute('ALTER TABLE faces ADD COLUMN track_start REAL')
             self.db.execute('ALTER TABLE faces ADD COLUMN track_stop REAL')
             self.db.commit()
+        # Мультяшных и игровых персонажей, которых детектор принял за лица,
+        # отдельный этап помечает сюда — группировка их обходит стороной.
+        self.db.execute('''
+            CREATE TABLE IF NOT EXISTS face_authenticity (
+              face_id INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
+              real_score REAL NOT NULL, anime_score REAL NOT NULL,
+              model TEXT NOT NULL, analyzed_at TEXT NOT NULL
+            )''')
+        self.db.commit()
         self.min_cluster_size = min_cluster_size
         self.chunk = max(200, chunk)
         self.assign_threshold = assign_threshold
@@ -223,10 +233,15 @@ class CatalogStore:
                 'JOIN people ON people.id=face_people.person_id'):
             assigned[(row[1], row[2], row[3])].append(row[0])
         excluded = {row[0] for row in self.db.execute('SELECT face_id FROM face_exclusions')}
+        # Мультяшный или игровой персонаж, которого детектор принял за лицо —
+        # не человек, группировать не о чем. Имя, если уже назначено кем-то
+        # вручную, важнее любой автоматической догадки — до сюда не доходит.
+        anime = {row[0] for row in self.db.execute(
+            'SELECT face_id FROM face_authenticity WHERE anime_score>=?', (ANIME_THRESHOLD,))}
         assigned_ids = {face_id for members in assigned.values() for face_id in members}
         automatic = defaultdict(list)
         for face_id, label in self.auto_labels.items():
-            if face_id not in assigned_ids and face_id not in excluded:
+            if face_id not in assigned_ids and face_id not in excluded and face_id not in anime:
                 automatic[label].append(face_id)
 
         result = [

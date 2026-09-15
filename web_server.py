@@ -340,7 +340,8 @@ class RouterController:
 
 class DeviceController:
     """Expose this computer as a configurable HomeCloud worker device."""
-    FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize')
+    FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize',
+               'authenticity')
 
     def __init__(self, catalog, device_id=None, device_name=None):
         self.root = Path(__file__).resolve().parent
@@ -514,6 +515,8 @@ class DeviceController:
                             / 'python.exe').is_file()
                            and (Path(r'C:\cv-models\huggingface').is_dir()
                                 or (self.root / 'hf-token.txt').is_file())),
+                'authenticity': (self.root.parents[1] / 'work' / 'imgutils-venv' / 'Scripts'
+                                / 'python.exe').is_file(),
             },
         }
 
@@ -581,6 +584,10 @@ class DeviceController:
                     "SELECT COUNT(*) FROM video_speech WHERE status='ok' AND text!=''").fetchone()[0]
                 payload['catalog_diarized'] = db.execute(
                     "SELECT COUNT(*) FROM video_diarization WHERE status='ok'").fetchone()[0]
+                payload['catalog_authenticity'] = db.execute(
+                    'SELECT COUNT(*) FROM face_authenticity').fetchone()[0]
+                payload['catalog_anime_faces'] = db.execute(
+                    'SELECT COUNT(*) FROM face_authenticity WHERE anime_score>=0.85').fetchone()[0]
                 db.close()
             except sqlite3.Error:
                 pass
