@@ -25,6 +25,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 import albums
+import people_albums
 import catalog_index
 import duplicates
 import pathrules
@@ -758,6 +759,7 @@ class App:
         self.store = CatalogStore(data, min_cluster_size, thread_safe=True,
                                   max_faces=max_faces)
         albums.ensure_schema(self.store.db)
+        people_albums.ensure_schema(self.store.db)
         privacy.ensure_schema(self.store.db)
         pathrules.ensure_column(self.store.db)
         duplicates.ensure_schema(self.store.db)
@@ -868,7 +870,7 @@ class App:
         return {**group, 'face_ids': [face_id for face_id in group['face_ids']
                                       if face_id not in masked]}
 
-    def group_payload(self, group, include_faces=False):
+    def group_payload(self, group, include_faces=False, albums_by_key=None, hidden_keys=None):
         face_ids = group['face_ids']
         payload = {
             'key': group['key'], 'title': group['title'], 'name': group['name'],
@@ -880,6 +882,8 @@ class App:
             'avatar_pinned': bool(group.get('avatar_pinned')),
             'avatar': (f"/media/face-crop/{group['avatar_face']}?size=400"
                        if group.get('avatar_face') else ''),
+            'albums': (albums_by_key or {}).get(group['key'], []),
+            'hidden': group['key'] in (hidden_keys or ()),
         }
         if include_faces:
             payload['faces'] = [self.face_payload(face_id) for face_id in face_ids]
@@ -908,6 +912,19 @@ class App:
                 self.store.refresh_labels()
             groups = [self.without(group, masked) for group in self.store.groups()]
             groups = [group for group in groups if group['face_ids']]
+            # Скрытый альбом — решение владельца картотеки, не приватность
+            # снимка: обычный зритель группу не видит вовсе, админ видит и
+            # управляет (group_payload помечает hidden, чтобы показать иначе).
+            hidden_keys = people_albums.hidden_group_keys(self.store.db)
+            if not admin:
+                groups = [group for group in groups if group['key'] not in hidden_keys]
+            albums_by_key = people_albums.group_albums(
+                self.store.db, [group['key'] for group in groups])
+            album_tree = people_albums.tree(self.store.db)
+            if not admin:
+                # Обычный зритель не должен даже знать о существовании
+                # скрытого альбома, не то что о его составе.
+                album_tree = [item for item in album_tree if not item['effectively_hidden']]
             named = [group for group in groups if group['kind'] == 'person']
             shown = {face_id for group in groups for face_id in group['face_ids']}
             return {
@@ -932,7 +949,9 @@ class App:
                     'review': sum(len(group['face_ids']) for group in groups
                                   if group['kind'] in {'noise', 'excluded'}),
                 },
-                'groups': [self.group_payload(group) for group in groups],
+                'groups': [self.group_payload(group, albums_by_key=albums_by_key,
+                                              hidden_keys=hidden_keys) for group in groups],
+                'people_albums': album_tree,
                 'people': [{'name': group['name'], 'count': len(group['face_ids']),
                             'bigfam_id': group.get('bigfam_id'),
                             'avatar': (f"/media/face-crop/{group['avatar_face']}?size=200"
@@ -1940,6 +1959,37 @@ class Handler(BaseHTTPRequestHandler):
                         return self.error_json(404, 'Неизвестное действие с альбомом')
                     return self.json_response({'ok': True, **result,
                                                'albums': albums.tree(db)})
+            if path.startswith('/api/people-albums/'):
+                action = path.rsplit('/', 1)[-1]
+                viewer, admin = self.viewer
+                with self.app.lock:
+                    db = self.app.store.db
+                    if action == 'hidden' and not admin:
+                        return self.error_json(403, 'Скрывать альбомы может только администратор')
+                    if action == 'create':
+                        album_id = people_albums.create(db, body.get('title', ''),
+                                                        body.get('parent_id', 0))
+                        if body.get('group_keys'):
+                            people_albums.set_members(db, album_id, add=body['group_keys'])
+                        result = {'id': album_id}
+                    elif action == 'rename':
+                        people_albums.rename(db, body.get('id'), body.get('title', ''))
+                        result = {'id': body.get('id')}
+                    elif action == 'move':
+                        people_albums.move(db, body.get('id'), body.get('parent_id', 0))
+                        result = {'id': body.get('id')}
+                    elif action == 'delete':
+                        result = {'removed': people_albums.remove(db, body.get('id'))}
+                    elif action == 'members':
+                        result = {'members': people_albums.set_members(
+                            db, body.get('id'), body.get('add', []), body.get('remove', []))}
+                    elif action == 'hidden':
+                        people_albums.set_hidden(db, body.get('id'), bool(body.get('hidden')))
+                        result = {'id': body.get('id')}
+                    else:
+                        return self.error_json(404, 'Неизвестное действие с альбомом')
+                    return self.json_response({'ok': True, **result,
+                                               'state': self.app.state(viewer, admin)})
             if path == '/api/photos/delete':
                 return self.json_response({'ok': True, **self.app.delete_photos(
                     body.get('paths', []))})
