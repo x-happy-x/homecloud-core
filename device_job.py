@@ -139,7 +139,7 @@ def run(args):
             publish(args, 'stopped', 'inventory', inventory=summary)
             return
         if not any(args.features.get(name) for name in
-                   ('faces', 'visual', 'ocr', 'caption', 'adult', 'speech')):
+                   ('faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize')):
             publish(args, 'completed', 'complete', completed=summary.get('total', 0),
                     total=summary.get('total', 0),
                     finished_at=datetime.now(timezone.utc).isoformat(),
@@ -183,7 +183,7 @@ def run(args):
                 publish(args, 'stopped', 'faces')
                 return
     elif any(args.features.get(name) for name in
-             ('visual', 'ocr', 'caption', 'adult', 'speech')):
+             ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize')):
         if inventory(args).get('stopped'):
             publish(args, 'stopped', 'inventory')
             return
@@ -261,6 +261,18 @@ def run(args):
                   *force, *root_args], 'speech')
     if args.stop_file.exists():
         publish(args, 'stopped', 'speech')
+        return
+
+    if args.features.get('diarize'):
+        # Тот же офлайн-манёвр, что и у речи: закачка модели должна идти в сеть.
+        os.environ.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_OFFLINE='0',
+                          HF_HUB_DISABLE_SYMLINKS_WARNING='1', PYTHONUTF8='1')
+        run_child(args, [str(audio_python), str(here / 'speaker_diarization.py'),
+                  '--catalog', str(args.catalog), '--limit', '100000000',
+                  '--progress-file', str(stage), '--stop-file', str(args.stop_file),
+                  *force, *root_args], 'diarize')
+    if args.stop_file.exists():
+        publish(args, 'stopped', 'diarize')
         return
 
     publish(args, 'completed', 'complete', completed=1, total=1,

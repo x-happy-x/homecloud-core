@@ -19,6 +19,7 @@ import threading
 import time
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import webbrowser
+import zipfile
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -31,6 +32,7 @@ import privacy
 import reverse_search
 import router_learning
 import settings as catalog_settings
+import speaker_diarization
 import speech_videos
 import video as video_media
 from people_gui import CatalogStore
@@ -338,7 +340,7 @@ class RouterController:
 
 class DeviceController:
     """Expose this computer as a configurable HomeCloud worker device."""
-    FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult', 'speech')
+    FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize')
 
     def __init__(self, catalog, device_id=None, device_name=None):
         self.root = Path(__file__).resolve().parent
@@ -508,6 +510,10 @@ class DeviceController:
                     r'C:\cv-models\huggingface\hub\models--SmilingWolf--wd-eva02-large-tagger-v3').is_dir(),
                 'speech': (self.root.parents[1] / 'work' / 'audio-venv' / 'Scripts'
                            / 'python.exe').is_file(),
+                'diarize': ((self.root.parents[1] / 'work' / 'audio-venv' / 'Scripts'
+                            / 'python.exe').is_file()
+                           and (Path(r'C:\cv-models\huggingface').is_dir()
+                                or (self.root / 'hf-token.txt').is_file())),
             },
         }
 
@@ -573,6 +579,8 @@ class DeviceController:
                     "SELECT COUNT(*) FROM photo_adult_analysis WHERE status='ok' AND rating!='safe'").fetchone()[0]
                 payload['catalog_speech'] = db.execute(
                     "SELECT COUNT(*) FROM video_speech WHERE status='ok' AND text!=''").fetchone()[0]
+                payload['catalog_diarized'] = db.execute(
+                    "SELECT COUNT(*) FROM video_diarization WHERE status='ok'").fetchone()[0]
                 db.close()
             except sqlite3.Error:
                 pass
@@ -747,6 +755,7 @@ class App:
         pathrules.ensure_column(self.store.db)
         duplicates.ensure_schema(self.store.db)
         router_learning.connect(data).close()
+        speaker_diarization.connect(data).close()
         speech_videos.connect(data).close()
         self.folders = albums.Folders(self.store.db)
         self.duplicates = DuplicateService(data)
@@ -766,6 +775,57 @@ class App:
         row = self.store.db.execute(
             'SELECT stored FROM hidden_photos WHERE path=?', (str(path),)).fetchone()
         return Path(row[0]) if row else Path(path)
+
+    def router_batch_archive(self, hide_adult=False):
+        """Build a private offline review pack without exposing original paths."""
+        reserved = router_learning.pending_batch_paths(self.catalog_folder)
+        candidates = router_learning.review_queue(
+            self.catalog_folder, 100, hide_adult=hide_adult)
+        encoded = []
+        for item in candidates:
+            raw_path = item['path']
+            if raw_path in reserved:
+                continue
+            path = self.file_for(raw_path).resolve()
+            if not path.is_file():
+                continue
+            try:
+                image = video_media.open_frame(path)
+                try:
+                    image = image.convert('RGB')
+                    image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+                    output = io.BytesIO()
+                    image.save(output, 'JPEG', quality=88, optimize=True)
+                    encoded.append((raw_path, output.getvalue()))
+                finally:
+                    image.close()
+            except (OSError, ValueError) as exc:
+                print(f'Router batch skipped {raw_path}: {exc}', file=sys.stderr, flush=True)
+                continue
+            if len(encoded) == 10:
+                break
+        batch = router_learning.create_batch(
+            self.catalog_folder, [path for path, _ in encoded])
+        pictures = dict(encoded)
+        public_items = [{'file': item['file']} for item in batch['items']]
+        template = {'batch_id': batch['batch_id'],
+                    'items': [{'file': item['file'], 'labels': []} for item in public_items]}
+        manifest = {'batch_id': batch['batch_id'],
+                    'embedding_model': batch['embedding_model'], 'items': public_items}
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=6) as package:
+            for item in batch['items']:
+                package.writestr(item['file'], pictures[item['path']])
+            package.writestr('categories.json', json.dumps(
+                router_learning.batch_categories(), ensure_ascii=False, indent=2))
+            package.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+            package.writestr('answer-template.json', json.dumps(
+                template, ensure_ascii=False, indent=2))
+            package.writestr('prompt.txt', router_learning.batch_prompt(
+                batch['batch_id'], [item['file'] for item in public_items]))
+        stamp = datetime.now().strftime('%Y%m%d-%H%M')
+        return archive.getvalue(), f'homecloud-review-{stamp}-{batch["batch_id"][:8]}.zip'
 
     def masked_faces(self, viewer='', admin=False, hide_adult=False):
         """Лица, которых этому зрителю видеть не положено."""
@@ -1454,6 +1514,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_headers(status, 'application/json; charset=utf-8', len(body))
         self.wfile.write(body)
 
+    def download_response(self, body, filename, content_type='application/octet-stream'):
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.end_headers()
+        self.wfile.write(body)
+
     def error_json(self, status, message):
         self.json_response({'error': message}, status)
 
@@ -1486,6 +1556,11 @@ class Handler(BaseHTTPRequestHandler):
                     {**cards[item['path']], 'router_scores': item['scores'],
                      'router_uncertainty': item['uncertainty']}
                     for item in queue if item['path'] in cards]})
+            if parsed.path == '/api/router/export':
+                query = parse_qs(parsed.query)
+                body, filename = self.app.router_batch_archive(
+                    query.get('adult', [''])[0] == 'hide')
+                return self.download_response(body, filename, 'application/zip')
             if parsed.path == '/api/device':
                 return self.json_response(self.app.device.info())
             if parsed.path == '/api/device/job':
@@ -1591,13 +1666,17 @@ class Handler(BaseHTTPRequestHandler):
                         'SELECT language,status,model FROM video_speech WHERE path=?',
                         (raw_path,)).fetchone()
                     segments = self.app.store.db.execute(
-                        'SELECT start,stop,text FROM video_speech_segments '
+                        'SELECT start,stop,text,speaker FROM video_speech_segments '
                         'WHERE path=? ORDER BY ord', (raw_path,)).fetchall()
+                    speakers = self.app.store.db.execute(
+                        'SELECT speaker,seconds FROM video_speakers WHERE path=?',
+                        (raw_path,)).fetchall()
                 return self.json_response({
                     'status': row[1] if row else '', 'language': (row and row[0]) or '',
-                    'model': (row and row[2]) or '',
-                    'segments': [{'start': start, 'stop': stop, 'text': text}
-                                 for start, stop, text in segments]})
+                    'model': (row and row[2]) or '', 'speakers': len(speakers),
+                    'segments': [{'start': start, 'stop': stop, 'text': text,
+                                  'speaker': speaker}
+                                 for start, stop, text, speaker in segments]})
             if parsed.path.startswith('/media/thumb/'):
                 return self.send_media(parsed.path.rsplit('/', 1)[-1], original=False)
             if parsed.path.startswith('/media/original/'):
@@ -1669,6 +1748,19 @@ class Handler(BaseHTTPRequestHandler):
                     auto_started = True
                 return self.json_response({'ok': True, 'labels': labels,
                                            'similar': similar, 'auto_started': auto_started})
+            if path == '/api/router/import':
+                viewer, _ = self.viewer
+                result = router_learning.import_batch(
+                    self.app.catalog_folder, body, viewer)
+                overview = router_learning.summary(self.app.catalog_folder)
+                auto_started = False
+                if (overview['auto_train'] and overview['reviewed'] >= 12
+                        and overview['new_since_training'] >= overview['auto_train_every']
+                        and not self.app.router.status().get('active')):
+                    self.app.router.start('train')
+                    auto_started = True
+                return self.json_response({'ok': True, **result,
+                                           'auto_started': auto_started})
             if path == '/api/router/activate':
                 router_learning.activate(self.app.catalog_folder, body.get('version', ''))
                 return self.json_response({'ok': True})

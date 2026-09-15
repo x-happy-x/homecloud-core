@@ -15,6 +15,7 @@ device-*progress*.json
 
 # Секреты
 backend-token.txt
+hf-token.txt
 
 __pycache__/
 *.py[cod]

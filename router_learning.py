@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import time
+import uuid
 
 import numpy as np
 
@@ -99,6 +100,16 @@ CREATE TABLE IF NOT EXISTS router_models (
   status TEXT NOT NULL, trained_at TEXT NOT NULL, dataset_size INTEGER NOT NULL,
   labels_json TEXT NOT NULL, metrics_json TEXT NOT NULL, model_path TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS router_batches (
+  id TEXT PRIMARY KEY, created_at TEXT NOT NULL, status TEXT NOT NULL,
+  embedding_model TEXT NOT NULL, imported_at TEXT, source_name TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS router_batch_items (
+  batch_id TEXT NOT NULL REFERENCES router_batches(id) ON DELETE CASCADE,
+  item_name TEXT NOT NULL, path TEXT NOT NULL REFERENCES photos(path) ON DELETE CASCADE,
+  PRIMARY KEY(batch_id,item_name), UNIQUE(batch_id,path)
+);
+CREATE INDEX IF NOT EXISTS router_batches_status ON router_batches(status,created_at);
 '''
 
 
@@ -141,6 +152,138 @@ def label_payload():
             for key, value in LABELS.items()]
 
 
+def batch_categories():
+    """Machine-readable vocabulary shipped with every offline review batch."""
+    groups = {label: group for group, labels in LABEL_GROUPS.items() for label in labels}
+    return [{'id': key, 'title_ru': value[0], 'group_ru': groups.get(key, 'Другое'),
+             'meaning_en': value[1]} for key, value in LABELS.items()]
+
+
+def pending_batch_paths(catalog):
+    """Do not put one photo into several outstanding archives at once."""
+    db = connect(catalog)
+    try:
+        # An abandoned package stops reserving photos after seven days.
+        db.execute("UPDATE router_batches SET status='expired' WHERE status='exported' "
+                   "AND datetime(created_at) < datetime('now','-7 days')")
+        db.commit()
+        return {row[0] for row in db.execute('''SELECT i.path FROM router_batch_items i
+            JOIN router_batches b ON b.id=i.batch_id WHERE b.status='exported' ''')}
+    finally:
+        db.close()
+
+
+def create_batch(catalog, paths):
+    if not paths:
+        raise ValueError('В очереди нет фотографий для нового пакета')
+    paths = list(dict.fromkeys(str(path) for path in paths))[:10]
+    db = connect(catalog)
+    try:
+        model = catalog_settings.read(db)['visual_model']
+        batch_id = uuid.uuid4().hex
+        items = [{'file': f'{index:02d}.jpg', 'path': path}
+                 for index, path in enumerate(paths, 1)]
+        with db:
+            db.execute('INSERT INTO router_batches(id,created_at,status,embedding_model) '
+                       'VALUES(?,?,?,?)', (batch_id, now(), 'exported', model))
+            db.executemany('INSERT INTO router_batch_items(batch_id,item_name,path) VALUES(?,?,?)',
+                           [(batch_id, item['file'], item['path']) for item in items])
+        return {'batch_id': batch_id, 'embedding_model': model, 'items': items}
+    finally:
+        db.close()
+
+
+def batch_prompt(batch_id, item_names):
+    files = ', '.join(item_names)
+    return f'''Проверь все 10 или меньше изображений из этого архива: {files}.
+
+Цель: присвоить каждому файлу все визуально подтверждённые категории из categories.json.
+
+Правила:
+1. Используй только id из categories.json. Категорий может быть несколько.
+2. Описывай только то, что действительно видно. Не угадывай имена, личности, отношения, точный возраст или место.
+3. Не добавляй категорию «на всякий случай». Если признака нет, не включай его в labels.
+4. Каждый файл должен встретиться ровно один раз, даже если labels пуст.
+5. Верни ТОЛЬКО валидный JSON: без Markdown, ``` и текста до/после.
+6. Не меняй batch_id: {batch_id}
+
+Формат ответа:
+{{
+  "batch_id": "{batch_id}",
+  "items": [
+    {{"file": "01.jpg", "labels": ["person", "portrait"]}},
+    {{"file": "02.jpg", "labels": []}}
+  ]
+}}
+'''.strip() + '\n'
+
+
+def import_batch(catalog, payload, reviewer=''):
+    if not isinstance(payload, dict):
+        raise ValueError('Ответ должен быть JSON-объектом')
+    batch_id = str(payload.get('batch_id', '')).strip()
+    items = payload.get('items')
+    if not batch_id or not isinstance(items, list):
+        raise ValueError('В ответе нужны batch_id и массив items')
+    db = connect(catalog)
+    try:
+        batch = db.execute('SELECT status FROM router_batches WHERE id=?', (batch_id,)).fetchone()
+        if not batch:
+            raise ValueError('Пакет не найден в HomeCloud')
+        if batch[0] == 'imported':
+            raise ValueError('Ответ этого пакета уже загружен')
+        expected = dict(db.execute(
+            'SELECT item_name,path FROM router_batch_items WHERE batch_id=? ORDER BY item_name',
+            (batch_id,)))
+        received = {}
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError('Каждый элемент items должен быть объектом')
+            name = str(item.get('file', '')).strip()
+            labels = item.get('labels')
+            if name in received:
+                raise ValueError(f'Файл {name} указан дважды')
+            if name not in expected or not isinstance(labels, list):
+                raise ValueError(f'Неверный файл или labels: {name}')
+            unknown = sorted(set(map(str, labels)) - set(LABELS))
+            if unknown:
+                raise ValueError(f'Неизвестные категории для {name}: {", ".join(unknown)}')
+            received[name] = set(map(str, labels))
+        missing = sorted(set(expected) - set(received))
+        extra = sorted(set(received) - set(expected))
+        if missing or extra:
+            raise ValueError('Набор файлов не совпадает с пакетом. '
+                             f'Пропущено: {missing}; лишние: {extra}')
+        stamp = now()
+        imported = 0
+        skipped = []
+        with db:
+            for name, path in expected.items():
+                prior = db.execute('SELECT source FROM router_reviews WHERE path=?',
+                                   (path,)).fetchone()
+                if prior and prior[0] != 'ai_batch':
+                    skipped.append(name)
+                    continue
+                values = received[name]
+                db.executemany('''INSERT INTO router_training_labels
+                    (path,label,value,verified_at,reviewer,source) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(path,label) DO UPDATE SET value=excluded.value,
+                    verified_at=excluded.verified_at,reviewer=excluded.reviewer,
+                    source=excluded.source''',
+                    [(path, key, int(key in values), stamp, reviewer[:120], 'ai_batch')
+                     for key in LABELS])
+                db.execute('''INSERT INTO router_reviews(path,verified_at,reviewer,source)
+                    VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+                    verified_at=excluded.verified_at,reviewer=excluded.reviewer,
+                    source=excluded.source''', (path, stamp, reviewer[:120], 'ai_batch'))
+                imported += 1
+            db.execute("UPDATE router_batches SET status='imported',imported_at=?,source_name=? "
+                       'WHERE id=?', (stamp, reviewer[:120], batch_id))
+        return {'batch_id': batch_id, 'imported': imported, 'skipped': skipped}
+    finally:
+        db.close()
+
+
 def prediction_source(db, embedding_model):
     active = db.execute(
         "SELECT version FROM router_models WHERE status='active' AND embedding_model=? "
@@ -163,6 +306,10 @@ def summary(catalog):
             "SELECT COUNT(*) FROM router_reviews WHERE source='human'").fetchone()[0]
         propagated = db.execute(
             "SELECT COUNT(*) FROM router_reviews WHERE source='propagated'").fetchone()[0]
+        ai_reviewed = db.execute(
+            "SELECT COUNT(*) FROM router_reviews WHERE source='ai_batch'").fetchone()[0]
+        pending_batches = db.execute(
+            "SELECT COUNT(*) FROM router_batches WHERE status='exported'").fetchone()[0]
         models = [{
             'version': row[0], 'embedding_model': row[1], 'status': row[2],
             'trained_at': row[3], 'dataset_size': row[4],
@@ -177,6 +324,7 @@ def summary(catalog):
                 'active_version': version if source == 'trained' else '',
                 'embedded': embedded, 'predicted': predicted, 'reviewed': reviewed,
                 'human_reviewed': human, 'propagated': propagated,
+                'ai_reviewed': ai_reviewed, 'pending_batches': pending_batches,
                 'pending': max(0, predicted - reviewed), 'labels': label_payload(),
                 'models': models, 'auto_train': options['router_auto_train'],
                 'auto_train_every': options['router_auto_train_every'],
