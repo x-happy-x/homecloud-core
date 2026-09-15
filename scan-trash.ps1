@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $prototype = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = (Resolve-Path (Join-Path $prototype '..\..\work\v\Scripts\python.exe')).Path
+$python = (Resolve-Path (Join-Path $prototype '.venv\Scripts\python.exe')).Path
 $catalog = Join-Path $prototype 'trash-clean-catalog'
 $models = Join-Path $prototype 'models\buffalo_l'
 $log = Join-Path $prototype 'trash-clean-scan.log'

@@ -1,6 +1,6 @@
 ﻿<#
   Бэкенд локальной фототеки: только API и медиа.
-  Веб-интерфейс живёт на Proxmox (/opt/photo-gallery) и ходит сюда по сети.
+  Веб-интерфейс живёт на Proxmox (/opt/homecloud) и ходит сюда по сети.
 #>
 param(
     [string]$Catalog = (Join-Path $PSScriptRoot 'trash-clean-catalog'),
@@ -15,8 +15,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$workspace = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$python = Join-Path $workspace 'work\v\Scripts\python.exe'
+$python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (!(Test-Path $python)) { throw 'Run setup.ps1 first' }
 if (!(Test-Path -LiteralPath (Join-Path $Catalog 'catalog.sqlite'))) {
     throw "Catalog not found: $Catalog"

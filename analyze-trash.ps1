@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $prototype = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = (Resolve-Path (Join-Path $prototype '..\..\work\vision-venv\Scripts\python.exe')).Path
+$python = (Resolve-Path (Join-Path $prototype '.venv\Scripts\python.exe')).Path
 $ocrPython = 'C:\cv-ocr\Scripts\python.exe'
 $catalog = Join-Path $prototype 'trash-clean-catalog'
 $progress = Join-Path $catalog 'analysis-progress.json'

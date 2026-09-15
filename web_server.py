@@ -782,7 +782,8 @@ class ReclusterController:
     def _idle_state():
         return {'status': 'idle', 'step': '', 'step_index': 0,
                 'steps_total': len(ReclusterController.STEPS), 'done': 0, 'total': 0,
-                'message': '', 'error': '', 'started_at': 0, 'updated_at': 0}
+                'faces_total': 0, 'message': '', 'error': '',
+                'started_at': 0, 'step_started_at': 0, 'updated_at': 0}
 
     def status(self):
         with self.lock:
@@ -801,9 +802,11 @@ class ReclusterController:
             if self.thread and self.thread.is_alive():
                 return {**self.state, 'steps': self.STEPS}
             self.stopping = False
+            now = time.time()
             self.state = {**self._idle_state(), 'status': 'running',
                           'step': self.STEPS[0]['key'], 'step_index': 1,
-                          'message': self.STEPS[0]['title'], 'started_at': time.time()}
+                          'message': self.STEPS[0]['title'], 'started_at': now,
+                          'step_started_at': now}
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
             return {**self.state, 'steps': self.STEPS}
@@ -826,13 +829,13 @@ class ReclusterController:
             # остановить пересборку на любом из первых трёх шагов, каталог
             # остаётся ровно таким, каким был — DELETE происходит одной
             # транзакцией с первой же пачкой новых данных на шаге "Сохраняю".
-            self._set(step='prepare', step_index=1, done=0, total=total,
+            self._set(step='prepare', step_index=1, done=0, total=total, faces_total=total,
                       message='Готовлю данные')
             if self._should_stop():
                 self._set(status='stopped', message='Остановлено — старые группы не тронуты')
                 return
             self._set(step='vectors', step_index=2, done=0, total=total,
-                      message='Загружаю векторы лиц')
+                      step_started_at=time.time(), message='Загружаю векторы лиц')
             ids, vectors = [], []
             for face_id, blob in rows:
                 vector = np.frombuffer(blob, dtype='<f4').astype('<f4')
@@ -846,6 +849,7 @@ class ReclusterController:
                 self._set(status='stopped', message='Остановлено — старые группы не тронуты')
                 return
             self._set(step='cluster', step_index=3, done=0, total=1,
+                      step_started_at=time.time(),
                       message='Кластеризую лица — самый долгий шаг, потерпите')
             min_cluster_size = self.app.store.min_cluster_size
             if vectors and len(vectors) >= min_cluster_size:
@@ -861,7 +865,7 @@ class ReclusterController:
                                                      'старые группы не тронуты')
                 return
             self._set(step='save', step_index=4, done=0, total=len(ids),
-                      message='Сохраняю результат')
+                      step_started_at=time.time(), message='Сохраняю результат')
             now = datetime.now(timezone.utc).isoformat()
             stopped_midway = False
             cleared = False

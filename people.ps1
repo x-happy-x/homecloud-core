@@ -5,8 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$workspace = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$python = Join-Path $workspace 'work\v\Scripts\python.exe'
+$python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (!(Test-Path $python)) { throw 'Run setup.ps1 first' }
 if (!(Test-Path -LiteralPath (Join-Path $Catalog 'catalog.sqlite'))) {
     throw "Catalog not found: $Catalog"

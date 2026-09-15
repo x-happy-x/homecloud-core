@@ -1,9 +1,8 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$workspace = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$envPath = Join-Path $workspace 'work\v'
-$env:PIP_CACHE_DIR = Join-Path $workspace 'work\pip-cache'
-New-Item -ItemType Directory -Force (Split-Path -Parent $envPath), $env:PIP_CACHE_DIR | Out-Null
+$envPath = Join-Path $PSScriptRoot '.venv'
+$env:PIP_CACHE_DIR = Join-Path $PSScriptRoot '.pip-cache'
+New-Item -ItemType Directory -Force $envPath, $env:PIP_CACHE_DIR | Out-Null
 python -m venv $envPath
 if ($LASTEXITCODE -ne 0) { throw 'Cannot create virtual environment' }
 $python = Join-Path $envPath 'Scripts\python.exe'
