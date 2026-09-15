@@ -148,12 +148,12 @@ def run(args):
             return
 
     here = Path(__file__).resolve().parent
-    workspace = here.parents[1]
+    worker_root = here / 'work'
     face_python = Path(sys.executable)
-    vision_python = workspace / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
+    vision_python = worker_root / 'vision-venv' / 'Scripts' / 'python.exe'
     ocr_python = Path(r'C:\cv-ocr\Scripts\python.exe')
-    audio_python = workspace / 'work' / 'audio-venv' / 'Scripts' / 'python.exe'
-    imgutils_python = workspace / 'work' / 'imgutils-venv' / 'Scripts' / 'python.exe'
+    audio_python = worker_root / 'audio-venv' / 'Scripts' / 'python.exe'
+    imgutils_python = worker_root / 'imgutils-venv' / 'Scripts' / 'python.exe'
     stage = args.progress_file.with_name('device-stage-progress.json')
 
     if args.features.get('faces') and args.path:

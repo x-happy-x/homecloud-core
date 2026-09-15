@@ -494,7 +494,10 @@ class DeviceController:
         return result
 
     def info(self):
-        vision = self.root.parents[1] / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
+        worker_root = self.root / 'work'
+        vision = worker_root / 'vision-venv' / 'Scripts' / 'python.exe'
+        audio = worker_root / 'audio-venv' / 'Scripts' / 'python.exe'
+        imgutils = worker_root / 'imgutils-venv' / 'Scripts' / 'python.exe'
         options = catalog_settings.load(self.catalog)
         return {
             'id': self.device_id, 'name': self.device_name,
@@ -511,14 +514,11 @@ class DeviceController:
                     r'C:\cv-models\huggingface\hub\models--Qwen--Qwen3-VL-2B-Instruct').is_dir(),
                 'adult': vision.is_file() and Path(
                     r'C:\cv-models\huggingface\hub\models--SmilingWolf--wd-eva02-large-tagger-v3').is_dir(),
-                'speech': (self.root.parents[1] / 'work' / 'audio-venv' / 'Scripts'
-                           / 'python.exe').is_file(),
-                'diarize': ((self.root.parents[1] / 'work' / 'audio-venv' / 'Scripts'
-                            / 'python.exe').is_file()
+                'speech': audio.is_file(),
+                'diarize': (audio.is_file()
                            and (Path(r'C:\cv-models\huggingface').is_dir()
                                 or (self.root / 'hf-token.txt').is_file())),
-                'authenticity': (self.root.parents[1] / 'work' / 'imgutils-venv' / 'Scripts'
-                                / 'python.exe').is_file(),
+                'authenticity': imgutils.is_file(),
             },
         }
 
