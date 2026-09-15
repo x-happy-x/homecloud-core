@@ -31,6 +31,7 @@ import privacy
 import reverse_search
 import router_learning
 import settings as catalog_settings
+import speech_videos
 import video as video_media
 from people_gui import CatalogStore
 from analyze_photos import connect as analysis_database
@@ -337,7 +338,7 @@ class RouterController:
 
 class DeviceController:
     """Expose this computer as a configurable HomeCloud worker device."""
-    FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult')
+    FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult', 'speech')
 
     def __init__(self, catalog, device_id=None, device_name=None):
         self.root = Path(__file__).resolve().parent
@@ -505,6 +506,8 @@ class DeviceController:
                     r'C:\cv-models\huggingface\hub\models--Qwen--Qwen3-VL-2B-Instruct').is_dir(),
                 'adult': vision.is_file() and Path(
                     r'C:\cv-models\huggingface\hub\models--SmilingWolf--wd-eva02-large-tagger-v3').is_dir(),
+                'speech': (self.root.parents[1] / 'work' / 'audio-venv' / 'Scripts'
+                           / 'python.exe').is_file(),
             },
         }
 
@@ -568,6 +571,8 @@ class DeviceController:
                     "SELECT COUNT(*) FROM photo_adult_analysis WHERE status='ok'").fetchone()[0]
                 payload['catalog_adult_flagged'] = db.execute(
                     "SELECT COUNT(*) FROM photo_adult_analysis WHERE status='ok' AND rating!='safe'").fetchone()[0]
+                payload['catalog_speech'] = db.execute(
+                    "SELECT COUNT(*) FROM video_speech WHERE status='ok' AND text!=''").fetchone()[0]
                 db.close()
             except sqlite3.Error:
                 pass
@@ -742,6 +747,7 @@ class App:
         pathrules.ensure_column(self.store.db)
         duplicates.ensure_schema(self.store.db)
         router_learning.connect(data).close()
+        speech_videos.connect(data).close()
         self.folders = albums.Folders(self.store.db)
         self.duplicates = DuplicateService(data)
         self.catalog_folder = Path(data).resolve()
@@ -1021,22 +1027,25 @@ class App:
         'photo_adult_analysis.tags_json,photo_adult_analysis.regions_json,'
         'photo_adult_analysis.description,photos.modified,photos.kind,photos.duration,'
         'photo_analysis.caption_short,photo_analysis.caption_search,'
-        'photo_analysis.caption_tags_json,photo_analysis.caption_json')
+        'photo_analysis.caption_tags_json,photo_analysis.caption_json,'
+        'video_speech.text')
     PHOTO_SOURCE = (
         'FROM photos LEFT JOIN faces ON faces.path=photos.path '
         'LEFT JOIN photo_analysis ON photo_analysis.path=photos.path '
         'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=photos.path '
+        'LEFT JOIN video_speech ON video_speech.path=photos.path '
         "WHERE photos.status='ok'")
     # Для счёта и поиска лица не нужны, а без их соединения запрос в разы быстрее.
     LIGHT_SOURCE = (
         'FROM photos LEFT JOIN photo_analysis ON photo_analysis.path=photos.path '
         'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=photos.path '
+        'LEFT JOIN video_speech ON video_speech.path=photos.path '
         "WHERE photos.status='ok'")
     LIGHT_COLUMNS = ('photos.path,photo_analysis.content_type,photo_analysis.caption,'
                      'photo_analysis.ocr_text,photo_adult_analysis.tags_json,'
                      'photo_adult_analysis.description,photos.modified,'
                      'photo_analysis.caption_short,photo_analysis.caption_search,'
-                     'photo_analysis.caption_tags_json')
+                     'photo_analysis.caption_tags_json,video_speech.text')
 
     def photo_filters(self, exact_path='', content_type='', blurry=False, adult=False,
                       folder='', folder_deep=True, album=0, album_deep=True, kind='',
@@ -1118,6 +1127,7 @@ class App:
                         f'JOIN people ON people.id=face_people.person_id '
                         f'LEFT JOIN photo_analysis ON photo_analysis.path=faces.path '
                         f'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=faces.path '
+                        f'LEFT JOIN video_speech ON video_speech.path=faces.path '
                         f'WHERE people.name IN ({placeholders}){where} GROUP BY faces.path '
                         f'HAVING COUNT(DISTINCT people.name)=?',
                         [*names, *values, len(names)]).fetchall()
@@ -1127,8 +1137,8 @@ class App:
                         values).fetchall()
                 if query:
                     # Совпадение по тексту ищем по лёгким колонкам, без картинок и векторов.
-                    index = ((0, 1, 2, 3, 4, 5, 7, 8, 9) if not names
-                             else (0, 2, 4, 5, 10, 12, 16, 17, 18))
+                    index = ((0, 1, 2, 3, 4, 5, 7, 8, 9, 10) if not names
+                             else (0, 2, 4, 5, 10, 12, 16, 17, 18, 20))
                     textual = [row for row in rows if query in ' '.join(
                         str(row[position] or '') for position in index).casefold()]
                     semantic = []
@@ -1258,6 +1268,7 @@ class App:
             'router_labels': router_by_path.get(path, []),
             'albums': album_by_path.get(path, []),
             'kind': kind or 'photo', 'duration': duration or 0,
+            'speech_text': speech_text or '',
             'hidden_owner': hidden_by_path.get(path, ''),
             'video': (f'/media/video?path={quote(path, safe="")}' if kind == 'video' else ''),
             # Время файла в миллисекундах: галерее нужна дата снимка.
@@ -1265,7 +1276,8 @@ class App:
         } for path, face_id, content_type, blur_score, caption, ocr_text,
               ocr_status, caption_status, adult_rating, adult_score, adult_tags,
               adult_regions, adult_description, modified, kind, duration,
-              caption_short, caption_search, caption_tags, caption_json in rows], total
+              caption_short, caption_search, caption_tags, caption_json,
+              speech_text in rows], total
 
     # Сколько копий показываем в группе: остальные считаются, но не рисуются.
     CARDS = 12
@@ -1565,6 +1577,27 @@ class Handler(BaseHTTPRequestHandler):
                 if not photos:
                     return self.error_json(404, 'Фотография не найдена')
                 return self.json_response({'photo': photos[0]})
+            if parsed.path == '/api/speech':
+                query = parse_qs(parsed.query)
+                raw_path = query.get('path', [''])[0]
+                viewer, admin = self.viewer
+                photos, _ = self.app.photo_payloads(
+                    exact_path=raw_path, viewer=viewer, admin=admin,
+                    hidden=query.get('hidden', ['0'])[0] == '1')
+                if not photos:
+                    return self.error_json(404, 'Файл не найден')
+                with self.app.lock:
+                    row = self.app.store.db.execute(
+                        'SELECT language,status,model FROM video_speech WHERE path=?',
+                        (raw_path,)).fetchone()
+                    segments = self.app.store.db.execute(
+                        'SELECT start,stop,text FROM video_speech_segments '
+                        'WHERE path=? ORDER BY ord', (raw_path,)).fetchall()
+                return self.json_response({
+                    'status': row[1] if row else '', 'language': (row and row[0]) or '',
+                    'model': (row and row[2]) or '',
+                    'segments': [{'start': start, 'stop': stop, 'text': text}
+                                 for start, stop, text in segments]})
             if parsed.path.startswith('/media/thumb/'):
                 return self.send_media(parsed.path.rsplit('/', 1)[-1], original=False)
             if parsed.path.startswith('/media/original/'):

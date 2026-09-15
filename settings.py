@@ -45,6 +45,12 @@ DEFAULTS = {
     'caption_backend': 'local',
     'caption_model': 'Qwen/Qwen3-VL-2B-Instruct',
     'caption_lmstudio_url': 'http://127.0.0.1:1234/v1/chat/completions',
+    # распознавание речи в роликах
+    'speech_model': 'large-v3',
+    # 'auto' — определять язык по самой записи; иначе код языка
+    'speech_language': 'auto',
+    # чем подменяется язык, когда определению нельзя верить
+    'speech_fallback_language': 'ru',
 }
 
 LIMITS = {
@@ -60,6 +66,7 @@ LIMITS = {
 
 CHOICES = {
     'caption_backend': ('local', 'lmstudio'),
+    'speech_model': ('large-v3', 'medium', 'small'),
     'visual_model': (
         'google/siglip2-base-patch16-224',
         'google/siglip2-base-patch16-256',

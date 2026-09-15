@@ -139,7 +139,7 @@ def run(args):
             publish(args, 'stopped', 'inventory', inventory=summary)
             return
         if not any(args.features.get(name) for name in
-                   ('faces', 'visual', 'ocr', 'caption', 'adult')):
+                   ('faces', 'visual', 'ocr', 'caption', 'adult', 'speech')):
             publish(args, 'completed', 'complete', completed=summary.get('total', 0),
                     total=summary.get('total', 0),
                     finished_at=datetime.now(timezone.utc).isoformat(),
@@ -151,6 +151,7 @@ def run(args):
     face_python = Path(sys.executable)
     vision_python = workspace / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
     ocr_python = Path(r'C:\cv-ocr\Scripts\python.exe')
+    audio_python = workspace / 'work' / 'audio-venv' / 'Scripts' / 'python.exe'
     stage = args.progress_file.with_name('device-stage-progress.json')
 
     if args.features.get('faces') and args.path:
@@ -181,7 +182,8 @@ def run(args):
             if args.stop_file.exists():
                 publish(args, 'stopped', 'faces')
                 return
-    elif any(args.features.get(name) for name in ('visual', 'ocr', 'caption', 'adult')):
+    elif any(args.features.get(name) for name in
+             ('visual', 'ocr', 'caption', 'adult', 'speech')):
         if inventory(args).get('stopped'):
             publish(args, 'stopped', 'inventory')
             return
@@ -242,6 +244,23 @@ def run(args):
                   *force, *root_args], 'caption')
     if args.stop_file.exists():
         publish(args, 'stopped', 'caption')
+        return
+
+    if args.features.get('speech'):
+        options = catalog_settings.load(args.catalog)
+        # Предыдущие этапы включили офлайн для Hugging Face; здесь он мешает
+        # забрать модель распознавания, если её ещё нет.
+        os.environ.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_OFFLINE='0',
+                          HF_HUB_DISABLE_SYMLINKS_WARNING='1', PYTHONUTF8='1')
+        run_child(args, [str(audio_python), str(here / 'speech_videos.py'),
+                  '--catalog', str(args.catalog), '--limit', '100000000',
+                  '--model', options['speech_model'],
+                  '--language', options['speech_language'],
+                  '--fallback-language', options['speech_fallback_language'],
+                  '--progress-file', str(stage), '--stop-file', str(args.stop_file),
+                  *force, *root_args], 'speech')
+    if args.stop_file.exists():
+        publish(args, 'stopped', 'speech')
         return
 
     publish(args, 'completed', 'complete', completed=1, total=1,
