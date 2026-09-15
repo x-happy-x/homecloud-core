@@ -203,18 +203,6 @@ class CatalogStore:
         self.auto_labels, self.auto_confidence = self._cluster()
         return True
 
-    def recluster(self):
-        """Полная пересборка групп: дорого, поэтому только по команде."""
-        with self.db:
-            self.db.execute('DELETE FROM face_clusters')
-        previous, self.chunk = self.chunk, max(self.chunk, len(self.rows) + 1)
-        try:
-            self.ensure_labels()
-        finally:
-            self.chunk = previous
-        self.auto_labels, self.auto_confidence = self._cluster()
-        return len(self.rows)
-
     def _cluster(self):
         self.ensure_labels()
         labels = {row[0]: -1 for row in self.rows}

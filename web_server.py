@@ -38,6 +38,7 @@ import speech_videos
 import video as video_media
 from people_gui import CatalogStore
 from analyze_photos import connect as analysis_database
+from prototype import cluster_embeddings, database as open_catalog_db
 
 
 WEB_ROOT = Path(__file__).with_name('web').resolve()
@@ -751,6 +752,161 @@ class DuplicateService:
             db.close()
 
 
+class ReclusterController:
+    """Полная пересборка автоматических групп лиц.
+
+    Считается в фоновом потоке на СВОЁМ соединении с БД, а не на потоке
+    запроса и не через общее `self.store.db` — раньше пересборка держала
+    общий `App.lock` и одновременно долбила общее соединение sqlite, а
+    /api/state читает то же соединение без блокировки вовсе: конкурентная
+    работа с одним объектом Connection из двух потоков и была причиной
+    зависания страницы и сырых ошибок sqlite в интерфейсе. Отдельное
+    соединение снимает конфликт полностью — sqlite сама умеет несколько
+    соединений к одному файлу.
+    """
+    STEPS = [
+        {'key': 'prepare', 'title': 'Готовлю данные'},
+        {'key': 'vectors', 'title': 'Загружаю векторы лиц'},
+        {'key': 'cluster', 'title': 'Кластеризую лица'},
+        {'key': 'save', 'title': 'Сохраняю результат'},
+    ]
+
+    def __init__(self, app):
+        self.app = app
+        self.lock = threading.Lock()
+        self.thread = None
+        self.stopping = False
+        self.state = self._idle_state()
+
+    @staticmethod
+    def _idle_state():
+        return {'status': 'idle', 'step': '', 'step_index': 0,
+                'steps_total': len(ReclusterController.STEPS), 'done': 0, 'total': 0,
+                'message': '', 'error': '', 'started_at': 0, 'updated_at': 0}
+
+    def status(self):
+        with self.lock:
+            return {**self.state, 'steps': self.STEPS}
+
+    def _set(self, **kwargs):
+        with self.lock:
+            self.state.update(kwargs, updated_at=time.time())
+
+    def _should_stop(self):
+        with self.lock:
+            return self.stopping
+
+    def start(self):
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return {**self.state, 'steps': self.STEPS}
+            self.stopping = False
+            self.state = {**self._idle_state(), 'status': 'running',
+                          'step': self.STEPS[0]['key'], 'step_index': 1,
+                          'message': self.STEPS[0]['title'], 'started_at': time.time()}
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+            return {**self.state, 'steps': self.STEPS}
+
+    def stop(self):
+        with self.lock:
+            if not (self.thread and self.thread.is_alive()):
+                raise ValueError('Пересборка сейчас не выполняется')
+            self.stopping = True
+            self.state['message'] = 'Останавливаю после текущего шага…'
+            return {**self.state, 'steps': self.STEPS}
+
+    def _run(self):
+        db = None
+        try:
+            db = open_catalog_db(self.app.store.folder, check_same_thread=False)
+            rows = db.execute('SELECT id,embedding FROM faces ORDER BY id').fetchall()
+            total = len(rows)
+            # Старые группы не трогаем, пока не готовы полностью новые: если
+            # остановить пересборку на любом из первых трёх шагов, каталог
+            # остаётся ровно таким, каким был — DELETE происходит одной
+            # транзакцией с первой же пачкой новых данных на шаге "Сохраняю".
+            self._set(step='prepare', step_index=1, done=0, total=total,
+                      message='Готовлю данные')
+            if self._should_stop():
+                self._set(status='stopped', message='Остановлено — старые группы не тронуты')
+                return
+            self._set(step='vectors', step_index=2, done=0, total=total,
+                      message='Загружаю векторы лиц')
+            ids, vectors = [], []
+            for face_id, blob in rows:
+                vector = np.frombuffer(blob, dtype='<f4').astype('<f4')
+                norm = float(np.linalg.norm(vector))
+                vectors.append(vector / max(norm, 1e-12))
+                ids.append(face_id)
+                if len(ids) % 2000 == 0:
+                    self._set(done=len(ids))
+            self._set(done=total, total=total)
+            if self._should_stop():
+                self._set(status='stopped', message='Остановлено — старые группы не тронуты')
+                return
+            self._set(step='cluster', step_index=3, done=0, total=1,
+                      message='Кластеризую лица — самый долгий шаг, потерпите')
+            min_cluster_size = self.app.store.min_cluster_size
+            if vectors and len(vectors) >= min_cluster_size:
+                matrix = np.stack(vectors)
+                labels, probabilities = cluster_embeddings(
+                    matrix, algorithm='hdbscan', min_cluster_size=min_cluster_size)
+            else:
+                labels = [-1] * len(ids)
+                probabilities = [0.0] * len(ids)
+            self._set(done=1, total=1)
+            if self._should_stop():
+                self._set(status='stopped', message='Остановлено после кластеризации — '
+                                                     'старые группы не тронуты')
+                return
+            self._set(step='save', step_index=4, done=0, total=len(ids),
+                      message='Сохраняю результат')
+            now = datetime.now(timezone.utc).isoformat()
+            stopped_midway = False
+            cleared = False
+            chunk = 2000
+            for offset in range(0, len(ids), chunk):
+                batch = list(zip(ids[offset:offset + chunk], labels[offset:offset + chunk],
+                                 probabilities[offset:offset + chunk]))
+                with db:
+                    if not cleared:
+                        # Старое стирается в той же транзакции, что и первая
+                        # пачка нового — снаружи каталог не бывает пустым.
+                        db.execute('DELETE FROM face_clusters')
+                        cleared = True
+                    db.executemany(
+                        'INSERT INTO face_clusters(face_id,label,probability,method,computed_at) '
+                        'VALUES(?,?,?,?,?) ON CONFLICT(face_id) DO UPDATE SET label=excluded.label,'
+                        'probability=excluded.probability,method=excluded.method,'
+                        'computed_at=excluded.computed_at',
+                        [(int(face_id), int(label), float(probability), 'hdbscan', now)
+                         for face_id, label, probability in batch])
+                self._set(done=min(offset + chunk, len(ids)), total=len(ids))
+                if self._should_stop():
+                    stopped_midway = True
+                    break
+            db.close()
+            db = None
+            with self.app.lock:
+                self.app.store.reload_faces()
+            if stopped_midway:
+                self._set(status='stopped', message='Остановлено — часть групп уже пересобрана, '
+                                                     'остальные соберутся при следующем запуске')
+            else:
+                self._set(step='save', step_index=len(self.STEPS), done=len(ids), total=len(ids))
+                self._set(status='completed', message='Готово')
+        except Exception as exc:
+            print(f'Recluster failed: {exc}', file=sys.stderr, flush=True)
+            self._set(status='error', error=str(exc), message='Ошибка пересборки')
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+
+
 class App:
     def __init__(self, data, min_cluster_size=8, token=None,
                  device_id=None, device_name=None, max_faces=0):
@@ -768,6 +924,7 @@ class App:
         speech_videos.connect(data).close()
         self.folders = albums.Folders(self.store.db)
         self.duplicates = DuplicateService(data)
+        self.recluster_job = ReclusterController(self)
         self.catalog_folder = Path(data).resolve()
         self.scanner = ScanController()
         self.analyzer = AnalysisController()
@@ -1641,6 +1798,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response({
                         'path': path, 'trail': self.app.folders.trail(path),
                         'folders': self.app.folders.children(path)})
+            if parsed.path == '/api/recluster/status':
+                return self.json_response(self.app.recluster_job.status())
             if parsed.path == '/api/duplicates/status':
                 return self.json_response(self.app.duplicates.status())
             if parsed.path == '/api/duplicates':
@@ -1917,6 +2076,10 @@ class Handler(BaseHTTPRequestHandler):
                     result = privacy.reveal(self.app.store.db, viewer, admin,
                                             body.get('paths', []))
                 return self.json_response({'ok': True, **result})
+            if path == '/api/recluster/start':
+                return self.json_response({'ok': True, 'job': self.app.recluster_job.start()})
+            if path == '/api/recluster/stop':
+                return self.json_response({'ok': True, 'job': self.app.recluster_job.stop()})
             if path == '/api/duplicates/scan':
                 return self.json_response({'ok': True, 'job': self.app.duplicates.start(
                     bool(body.get('similar')))})
@@ -2004,9 +2167,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.app.store.set_avatar(body.get('key', ''), body.get('face_id'))
                 elif path == '/api/clear-avatar':
                     self.app.store.clear_avatar(body.get('key', ''))
-                elif path == '/api/recluster':
-                    self.app.store.reload_faces()
-                    self.app.store.recluster()
                 elif path == '/api/exclude':
                     self.app.store.exclude(body.get('face_ids', []))
                 elif path == '/api/undo':
