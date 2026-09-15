@@ -1091,7 +1091,7 @@ class App:
         'photo_adult_analysis.description,photos.modified,photos.kind,photos.duration,'
         'photo_analysis.caption_short,photo_analysis.caption_search,'
         'photo_analysis.caption_tags_json,photo_analysis.caption_json,'
-        'video_speech.text')
+        'video_speech.text,photos.size,photo_analysis.width,photo_analysis.height')
     PHOTO_SOURCE = (
         'FROM photos LEFT JOIN faces ON faces.path=photos.path '
         'LEFT JOIN photo_analysis ON photo_analysis.path=photos.path '
@@ -1264,15 +1264,22 @@ class App:
                     people_by_path[path].append({'name': name, 'bigfam_id': bigfam_id})
                 # Каждое отдельное лицо — чтобы просмотрщик мог назвать и
                 # неназванные лица прямо на месте, а не только через группу.
-                for face_id, path, moment, name, bigfam_id in self.store.db.execute(
-                        f'SELECT faces.id,faces.path,faces.frame_time,people.name,'
-                        f'people.bigfam_id FROM faces '
+                # Группа — та же самая, что и в разделе «Люди»: по имени, если
+                # оно есть, иначе по автокластеру (face_clusters), а не по
+                # случайному совпадению строки имени или отдельной карточке.
+                for face_id, path, moment, person_id, name, bigfam_id in self.store.db.execute(
+                        f'SELECT faces.id,faces.path,faces.frame_time,face_people.person_id,'
+                        f'people.name,people.bigfam_id FROM faces '
                         f'LEFT JOIN face_people ON face_people.face_id=faces.id '
                         f'LEFT JOIN people ON people.id=face_people.person_id '
                         f'WHERE faces.path IN ({placeholders}) ORDER BY faces.id', paths):
+                    label = self.store.auto_labels.get(face_id, -1)
+                    group = (f'person:{person_id}' if person_id is not None
+                            else f'auto:{label}' if label != -1 else f'noise:{face_id}')
                     faces_by_path[path].append({
                         'id': face_id, 'thumbnail': f'/media/thumb/{face_id}',
-                        'frame_time': moment, 'name': name, 'bigfam_id': bigfam_id})
+                        'frame_time': moment, 'name': name, 'bigfam_id': bigfam_id,
+                        'group': group})
         # Multi-label роутер показываем рядом с описанием. Ручная разметка имеет
         # приоритет: подтверждённый отрицательный тег не должен всплывать из AI.
         router_by_path = {path: [] for path in paths}
@@ -1336,11 +1343,12 @@ class App:
             'video': (f'/media/video?path={quote(path, safe="")}' if kind == 'video' else ''),
             # Время файла в миллисекундах: галерее нужна дата снимка.
             'taken': round((modified or 0) / 1e6) or None,
+            'size': size or 0, 'width': width or 0, 'height': height or 0,
         } for path, face_id, content_type, blur_score, caption, ocr_text,
               ocr_status, caption_status, adult_rating, adult_score, adult_tags,
               adult_regions, adult_description, modified, kind, duration,
               caption_short, caption_search, caption_tags, caption_json,
-              speech_text in rows], total
+              speech_text, size, width, height in rows], total
 
     # Сколько копий показываем в группе: остальные считаются, но не рисуются.
     CARDS = 12
