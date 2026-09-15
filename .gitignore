@@ -1,0 +1,23 @@
+# Веса моделей и скачанное — сотни мегабайт, ставятся отдельно
+models/
+downloads/
+
+# Каталоги: база снимков, превью, лица. Это данные пользователя, не код.
+data/
+trash-catalog/
+trash-clean-catalog/
+test-photos/
+
+# Журналы и прогресс этапов
+*.log
+device-*progress*.json
+*.stop
+
+# Секреты
+backend-token.txt
+
+__pycache__/
+*.py[cod]
+
+# Виртуальное окружение этого бэкенда
+.venv/

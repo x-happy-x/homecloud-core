@@ -1,0 +1,14 @@
+{
+  "model": {
+    "url": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+    "sha256": "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f"
+  },
+  "dataset": {
+    "url": "https://ndownloader.figshare.com/files/5976018",
+    "sha256": "055f7d9c632d7370e6fb4afc7468d40f970c34a80d4c6f50ffec63f5a8d536c0"
+  },
+  "sample": {
+    "people": 20,
+    "photos": 545
+  }
+}

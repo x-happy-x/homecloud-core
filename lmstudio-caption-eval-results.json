@@ -1,0 +1,680 @@
+{
+  "model": "huihui-qwen3.8-27b-vision",
+  "created_at": "2026-09-14T09:47:41.546851+00:00",
+  "prompt": "C:\\Users\\amagomedsharipov\\Documents\\Codex\\2026-09-10\\https-github-com-reconurge-flowsint-https-2\\outputs\\photo-prototype\\lmstudio_caption_prompt.txt",
+  "samples": [
+    {
+      "set": "safe",
+      "path": "D:\\trash\\РАЗОБРАТЬ\\Новая папка\\Mi8 Pro\\DCIM\\Camera\\IMG_20200707_113524.jpg",
+      "filename": "IMG_20200707_113524.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Две девочки в желтых футболках с младенцем на диване",
+        "caption_short_en": "Two girls in yellow shirts with a baby on a sofa",
+        "description_ru": "На снимке изображены три ребенка, расположенные на диване с узорчатой обивкой. Слева и справа сидят две девочки в одинаковых желтых футболках с блестящим декором; одна из них указывает пальцем в камеру. Между ними находится младенец в светлой одежде с синим бантом. Все дети улыбаются, создавая атмосферу семейного фото.",
+        "description_en": "The image shows three children sitting on a patterned sofa. Two girls in matching yellow t-shirts with shiny decorations are positioned on the left and right; one of them is pointing at the camera. Between them sits an infant wearing light-colored clothing with a blue bow. All the children are smiling, creating a family photo atmosphere.",
+        "tags_ru": [
+          "дети",
+          "девочки",
+          "младенец",
+          "желтые футболки",
+          "диван",
+          "улыбка",
+          "семейное фото",
+          "интерьер",
+          "портрет",
+          "ребенок",
+          "сестры",
+          "фотография"
+        ],
+        "tags_en": [
+          "children",
+          "girls",
+          "baby",
+          "yellow shirts",
+          "sofa",
+          "smile",
+          "family photo",
+          "indoor",
+          "portrait",
+          "kid",
+          "sisters",
+          "photography"
+        ],
+        "people": {
+          "count": 3,
+          "presentation": [
+            "девочка",
+            "младенец"
+          ]
+        },
+        "scene": {
+          "ru": "гостиная с диваном",
+          "en": "living room with sofa",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "сидят на диване",
+            "улыбаются",
+            "указывают пальцем"
+          ],
+          "en": [
+            "sitting on a sofa",
+            "smiling",
+            "pointing finger"
+          ]
+        },
+        "clothing": {
+          "ru": [
+            "желтая футболка с блёстками",
+            "леопардовые штаны",
+            "светлая одежда младенца"
+          ],
+          "en": [
+            "yellow t-shirt with sequins",
+            "leopard print pants",
+            "light-colored baby clothes"
+          ]
+        },
+        "objects": {
+          "ru": [
+            "диван с узором",
+            "бант на волосах"
+          ],
+          "en": [
+            "patterned sofa",
+            "hair bow"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "дневной свет",
+            "семейный альбом",
+            "крупный план"
+          ],
+          "en": [
+            "daylight",
+            "family album",
+            "close-up"
+          ]
+        },
+        "content": {
+          "rating": "safe",
+          "nsfw": false,
+          "categories": []
+        },
+        "search_text_ru": "Две девочки в одинаковых желтых футболках и младенец сидят на диване с узорчатой обивкой и улыбаются.",
+        "search_text_en": "Two girls in matching yellow shirts and a baby sitting on a patterned sofa smiling."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 2523,
+        "completion_tokens": 761,
+        "total_tokens": 3284,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "seconds": 25.46
+    },
+    {
+      "set": "safe",
+      "path": "D:\\trash\\РАЗОБРАТЬ\\Новая папка\\Mi8 Pro\\DCIM\\Camera\\Compressed_IMG_20210216_134709.jpg",
+      "filename": "Compressed_IMG_20210216_134709.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Записи по биологии в тетради в клетку",
+        "caption_short_en": "Biology notes in a grid notebook",
+        "description_ru": "На изображении крупным планом показана открытая тетрадь в клетку с металлическим пружинным переплетом. На странице рукописные записи синими чернилами, выполненные курсивом на русском языке. Текст содержит биологические термины и определения: 'Легочная и кожная дыхание', 'Целомное и внекишечное пищеварение', 'Мерцательные клетки'. Тетрадь лежит на тёмной поверхности, справа видна часть клавиатуры с синими клавишами.",
+        "description_en": "A close-up view of an open grid notebook with a metal spiral binding. The page contains handwritten notes in blue ink, written in cursive Russian script. The text includes biological terms and definitions such as 'pulmonary and skin respiration', 'coelomic and extraintestinal digestion', and 'contractile vacuoles'. The notebook rests on a dark surface, with part of a keyboard featuring blue keys visible on the right side.",
+        "tags_ru": [
+          "тетрадь",
+          "записи",
+          "рукопись",
+          "биология",
+          "учеба",
+          "клетка",
+          "синие чернила",
+          "шпирали",
+          "конспект",
+          "бумага",
+          "клавиатура",
+          "студент",
+          "школьник",
+          "текст",
+          "русский язык"
+        ],
+        "tags_en": [
+          "notebook",
+          "handwriting",
+          "biology",
+          "study notes",
+          "grid paper",
+          "blue ink",
+          "spiral binding",
+          "summary",
+          "paper",
+          "keyboard",
+          "student",
+          "text",
+          "russian language"
+        ],
+        "people": {
+          "count": 0,
+          "presentation": []
+        },
+        "scene": {
+          "ru": "рабочее место",
+          "en": "workspace",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "запись текста"
+          ],
+          "en": [
+            "writing text"
+          ]
+        },
+        "clothing": {
+          "ru": [],
+          "en": []
+        },
+        "objects": {
+          "ru": [
+            "тетрадь",
+            "клавиатура",
+            "пружинный переплет"
+          ],
+          "en": [
+            "notebook",
+            "keyboard",
+            "spiral binding"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "крупный план",
+            "рукопись",
+            "синие чернила",
+            "бумага в клетку"
+          ],
+          "en": [
+            "close-up",
+            "handwriting",
+            "blue ink",
+            "grid paper"
+          ]
+        },
+        "content": {
+          "rating": "safe",
+          "nsfw": false,
+          "categories": []
+        },
+        "search_text_ru": "Рукописные записи по биологии в тетради в клетку с синими чернилами на фоне клавиатуры.",
+        "search_text_en": "Handwritten biology notes in a grid notebook with blue ink on a keyboard background."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 2523,
+        "completion_tokens": 728,
+        "total_tokens": 3251,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "seconds": 25.87
+    },
+    {
+      "set": "safe",
+      "path": "D:\\trash\\РАЗОБРАТЬ\\Новая папка\\Mi8 Pro\\DCIM\\Camera\\IMG_20221203_184011.jpg",
+      "filename": "IMG_20221203_184011.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Цифровой штангенциркуль измеряет чёрный объект",
+        "caption_short_en": "Digital caliper measuring a black object",
+        "description_ru": "На изображении крупным планом показан цифровой штангенциркуль, который используется для измерения толщины чёрного прямоугольного объекта с надписью 'Enter' и стрелкой. Цифровой дисплей инструмента отображает значение 18.29 мм. Штангенциркуль имеет металлический корпус серебристого цвета и шкалу в сантиметрах и миллиметрах, а также кнопки управления (Inch/mm, OFF/ON, ZERO). Инструмент лежит на мягкой поверхности бежевого или светло-коричневого цвета с ворсистой текстурой.",
+        "description_en": "A close-up shot of a digital caliper measuring the thickness of a black rectangular object with an 'Enter' label and arrow. The tool's digital display shows a reading of 18.29 mm. The caliper has a silver metallic body, a scale in centimeters and millimeters, and control buttons (Inch/mm, OFF/ON, ZERO). It is resting on a soft, beige or light brown surface with a fuzzy texture.",
+        "tags_ru": [
+          "цифровой штангенциркуль",
+          "измерение",
+          "инструмент",
+          "дисплей",
+          "металл",
+          "миллиметры",
+          "чёрный объект",
+          "крупный план",
+          "мастерская",
+          "точность",
+          "калибр",
+          "шкала"
+        ],
+        "tags_en": [
+          "digital caliper",
+          "measurement",
+          "tool",
+          "display",
+          "metal",
+          "millimeters",
+          "black object",
+          "close-up",
+          "workshop",
+          "precision",
+          "gauge",
+          "scale"
+        ],
+        "people": {
+          "count": 0,
+          "presentation": []
+        },
+        "scene": {
+          "ru": "рабочая поверхность",
+          "en": "work surface",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "измерение объекта"
+          ],
+          "en": [
+            "measuring object"
+          ]
+        },
+        "clothing": {
+          "ru": [],
+          "en": []
+        },
+        "objects": {
+          "ru": [
+            "цифровой штангенциркуль",
+            "чёрный объект",
+            "дисплей",
+            "кнопки",
+            "шкала"
+          ],
+          "en": [
+            "digital caliper",
+            "black object",
+            "display",
+            "buttons",
+            "scale"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "крупный план",
+            "статичная сцена",
+            "искусственное освещение"
+          ],
+          "en": [
+            "close-up",
+            "static scene",
+            "artificial lighting"
+          ]
+        },
+        "content": {
+          "rating": "safe",
+          "nsfw": false,
+          "categories": []
+        },
+        "search_text_ru": "Цифровой штангенциркуль с дисплеем измеряет толщину чёрного предмета на ворсистой поверхности.",
+        "search_text_en": "Digital caliper with display measuring the thickness of a black item on a fuzzy surface."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 2523,
+        "completion_tokens": 738,
+        "total_tokens": 3261,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "seconds": 24.96
+    },
+    {
+      "set": "nsfw",
+      "path": "D:\\xxx\\Новая папка\\49063.jpg",
+      "filename": "49063.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Женщина делает селфи в интимной обстановке",
+        "caption_short_en": "Woman taking a selfie in an intimate setting",
+        "description_ru": "На изображении взрослая женщина со светлой кожей и длинными тёмными волосами сидит на полу, держа белый смартфон в руке для селфи. Она одета в чёрный облегающий топ и чулки с подвязками, на ногах — высокие каблуки. На шее видна серебряная цепочка с кулоном, на запястье — браслет. Рядом стоит обнажённый мужчина, видны его торс и ноги. Освещение в помещении яркое, фон светлый.",
+        "description_en": "An adult woman with light skin and long dark hair sits on the floor holding a white smartphone for a selfie. She wears a tight black top, stockings with garters, and high heels. A silver necklace and bracelet are visible. An unclothed man stands nearby, with his torso and legs in frame. The lighting is bright against a light-colored background.",
+        "tags_ru": [
+          "женщина",
+          "мужчина",
+          "селфи",
+          "смартфон",
+          "чулки",
+          "подвязки",
+          "каблуки",
+          "интимная поза",
+          "обнажённый мужчина",
+          "чёрный топ",
+          "украшения",
+          "пол",
+          "взрослые"
+        ],
+        "tags_en": [
+          "woman",
+          "man",
+          "selfie",
+          "smartphone",
+          "stockings",
+          "garters",
+          "high heels",
+          "intimate pose",
+          "nude man",
+          "black top",
+          "jewelry",
+          "floor",
+          "adults"
+        ],
+        "people": {
+          "count": 2,
+          "presentation": [
+            "женщина",
+            "мужчина"
+          ]
+        },
+        "scene": {
+          "ru": "комната",
+          "en": "room",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "сидит на полу",
+            "делает селфи",
+            "стоит обнажённый"
+          ],
+          "en": [
+            "sitting on floor",
+            "taking selfie",
+            "standing nude"
+          ]
+        },
+        "clothing": {
+          "ru": [
+            "чёрный топ",
+            "чулки",
+            "подвязки",
+            "каблуки"
+          ],
+          "en": [
+            "black top",
+            "stockings",
+            "garters",
+            "high heels"
+          ]
+        },
+        "objects": {
+          "ru": [
+            "смартфон",
+            "цепочка",
+            "браслет"
+          ],
+          "en": [
+            "smartphone",
+            "necklace",
+            "bracelet"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "селфи",
+            "интимный контент",
+            "яркий свет"
+          ],
+          "en": [
+            "selfie",
+            "intimate content",
+            "bright light"
+          ]
+        },
+        "content": {
+          "rating": "suggestive",
+          "nsfw": true,
+          "categories": [
+            "underwear",
+            "lingerie",
+            "suggestive_pose"
+          ]
+        },
+        "search_text_ru": "Женщина в чулках и каблуках делает селфи рядом с обнажённым мужчиной в комнате.",
+        "search_text_en": "Woman in stockings and heels taking a selfie next to a nude man in a room."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 1575,
+        "completion_tokens": 880,
+        "total_tokens": 2455,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "seconds": 27.1
+    },
+    {
+      "set": "nsfw",
+      "path": "D:\\xxx\\Новая папка\\48595.jpg",
+      "filename": "48595.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Молодая женщина с леденцом на палочке в руке",
+        "caption_short_en": "Young woman holding a lollipop in her hand",
+        "description_ru": "Крупный план молодой женщины, лежащей на белой поверхности. У неё тёмные волосы, собранные в хвосты с помощью ярких розовых резинок. В левой руке она держит розовый леденец в форме сердца на палочке. Рот открыт, язык виден, на подбородке и щеках заметны белые пятна, похожие на остатки еды или крема. На переднем плане слева находится мужская рука с татуировкой, держащая объект, напоминающий фаллическую форму. Освещение мягкое, создающее интимную атмосферу.",
+        "description_en": "Close-up of a young woman lying on a white surface. She has dark hair tied in pigtails with bright pink bands. In her left hand, she holds a pink heart-shaped lollipop on a stick. Her mouth is open, tongue visible, with white spots resembling food or cream residue on her chin and cheeks. In the foreground on the left, a tattooed male hand holds an object resembling a phallic shape. The lighting is soft, creating an intimate atmosphere.",
+        "tags_ru": [
+          "молодая женщина",
+          "леденец",
+          "хвосты",
+          "белая поверхность",
+          "крупный план",
+          "портрет",
+          "розовый цвет",
+          "татуировка",
+          "рука",
+          "рот открыт",
+          "интимная поза",
+          "фотография"
+        ],
+        "tags_en": [
+          "young woman",
+          "lollipop",
+          "pigtails",
+          "white surface",
+          "close-up",
+          "portrait",
+          "pink color",
+          "tattoo",
+          "hand",
+          "open mouth",
+          "intimate pose",
+          "photography"
+        ],
+        "people": {
+          "count": 2,
+          "presentation": [
+            "женщина",
+            "мужчина (рука)"
+          ]
+        },
+        "scene": {
+          "ru": "интерьер, белая поверхность",
+          "en": "indoor, white surface",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "лежит",
+            "держит леденец"
+          ]
+        },
+        "clothing": {
+          "ru": [],
+          "en": []
+        },
+        "objects": {
+          "ru": [
+            "леденец",
+            "палочка",
+            "резинки для волос"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "крупный план",
+            "мягкий свет",
+            "портрет"
+          ]
+        },
+        "content": {
+          "rating": "suggestive",
+          "nsfw": true,
+          "categories": [
+            "suggestive_pose"
+          ]
+        },
+        "search_text_ru": "Молодая женщина с хвостиками и розовым леденцом на палочке лежит на белой поверхности, крупный план лица.",
+        "search_text_en": "Young woman with pigtails and a pink lollipop lying on a white surface, close-up of face."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 1698,
+        "completion_tokens": 727,
+        "total_tokens": 2425,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "seconds": 23.67
+    },
+    {
+      "set": "nsfw",
+      "path": "D:\\xxx\\Новая папка\\46332.jpg",
+      "filename": "46332.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Женщина целует обнаженную спину другой женщины",
+        "caption_short_en": "Woman kissing another woman's bare back",
+        "description_ru": "На изображении крупным планом запечатлены две молодые женщины в интимной обстановке. Справа находится женщина со светлой кожей и темными волосами, собранными назад; она улыбается, глядя на спину другой женщины, и прижимает к ней свое лицо. На ее лице видна красная помада, а на ухе — крупное серебристое украшение в виде звезды. Слева виден торс второй женщины сзади: обнаженная спина и часть груди, кожа светлая, на плече заметны родинки. Рука первой женщины с красным маникюром лежит на спине второй. Фон размытый, светлый, предположительно интерьер комнаты или студии. Внизу по центру расположен белый текст субтитров \"gorgeous butt, isn't it?\", а в правом нижнем углу — логотип сайта \"DIRTYFLEX.com\".",
+        "description_en": "A close-up shot of two young women in an intimate setting. On the right is a woman with fair skin and dark hair pulled back; she is smiling while looking at the other woman's bare back, pressing her face against it. She wears red lipstick and has a large silver star-shaped earring. On the left, the torso of the second woman is visible from behind: an exposed back and part of the chest with fair skin and moles on the shoulder. The first woman's hand with red nail polish rests on the other's back. The background is blurred and light-colored, likely a room or studio interior. White subtitle text \"gorgeous butt, isn't it?\" is at the bottom center, and the website logo \"DIRTYFLEX.com\" is in the bottom right corner.",
+        "tags_ru": [
+          "женщины",
+          "пара",
+          "обнаженная спина",
+          "поцелуй",
+          "интимная поза",
+          "красный маникюр",
+          "серьги",
+          "субтитры",
+          "логотип",
+          "крупный план",
+          "светлая кожа",
+          "темные волосы",
+          "улыбка",
+          "рука на спине",
+          "интерьер"
+        ],
+        "tags_en": [
+          "women",
+          "couple",
+          "bare back",
+          "kiss",
+          "intimate pose",
+          "red nails",
+          "earrings",
+          "subtitles",
+          "logo",
+          "close-up",
+          "fair skin",
+          "dark hair",
+          "smile",
+          "hand on back",
+          "indoor"
+        ],
+        "people": {
+          "count": 2,
+          "presentation": [
+            "женщина",
+            "женщина"
+          ]
+        },
+        "scene": {
+          "ru": "интерьер комнаты",
+          "en": "room interior",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "целуются",
+            "обнимаются",
+            "улыбаются"
+          ],
+          "en": [
+            "kissing",
+            "hugging",
+            "smiling"
+          ]
+        },
+        "clothing": {
+          "ru": [],
+          "en": []
+        },
+        "objects": {
+          "ru": [
+            "серьги",
+            "субтитры",
+            "логотип"
+          ],
+          "en": [
+            "earrings",
+            "subtitles",
+            "logo"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "крупный план",
+            "размытый фон",
+            "яркое освещение"
+          ],
+          "en": [
+            "close-up",
+            "blurred background",
+            "bright lighting"
+          ]
+        },
+        "content": {
+          "rating": "suggestive",
+          "nsfw": true,
+          "categories": [
+            "suggestive_pose",
+            "intimate_pose"
+          ]
+        },
+        "search_text_ru": "Две женщины в интимной сцене, одна целует обнаженную спину другой, крупный план, субтитры и логотип внизу.",
+        "search_text_en": "Two women in an intimate scene, one kissing the bare back of the other, close-up shot with subtitles and logo at the bottom."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 1467,
+        "completion_tokens": 961,
+        "total_tokens": 2428,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "seconds": 31.48
+    }
+  ]
+}

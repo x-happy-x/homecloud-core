@@ -1,0 +1,751 @@
+{
+  "model": "huihui-qwen3.8-27b-vision",
+  "created_at": "2026-09-14T17:09:12.320975+00:00",
+  "prompt": "C:\\Users\\amagomedsharipov\\Documents\\Codex\\2026-09-10\\https-github-com-reconurge-flowsint-https-2\\outputs\\photo-prototype\\lmstudio_caption_prompt.txt",
+  "samples": [
+    {
+      "set": "nsfw",
+      "path": "D:\\xxx\\Новая папка\\49063.jpg",
+      "filename": "49063.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Селфи женщины во время интимного акта с мужчиной",
+        "caption_short_en": "Woman taking a selfie during intimate act with man",
+        "description_ru": "На изображении крупным планом запечатлены два человека в помещении. Женщина сидит на полу, держа в руке белый смартфон для селфи. У неё тёмные волосы, розовый маникюр, на шее ожерелье, на запястье браслет, пупочный пирсинг и чёрная одежда с разрезами. Мужчина стоит перед ней, его тело частично видно слева, он обнажён. Освещение в комнате яркое, фон светлый.",
+        "description_en": "The image shows a close-up of two people indoors. A woman is sitting on the floor holding a white smartphone for a selfie. She has dark hair, pink manicure, a necklace, bracelets, navel piercing, and black clothing with cutouts. A man stands in front of her, partially visible on the left, appearing nude. The lighting is bright with a light background.",
+        "tags_ru": [
+          "селфи",
+          "женщина",
+          "мужчина",
+          "интимная поза",
+          "нагота",
+          "пирсинг",
+          "украшения",
+          "смартфон",
+          "чёрная одежда",
+          "пол",
+          "помещение",
+          "крупный план",
+          "ночной клуб",
+          "сексуальный контент"
+        ],
+        "tags_en": [
+          "selfie",
+          "woman",
+          "man",
+          "intimate pose",
+          "nudity",
+          "piercing",
+          "jewelry",
+          "smartphone",
+          "black clothing",
+          "floor",
+          "indoor",
+          "close-up",
+          "nightclub",
+          "sexual content"
+        ],
+        "people": {
+          "count": 2,
+          "presentation": [
+            "женщина",
+            "мужчина"
+          ]
+        },
+        "scene": {
+          "ru": "помещение с ярким освещением",
+          "en": "brightly lit indoor room",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "сидит на полу",
+            "держит смартфон",
+            "делает селфи",
+            "интимный акт"
+          ],
+          "en": [
+            "sitting on floor",
+            "holding smartphone",
+            "taking selfie",
+            "intimate act"
+          ]
+        },
+        "clothing": {
+          "ru": [
+            "чёрная одежда",
+            "ожерелье",
+            "браслет",
+            "пирсинг пупка"
+          ],
+          "en": [
+            "black clothing",
+            "necklace",
+            "bracelet",
+            "navel piercing"
+          ]
+        },
+        "objects": {
+          "ru": [
+            "смартфон",
+            "пол"
+          ],
+          "en": [
+            "smartphone",
+            "floor"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "селфи",
+            "крупный план",
+            "яркое освещение"
+          ],
+          "en": [
+            "selfie",
+            "close-up",
+            "bright lighting"
+          ]
+        },
+        "content": {
+          "rating": "explicit",
+          "nsfw": true,
+          "categories": [
+            "nudity",
+            "intimate_pose",
+            "sexual_activity"
+          ]
+        },
+        "search_text_ru": "Селфи женщины и мужчины во время интимного акта в помещении, женщина сидит на полу с телефоном, мужчина обнажён.",
+        "search_text_en": "Selfie of a woman and man during an intimate act indoors, woman sitting on floor with phone, man is nude."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 1832,
+        "completion_tokens": 826,
+        "total_tokens": 2658,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "wd_context": {
+        "ratings": {
+          "safe": 0.0814,
+          "sensitive": 0.0053,
+          "questionable": 0.0008,
+          "explicit": 0.9827
+        },
+        "tags": [
+          {
+            "name": "navel piercing",
+            "score": 0.9866
+          },
+          {
+            "name": "oral",
+            "score": 0.9805
+          },
+          {
+            "name": "penis",
+            "score": 0.9789
+          },
+          {
+            "name": "1girl",
+            "score": 0.9785
+          },
+          {
+            "name": "hetero",
+            "score": 0.9732
+          },
+          {
+            "name": "fellatio",
+            "score": 0.9675
+          },
+          {
+            "name": "1boy",
+            "score": 0.9474
+          },
+          {
+            "name": "piercing",
+            "score": 0.8933
+          },
+          {
+            "name": "jewelry",
+            "score": 0.8072
+          },
+          {
+            "name": "realistic",
+            "score": 0.7695
+          },
+          {
+            "name": "squatting",
+            "score": 0.7527
+          },
+          {
+            "name": "necklace",
+            "score": 0.6943
+          },
+          {
+            "name": "solo focus",
+            "score": 0.6349
+          },
+          {
+            "name": "clothed female nude male",
+            "score": 0.6327
+          },
+          {
+            "name": "nude",
+            "score": 0.5993
+          },
+          {
+            "name": "fat",
+            "score": 0.5919
+          },
+          {
+            "name": "selfie",
+            "score": 0.5888
+          },
+          {
+            "name": "ring",
+            "score": 0.5837
+          },
+          {
+            "name": "blue skin",
+            "score": 0.5821
+          },
+          {
+            "name": "bracelet",
+            "score": 0.5641
+          },
+          {
+            "name": "navel",
+            "score": 0.5442
+          },
+          {
+            "name": "midriff",
+            "score": 0.5398
+          },
+          {
+            "name": "phone",
+            "score": 0.5266
+          },
+          {
+            "name": "black hair",
+            "score": 0.514
+          },
+          {
+            "name": "long hair",
+            "score": 0.5116
+          },
+          {
+            "name": "censored",
+            "score": 0.456
+          },
+          {
+            "name": "fat man",
+            "score": 0.4503
+          },
+          {
+            "name": "nail polish",
+            "score": 0.4169
+          },
+          {
+            "name": "colored skin",
+            "score": 0.4107
+          },
+          {
+            "name": "cellphone",
+            "score": 0.3759
+          }
+        ]
+      },
+      "seconds": 51.66
+    },
+    {
+      "set": "nsfw",
+      "path": "D:\\xxx\\Новая папка\\48595.jpg",
+      "filename": "48595.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Девушка с леденцом и пенисом на лице",
+        "caption_short_en": "Girl with lollipop and penis on face",
+        "description_ru": "Крупный план молодой женщины с тёмными волосами, лежащей на белой поверхности. У неё открыт рот, язык высовывается, а в руке она держит розовый леденец-лопоухий. На её лице и шее видны следы белого крема или пены. В левой части кадра находится мужской пенис с синеватым оттенком кожи, расположенный рядом с её лицом. Освещение яркое, создающее контрастные тени.",
+        "description_en": "Close-up of a young woman with dark hair lying on a white surface. Her mouth is open with her tongue out, and she holds a pink lollipop in one hand. White cream or foam is visible on her face and neck. A male penis with blue-tinted skin is positioned near her face on the left side of the frame. The lighting is bright, creating high contrast.",
+        "tags_ru": [
+          "девушка",
+          "пенис",
+          "леденец",
+          "рот открыт",
+          "язык",
+          "нагота",
+          "сексуальный контент",
+          "белый фон",
+          "крем на лице",
+          "крупный план",
+          "фотография",
+          "интимная поза"
+        ],
+        "tags_en": [
+          "girl",
+          "penis",
+          "lollipop",
+          "open mouth",
+          "tongue out",
+          "nude",
+          "sexual content",
+          "white background",
+          "cream on face",
+          "close-up",
+          "photography",
+          "intimate pose"
+        ],
+        "people": {
+          "count": 2,
+          "presentation": [
+            "женщина",
+            "мужчина (частично)"
+          ]
+        },
+        "scene": {
+          "ru": "белая поверхность, вероятно кровать",
+          "en": "white surface, likely bed",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "лежит",
+            "держит леденец",
+            "открытый рот"
+          ],
+          "en": [
+            "lying down",
+            "holding lollipop",
+            "open mouth"
+          ]
+        },
+        "clothing": {
+          "ru": [],
+          "en": []
+        },
+        "objects": {
+          "ru": [
+            "леденец",
+            "палочка от леденца"
+          ],
+          "en": [
+            "lollipop",
+            "candy stick"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "крупный план",
+            "яркий свет",
+            "тени"
+          ],
+          "en": [
+            "close-up",
+            "bright light",
+            "shadows"
+          ]
+        },
+        "content": {
+          "rating": "explicit",
+          "nsfw": true,
+          "categories": [
+            "nudity",
+            "sexual_activity"
+          ]
+        },
+        "search_text_ru": "Девушка с тёмными волосами лежит на белом фоне, держит розовый леденец, рот открыт, рядом пенис, следы крема на лице.",
+        "search_text_en": "Dark-haired girl lying on white background holding pink lollipop, mouth open, penis nearby, cream traces on face."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 1956,
+        "completion_tokens": 762,
+        "total_tokens": 2718,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "wd_context": {
+        "ratings": {
+          "safe": 0.0906,
+          "sensitive": 0.0052,
+          "questionable": 0.003,
+          "explicit": 0.9777
+        },
+        "tags": [
+          {
+            "name": "1girl",
+            "score": 0.9968
+          },
+          {
+            "name": "food",
+            "score": 0.9766
+          },
+          {
+            "name": "penis",
+            "score": 0.9703
+          },
+          {
+            "name": "hetero",
+            "score": 0.9641
+          },
+          {
+            "name": "candy",
+            "score": 0.9533
+          },
+          {
+            "name": "realistic",
+            "score": 0.9522
+          },
+          {
+            "name": "1boy",
+            "score": 0.9484
+          },
+          {
+            "name": "colored skin",
+            "score": 0.9437
+          },
+          {
+            "name": "blue skin",
+            "score": 0.9102
+          },
+          {
+            "name": "open mouth",
+            "score": 0.8894
+          },
+          {
+            "name": "lollipop",
+            "score": 0.8848
+          },
+          {
+            "name": "uncensored",
+            "score": 0.8326
+          },
+          {
+            "name": "solo focus",
+            "score": 0.8269
+          },
+          {
+            "name": "tongue",
+            "score": 0.78
+          },
+          {
+            "name": "purple skin",
+            "score": 0.6888
+          },
+          {
+            "name": "holding",
+            "score": 0.687
+          },
+          {
+            "name": "purple lips",
+            "score": 0.6745
+          },
+          {
+            "name": "erection",
+            "score": 0.6608
+          },
+          {
+            "name": "holding food",
+            "score": 0.6332
+          },
+          {
+            "name": "holding candy",
+            "score": 0.6253
+          },
+          {
+            "name": "brown hair",
+            "score": 0.6233
+          },
+          {
+            "name": "tongue out",
+            "score": 0.5838
+          },
+          {
+            "name": "cum",
+            "score": 0.5382
+          },
+          {
+            "name": "facial",
+            "score": 0.5215
+          },
+          {
+            "name": "scrunchie",
+            "score": 0.4832
+          },
+          {
+            "name": "nose",
+            "score": 0.4705
+          },
+          {
+            "name": "portrait",
+            "score": 0.44
+          },
+          {
+            "name": "lips",
+            "score": 0.4211
+          },
+          {
+            "name": "photorealistic",
+            "score": 0.4046
+          },
+          {
+            "name": "one eye closed",
+            "score": 0.3748
+          }
+        ]
+      },
+      "seconds": 50.64
+    },
+    {
+      "set": "nsfw",
+      "path": "D:\\xxx\\Новая папка\\46332.jpg",
+      "filename": "46332.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Две женщины в интимной близости с субтитрами",
+        "caption_short_en": "Two women in intimate close-up with subtitles",
+        "description_ru": "Крупный план двух молодых женщин в интимном положении. Женщина на переднем плане, видная со спины и сбоку, обнажена до пояса, её грудь частично видна. Вторая женщина справа смотрит на неё с улыбкой, у неё тёмные волосы, собранные назад, серьги-подвески и розовый маникюр; она касается груди первой женщины рукой. На нижней части изображения есть английские субтитры «gorgeous butt, isn't it?» и логотип сайта DIRTYFLEX.com в правом нижнем углу. Фон светлый, размытый, вероятно, интерьер.",
+        "description_en": "Close-up of two young women in an intimate position. The woman in the foreground is seen from behind and the side, bare-chested with her breast partially visible. The second woman on the right looks at her smiling, with dark hair tied back, dangling earrings, and pink nail polish; she touches the first woman's breast with her hand. English subtitles reading 'gorgeous butt, isn't it?' appear at the bottom, along with a DIRTYFLEX.com logo in the lower right corner. The background is light and blurred, likely an indoor setting.",
+        "tags_ru": [
+          "женщины",
+          "пара",
+          "интимная поза",
+          "нагота",
+          "грудь",
+          "рука",
+          "улыбка",
+          "субтитры",
+          "крупный план",
+          "маникюр",
+          "серьги",
+          "вид со спины",
+          "внутренний интерьер"
+        ],
+        "tags_en": [
+          "women",
+          "couple",
+          "intimate pose",
+          "nude",
+          "breasts",
+          "hand",
+          "smile",
+          "subtitles",
+          "close-up",
+          "manicure",
+          "earrings",
+          "back view",
+          "indoor"
+        ],
+        "people": {
+          "count": 2,
+          "presentation": [
+            "женщина",
+            "женщина"
+          ]
+        },
+        "scene": {
+          "ru": "интерьер",
+          "en": "interior",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "обнажённая поза",
+            "касание груди",
+            "улыбка"
+          ],
+          "en": [
+            "nude pose",
+            "touching breast",
+            "smiling"
+          ]
+        },
+        "clothing": {
+          "ru": [],
+          "en": []
+        },
+        "objects": {
+          "ru": [
+            "серьги",
+            "субтитры",
+            "логотип"
+          ],
+          "en": [
+            "earrings",
+            "subtitles",
+            "logo"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "крупный план",
+            "субтитры",
+            "вид со спины"
+          ],
+          "en": [
+            "close-up",
+            "subtitled",
+            "back view"
+          ]
+        },
+        "content": {
+          "rating": "nudity",
+          "nsfw": true,
+          "categories": [
+            "partial_nudity",
+            "intimate_pose"
+          ]
+        },
+        "search_text_ru": "Крупный план двух обнажённых женщин в интимной позе с субтитрами и логотипом сайта.",
+        "search_text_en": "Close-up of two nude women in an intimate pose with subtitles and a website logo."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 1724,
+        "completion_tokens": 703,
+        "total_tokens": 2427,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "wd_context": {
+        "ratings": {
+          "safe": 0.007,
+          "sensitive": 0.0034,
+          "questionable": 0.9537,
+          "explicit": 0.0551
+        },
+        "tags": [
+          {
+            "name": "yuri",
+            "score": 0.9872
+          },
+          {
+            "name": "multiple girls",
+            "score": 0.9848
+          },
+          {
+            "name": "2girls",
+            "score": 0.9609
+          },
+          {
+            "name": "blue skin",
+            "score": 0.9408
+          },
+          {
+            "name": "colored skin",
+            "score": 0.9259
+          },
+          {
+            "name": "english text",
+            "score": 0.8837
+          },
+          {
+            "name": "nude",
+            "score": 0.8664
+          },
+          {
+            "name": "purple nails",
+            "score": 0.8399
+          },
+          {
+            "name": "meme",
+            "score": 0.8389
+          },
+          {
+            "name": "breasts",
+            "score": 0.7997
+          },
+          {
+            "name": "teeth",
+            "score": 0.7772
+          },
+          {
+            "name": "subtitled",
+            "score": 0.7764
+          },
+          {
+            "name": "black hair",
+            "score": 0.7711
+          },
+          {
+            "name": "closed eyes",
+            "score": 0.7692
+          },
+          {
+            "name": "jewelry",
+            "score": 0.7286
+          },
+          {
+            "name": "ass",
+            "score": 0.7269
+          },
+          {
+            "name": "navel",
+            "score": 0.6767
+          },
+          {
+            "name": "earrings",
+            "score": 0.6444
+          },
+          {
+            "name": "groping",
+            "score": 0.6237
+          },
+          {
+            "name": "purple lips",
+            "score": 0.5982
+          },
+          {
+            "name": "age difference",
+            "score": 0.5807
+          },
+          {
+            "name": "realistic",
+            "score": 0.551
+          },
+          {
+            "name": "grin",
+            "score": 0.5356
+          },
+          {
+            "name": "smile",
+            "score": 0.5017
+          },
+          {
+            "name": "long hair",
+            "score": 0.4809
+          },
+          {
+            "name": "biting own lip",
+            "score": 0.4617
+          },
+          {
+            "name": "completely nude",
+            "score": 0.4613
+          },
+          {
+            "name": "large breasts",
+            "score": 0.4338
+          },
+          {
+            "name": "onee-loli",
+            "score": 0.4067
+          },
+          {
+            "name": "head out of frame",
+            "score": 0.4066
+          }
+        ]
+      },
+      "seconds": 46.21
+    }
+  ]
+}

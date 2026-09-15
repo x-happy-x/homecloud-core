@@ -1,0 +1,260 @@
+{
+  "model": "huihui-qwen3.8-27b-vision",
+  "created_at": "2026-09-14T17:08:11.605525+00:00",
+  "prompt": "C:\\Users\\amagomedsharipov\\Documents\\Codex\\2026-09-10\\https-github-com-reconurge-flowsint-https-2\\outputs\\photo-prototype\\lmstudio_caption_prompt.txt",
+  "samples": [
+    {
+      "set": "nsfw",
+      "path": "D:\\xxx\\Новая папка\\49063.jpg",
+      "filename": "49063.jpg",
+      "ok": true,
+      "result": {
+        "caption_short_ru": "Селфи женщины и мужчины во время интимного момента",
+        "caption_short_en": "Selfie of a woman and man during an intimate moment",
+        "description_ru": "На изображении крупным планом запечатлены два человека в помещении. Женщина с длинными тёмными волосами сидит на полу, держа в руке белый смартфон и делая селфи. Она одета в чёрный топ, открывающий живот, и чёрные чулки с подвязками, на ногах — высокие каблуки. На шее у неё ожерелье, на запястье браслет, виден пирсинг пупка. Мужчина стоит перед ней, его тело частично видно в кадре; он голый по пояс. Женщина выполняет оральный секс, мужчина находится в позе приседа или наклона. Фон — светлая стена и пол с узором.",
+        "description_en": "A close-up image of two people in an indoor setting. A woman with long dark hair is sitting on the floor holding a white smartphone to take a selfie. She wears a black top exposing her midriff, black stockings with garters, and high heels. She has a necklace, bracelets, and a navel piercing. A man stands before her, partially visible in the frame; he is shirtless. The woman is performing oral sex while the man squats or leans forward. The background shows a light-colored wall and patterned floor.",
+        "tags_ru": [
+          "селфи",
+          "женщина",
+          "мужчина",
+          "оральный секс",
+          "фелляция",
+          "пирсинг пупка",
+          "чулки",
+          "подвязки",
+          "высокие каблуки",
+          "чёрная одежда",
+          "интимный момент",
+          "крупный план",
+          "в помещении"
+        ],
+        "tags_en": [
+          "selfie",
+          "woman",
+          "man",
+          "oral sex",
+          "fellatio",
+          "navel piercing",
+          "stockings",
+          "garters",
+          "high heels",
+          "black clothing",
+          "intimate moment",
+          "close-up",
+          "indoor"
+        ],
+        "people": {
+          "count": 2,
+          "presentation": [
+            "женщина",
+            "мужчина"
+          ]
+        },
+        "scene": {
+          "ru": "помещение",
+          "en": "room",
+          "indoor": true,
+          "outdoor": false
+        },
+        "actions": {
+          "ru": [
+            "делает селфи",
+            "оральный секс"
+          ],
+          "en": [
+            "taking a selfie",
+            "oral sex"
+          ]
+        },
+        "clothing": {
+          "ru": [
+            "чёрный топ",
+            "чулки",
+            "подвязки",
+            "высокие каблуки",
+            "ожерелье",
+            "браслет"
+          ],
+          "en": [
+            "black top",
+            "stockings",
+            "garters",
+            "high heels",
+            "necklace",
+            "bracelet"
+          ]
+        },
+        "objects": {
+          "ru": [
+            "смартфон"
+          ],
+          "en": [
+            "smartphone"
+          ]
+        },
+        "visual_attributes": {
+          "ru": [
+            "селфи",
+            "крупный план",
+            "интимная поза"
+          ],
+          "en": [
+            "selfie",
+            "close-up",
+            "intimate pose"
+          ]
+        },
+        "content": {
+          "rating": "explicit",
+          "nsfw": true,
+          "categories": [
+            "sexual_activity",
+            "suggestive_pose"
+          ]
+        },
+        "search_text_ru": "Селфи женщины и мужчины во время орального секса в помещении, женщина в чёрной одежде с чулками и пирсингом пупка.",
+        "search_text_en": "Selfie of a woman and man during oral sex in a room, woman wearing black clothing with stockings and navel piercing."
+      },
+      "issues": [],
+      "usage": {
+        "prompt_tokens": 1832,
+        "completion_tokens": 763,
+        "total_tokens": 2595,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "wd_context": {
+        "ratings": {
+          "safe": 0.0814,
+          "sensitive": 0.0053,
+          "questionable": 0.0008,
+          "explicit": 0.9827
+        },
+        "tags": [
+          {
+            "name": "navel piercing",
+            "score": 0.9866
+          },
+          {
+            "name": "oral",
+            "score": 0.9805
+          },
+          {
+            "name": "penis",
+            "score": 0.9789
+          },
+          {
+            "name": "1girl",
+            "score": 0.9785
+          },
+          {
+            "name": "hetero",
+            "score": 0.9732
+          },
+          {
+            "name": "fellatio",
+            "score": 0.9675
+          },
+          {
+            "name": "1boy",
+            "score": 0.9474
+          },
+          {
+            "name": "piercing",
+            "score": 0.8933
+          },
+          {
+            "name": "jewelry",
+            "score": 0.8072
+          },
+          {
+            "name": "realistic",
+            "score": 0.7695
+          },
+          {
+            "name": "squatting",
+            "score": 0.7527
+          },
+          {
+            "name": "necklace",
+            "score": 0.6943
+          },
+          {
+            "name": "solo focus",
+            "score": 0.6349
+          },
+          {
+            "name": "clothed female nude male",
+            "score": 0.6327
+          },
+          {
+            "name": "nude",
+            "score": 0.5993
+          },
+          {
+            "name": "fat",
+            "score": 0.5919
+          },
+          {
+            "name": "selfie",
+            "score": 0.5888
+          },
+          {
+            "name": "ring",
+            "score": 0.5837
+          },
+          {
+            "name": "blue skin",
+            "score": 0.5821
+          },
+          {
+            "name": "bracelet",
+            "score": 0.5641
+          },
+          {
+            "name": "navel",
+            "score": 0.5442
+          },
+          {
+            "name": "midriff",
+            "score": 0.5398
+          },
+          {
+            "name": "phone",
+            "score": 0.5266
+          },
+          {
+            "name": "black hair",
+            "score": 0.514
+          },
+          {
+            "name": "long hair",
+            "score": 0.5116
+          },
+          {
+            "name": "censored",
+            "score": 0.456
+          },
+          {
+            "name": "fat man",
+            "score": 0.4503
+          },
+          {
+            "name": "nail polish",
+            "score": 0.4169
+          },
+          {
+            "name": "colored skin",
+            "score": 0.4107
+          },
+          {
+            "name": "cellphone",
+            "score": 0.3759
+          }
+        ]
+      },
+      "seconds": 51.02
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "photos_ok": 545,
+  "photo_errors": 0,
+  "faces": 650,
+  "groups": 26,
+  "ungrouped_faces": 68,
+  "primary_faces_evaluated": 545,
+  "ungrouped_primary_faces": 1,
+  "mixed_primary_groups": 0,
+  "adjusted_rand_index": 0.9979066032502929,
+  "homogeneity": 1.0,
+  "completeness": 0.9973126194211891,
+  "v_measure": 0.9986545017776989,
+  "mean_membership_confidence": 0.9379917094002405,
+  "algorithm": "HDBSCAN(min_cluster_size=3,min_samples=2,euclidean_on_normalized_vectors)",
+  "notes": "LFW labels describe the main subject. Evaluation uses the largest detected face per photo; all faces still participate in clustering. This curated benchmark is not a family-photo accuracy estimate."
+}
