@@ -296,25 +296,30 @@ class CatalogStore:
                         (datetime.now(timezone.utc).isoformat(), description,
                          json.dumps(state, separators=(',', ':'))))
 
-    def assign(self, face_ids, name, bigfam_id=None):
+    def find_or_create_person(self, name, bigfam_id=None):
+        """Человек по имени: та же запись, если уже есть, иначе новая."""
         name = name.strip()
         bigfam_id = (bigfam_id or '').strip() or None
-        face_ids = sorted(set(face_ids))
         if not name:
             raise ValueError('Введите имя человека')
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.execute('INSERT INTO people(name,created_at) VALUES(?,?) ON CONFLICT(name) DO NOTHING',
+                        (name, now))
+        person_id = self.db.execute('SELECT id FROM people WHERE name=?', (name,)).fetchone()[0]
+        if bigfam_id:
+            # Один человек картотеки — одна запись каталога.
+            self.db.execute('UPDATE people SET bigfam_id=NULL WHERE bigfam_id=? AND id!=?',
+                            (bigfam_id, person_id))
+            self.db.execute('UPDATE people SET bigfam_id=? WHERE id=?', (bigfam_id, person_id))
+        return person_id
+
+    def assign(self, face_ids, name, bigfam_id=None):
+        face_ids = sorted(set(face_ids))
         if not face_ids:
             raise ValueError('Выберите группу или лица')
-        now = datetime.now(timezone.utc).isoformat()
         with self.db:
-            self._snapshot(face_ids, f'Назначено имя «{name}»')
-            self.db.execute('INSERT INTO people(name,created_at) VALUES(?,?) ON CONFLICT(name) DO NOTHING',
-                            (name, now))
-            person_id = self.db.execute('SELECT id FROM people WHERE name=?', (name,)).fetchone()[0]
-            if bigfam_id:
-                # Один человек картотеки — одна запись каталога.
-                self.db.execute('UPDATE people SET bigfam_id=NULL WHERE bigfam_id=? AND id!=?',
-                                (bigfam_id, person_id))
-                self.db.execute('UPDATE people SET bigfam_id=? WHERE id=?', (bigfam_id, person_id))
+            self._snapshot(face_ids, f'Назначено имя «{name.strip()}»')
+            person_id = self.find_or_create_person(name, bigfam_id)
             self.db.executemany(
                 'INSERT INTO face_people(face_id,person_id) VALUES(?,?) '
                 'ON CONFLICT(face_id) DO UPDATE SET person_id=excluded.person_id',

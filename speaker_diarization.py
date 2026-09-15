@@ -89,6 +89,10 @@ def connect(catalog):
         # с лицом, но это именно догадка, отсюда отдельные колонки.
         db.execute('ALTER TABLE video_speakers ADD COLUMN suggested_person_id INTEGER')
         db.execute('ALTER TABLE video_speakers ADD COLUMN suggested_confidence REAL NOT NULL DEFAULT 0')
+    if 'assigned_person_id' not in speaker_columns:
+        # Человек вручную назначил голос — это выше и связки по лицу, и
+        # подсказки по голосу: решение человека, а не догадка алгоритма.
+        db.execute('ALTER TABLE video_speakers ADD COLUMN assigned_person_id INTEGER')
     db.commit()
     return db
 
@@ -242,42 +246,46 @@ def link_speakers_to_faces(db, path, turns, min_overlap=0.3, dominance=0.7):
     return links
 
 
-def update_voice_prints(db, links, speakers):
-    """Пополняет голосовой эталон человека — если лицо в кадре уже названо.
+def apply_voice_sample(db, person_id, embedding):
+    """Добавляет один голосовой образец в постоянный эталон человека.
 
-    Эталон — не ролик, а человек: усредняется по всем подтверждённым
-    случаям, чтобы потом узнавать голос и там, где лица не видно вовсе.
+    Эталон — не ролик, а человек: скользящее среднее по всем подтверждённым
+    случаям (не важно, лицом или руками), чтобы потом узнавать голос и там,
+    где лица не видно вовсе.
     """
+    vector = embedding / (np.linalg.norm(embedding) or 1)
+    existing = db.execute('SELECT embedding,samples FROM voice_prints WHERE person_id=?',
+                          (person_id,)).fetchone()
+    if existing:
+        old_vector = np.frombuffer(existing[0], dtype='<f4')
+        samples = existing[1]
+        merged = (old_vector * samples + vector) / (samples + 1)
+        samples += 1
+    else:
+        merged, samples = vector, 1
+    merged = merged / (np.linalg.norm(merged) or 1)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.execute(
+        'INSERT INTO voice_prints(person_id,embedding,dims,samples,updated_at) '
+        'VALUES(?,?,?,?,?) ON CONFLICT(person_id) DO UPDATE SET '
+        'embedding=excluded.embedding,dims=excluded.dims,samples=excluded.samples,'
+        'updated_at=excluded.updated_at',
+        (person_id, merged.astype('<f4').tobytes(), merged.shape[0], samples, now))
+
+
+def update_voice_prints(db, links, speakers):
+    """Пополняет голосовой эталон человека — если лицо в кадре уже названо."""
     has_people = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_people'").fetchone()
     if not has_people or not links:
         return
     embeddings = {label: embedding for label, _, embedding in speakers}
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     for speaker, (face_id, _) in links.items():
         row = db.execute('SELECT person_id FROM face_people WHERE face_id=?',
                          (face_id,)).fetchone()
         if not row or speaker not in embeddings:
             continue
-        person_id = row[0]
-        vector = embeddings[speaker]
-        vector = vector / (np.linalg.norm(vector) or 1)
-        existing = db.execute('SELECT embedding,samples FROM voice_prints WHERE person_id=?',
-                              (person_id,)).fetchone()
-        if existing:
-            old_vector = np.frombuffer(existing[0], dtype='<f4')
-            samples = existing[1]
-            merged = (old_vector * samples + vector) / (samples + 1)
-            samples += 1
-        else:
-            merged, samples = vector, 1
-        merged = merged / (np.linalg.norm(merged) or 1)
-        db.execute(
-            'INSERT INTO voice_prints(person_id,embedding,dims,samples,updated_at) '
-            'VALUES(?,?,?,?,?) ON CONFLICT(person_id) DO UPDATE SET '
-            'embedding=excluded.embedding,dims=excluded.dims,samples=excluded.samples,'
-            'updated_at=excluded.updated_at',
-            (person_id, merged.astype('<f4').tobytes(), merged.shape[0], samples, now))
+        apply_voice_sample(db, row[0], embeddings[speaker])
 
 
 def suggest_from_voice(db, speakers, threshold=0.55):

@@ -1682,10 +1682,17 @@ class Handler(BaseHTTPRequestHandler):
                     speakers = self.app.store.db.execute(
                         'SELECT speaker,seconds FROM video_speakers WHERE path=?',
                         (raw_path,)).fetchall()
-                    # Кто говорит — по имени, если получилось узнать: лицо в кадре
-                    # (надёжно) или похожий голос, встречавшийся у названного
-                    # человека раньше (это уже подсказка, не факт).
+                    # Кто говорит — по имени, если получилось узнать. Порядок
+                    # доверия: назначено руками (решение человека) → лицо в
+                    # кадре (надёжная связка) → похожий голос, встречавшийся у
+                    # названного человека раньше (это уже подсказка, не факт).
                     people = {}
+                    for speaker, person_id, name in self.app.store.db.execute(
+                            'SELECT video_speakers.speaker,people.id,people.name '
+                            'FROM video_speakers JOIN people '
+                            'ON people.id=video_speakers.assigned_person_id '
+                            'WHERE video_speakers.path=?', (raw_path,)):
+                        people[speaker] = {'name': name, 'confidence': 1.0, 'source': 'manual'}
                     for speaker, name, confidence in self.app.store.db.execute(
                             'SELECT video_speaker_faces.speaker,people.name,'
                             'video_speaker_faces.confidence FROM video_speaker_faces '
@@ -1693,6 +1700,8 @@ class Handler(BaseHTTPRequestHandler):
                             'JOIN face_people ON face_people.face_id=faces.id '
                             'JOIN people ON people.id=face_people.person_id '
                             'WHERE video_speaker_faces.path=?', (raw_path,)):
+                        if speaker in people:
+                            continue  # ручное назначение уже решило вопрос
                         people[speaker] = {'name': name, 'confidence': confidence,
                                            'source': 'face'}
                     for speaker, person_id, confidence in self.app.store.db.execute(
@@ -1700,7 +1709,7 @@ class Handler(BaseHTTPRequestHandler):
                             'FROM video_speakers WHERE path=? AND suggested_person_id IS NOT NULL',
                             (raw_path,)):
                         if speaker in people:
-                            continue  # лицо надёжнее голосовой догадки
+                            continue  # лицо или ручное назначение надёжнее догадки
                         name = self.app.store.db.execute(
                             'SELECT name FROM people WHERE id=?', (person_id,)).fetchone()
                         if name:
@@ -1841,6 +1850,33 @@ class Handler(BaseHTTPRequestHandler):
                          file=sys.stderr, flush=True)
                     return self.error_json(502, f'Не удалось загрузить снимок для поиска: {exc}')
                 return self.json_response({'ok': True, 'url': url})
+            if path == '/api/photos/assign-speaker':
+                raw_path = body.get('path', '')
+                speaker = body.get('speaker', '')
+                if not speaker:
+                    return self.error_json(400, 'Не указан голос')
+                with self.app.lock:
+                    row = self.app.store.db.execute(
+                        'SELECT embedding FROM video_speakers WHERE path=? AND speaker=?',
+                        (raw_path, speaker)).fetchone()
+                    if row is None:
+                        return self.error_json(404, 'Голос не найден')
+                    try:
+                        with self.app.store.db:
+                            person_id = self.app.store.find_or_create_person(
+                                body.get('name', ''), body.get('bigfam_id'))
+                            self.app.store.db.execute(
+                                'UPDATE video_speakers SET assigned_person_id=? '
+                                'WHERE path=? AND speaker=?', (person_id, raw_path, speaker))
+                            # Человек уже подтвердил голос руками — это такой же
+                            # надёжный образец, как связка через лицо в кадре.
+                            if row[0]:
+                                speaker_diarization.apply_voice_sample(
+                                    self.app.store.db, person_id,
+                                    np.frombuffer(row[0], dtype='<f4'))
+                    except ValueError as exc:
+                        return self.error_json(400, str(exc))
+                return self.json_response({'ok': True})
             if path == '/api/photos/hide':
                 viewer, admin = self.viewer
                 with self.app.lock:
