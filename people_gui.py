@@ -19,7 +19,7 @@ from prototype import cluster_embeddings, database
 
 
 class CatalogStore:
-    def __init__(self, folder, min_cluster_size=3, thread_safe=False, max_faces=0,
+    def __init__(self, folder, min_cluster_size=8, thread_safe=False, max_faces=0,
                  chunk=4000, assign_threshold=0.66):
         self.folder = Path(folder).resolve()
         self.db = database(self.folder, check_same_thread=not thread_safe)
@@ -479,7 +479,7 @@ class MainWindow(QMainWindow):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=Path, required=True)
-    parser.add_argument('--min-cluster-size', type=int, default=3)
+    parser.add_argument('--min-cluster-size', type=int, default=8)
     args = parser.parse_args()
     app = QApplication(sys.argv)
     try:

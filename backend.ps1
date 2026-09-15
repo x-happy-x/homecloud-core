@@ -6,7 +6,7 @@ param(
     [string]$Catalog = (Join-Path $PSScriptRoot 'trash-clean-catalog'),
     [int]$Port = 18311,
     [string]$ListenAddress = '0.0.0.0',
-    [int]$MinClusterSize = 3,
+    [int]$MinClusterSize = 8,
     [int]$MaxFaces = 100000,   # каталог давно больше прототипного образца
     [string]$TokenFile = (Join-Path $PSScriptRoot 'backend-token.txt'),
     [string]$DeviceId = ($env:COMPUTERNAME.ToLowerInvariant()),

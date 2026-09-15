@@ -556,7 +556,7 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
     return len(taken), len(results) - len(taken), len(stale)
 
 
-def cluster_embeddings(matrix, algorithm='hdbscan', distance=0.35, min_cluster_size=3):
+def cluster_embeddings(matrix, algorithm='hdbscan', distance=0.35, min_cluster_size=8):
     """Cluster normalized face vectors and return labels plus membership confidence."""
     import numpy as np
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
@@ -644,7 +644,7 @@ def main():
     gallery_parser.add_argument('--data', type=Path, default=Path('data'))
     gallery_parser.add_argument('--algorithm', choices=('hdbscan', 'dbscan'), default='hdbscan')
     gallery_parser.add_argument('--distance', type=float, default=0.35)
-    gallery_parser.add_argument('--min-cluster-size', type=int, default=3)
+    gallery_parser.add_argument('--min-cluster-size', type=int, default=8)
     args = parser.parse_args()
     if args.command == 'scan' and args.limit < 1:
         parser.error('--limit must be positive')

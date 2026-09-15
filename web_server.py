@@ -744,7 +744,7 @@ class DuplicateService:
 
 
 class App:
-    def __init__(self, data, min_cluster_size=3, token=None,
+    def __init__(self, data, min_cluster_size=8, token=None,
                  device_id=None, device_name=None, max_faces=0):
         schema = analysis_database(Path(data).resolve())
         schema.close()
@@ -2215,7 +2215,7 @@ def main():
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8787)
-    parser.add_argument('--min-cluster-size', type=int, default=3)
+    parser.add_argument('--min-cluster-size', type=int, default=8)
     parser.add_argument('--max-faces', type=int, default=0,
                         help='Потолок лиц в каталоге; 0 — без ограничения')
     parser.add_argument('--no-browser', action='store_true')
