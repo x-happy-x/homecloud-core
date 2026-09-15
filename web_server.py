@@ -1674,11 +1674,35 @@ class Handler(BaseHTTPRequestHandler):
                     speakers = self.app.store.db.execute(
                         'SELECT speaker,seconds FROM video_speakers WHERE path=?',
                         (raw_path,)).fetchall()
+                    # Кто говорит — по имени, если получилось узнать: лицо в кадре
+                    # (надёжно) или похожий голос, встречавшийся у названного
+                    # человека раньше (это уже подсказка, не факт).
+                    people = {}
+                    for speaker, name, confidence in self.app.store.db.execute(
+                            'SELECT video_speaker_faces.speaker,people.name,'
+                            'video_speaker_faces.confidence FROM video_speaker_faces '
+                            'JOIN faces ON faces.id=video_speaker_faces.face_id '
+                            'JOIN face_people ON face_people.face_id=faces.id '
+                            'JOIN people ON people.id=face_people.person_id '
+                            'WHERE video_speaker_faces.path=?', (raw_path,)):
+                        people[speaker] = {'name': name, 'confidence': confidence,
+                                           'source': 'face'}
+                    for speaker, person_id, confidence in self.app.store.db.execute(
+                            'SELECT speaker,suggested_person_id,suggested_confidence '
+                            'FROM video_speakers WHERE path=? AND suggested_person_id IS NOT NULL',
+                            (raw_path,)):
+                        if speaker in people:
+                            continue  # лицо надёжнее голосовой догадки
+                        name = self.app.store.db.execute(
+                            'SELECT name FROM people WHERE id=?', (person_id,)).fetchone()
+                        if name:
+                            people[speaker] = {'name': name[0], 'confidence': confidence,
+                                               'source': 'voice'}
                 return self.json_response({
                     'status': row[1] if row else '', 'language': (row and row[0]) or '',
                     'model': (row and row[2]) or '', 'speakers': len(speakers),
                     'segments': [{'start': start, 'stop': stop, 'text': text,
-                                  'speaker': speaker}
+                                  'speaker': speaker, 'person': people.get(speaker)}
                                  for start, stop, text, speaker in segments]})
             if parsed.path.startswith('/media/thumb/'):
                 return self.send_media(parsed.path.rsplit('/', 1)[-1], original=False)

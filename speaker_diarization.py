@@ -1,17 +1,25 @@
-"""Разделение голосов в роликах: кто говорил и когда, без знания кто именно.
+"""Разделение голосов в роликах: кто говорил и когда, а если повезёт — и кто.
 
 pyannote.audio раскладывает звуковую дорожку на интервалы SPEAKER_00,
 SPEAKER_01 и так далее — без заранее известного числа говорящих. Эти метки
 существуют только внутри одного ролика: если во втором ролике снова
-`SPEAKER_00`, это не обязательно тот же человек. Постоянная личность
-появится позже, когда голосовой эмбеддинг сопоставят с сохранёнными
-образцами (`voice_prints`) — здесь только эмбеддинг лежит, готовый для
-сравнения.
+`SPEAKER_00`, это не обязательно тот же человек.
 
 Заодно, раз и диаризация, и расшифровка речи разбирают одну и ту же
 дорожку, репликам из `video_speech_segments` сразу проставляется метка
 говорящего — по тому, чей интервал перекрывает реплику дольше всего. Это не
 требует видео и лиц: чистое совпадение по времени в пределах одного файла.
+
+Если к этому моменту уже есть треки лиц (`faces.track_start/track_stop`,
+этап 3), можно пойти дальше: пока говорящий что-то говорит, посмотреть, чьё
+лицо было единственным в кадре — совпало для нескольких реплик подряд,
+значит это его голос. Осторожно: если в кадре несколько лиц или ни одного,
+решение не принимается вовсе, а не гадается. Как только голос связан с
+названным лицом (`face_people`), его эмбеддинг пополняет `voice_prints` —
+постоянный голосовой образец человека, а не ролика. С этого момента голос
+того же человека можно узнать и там, где лица не видно вовсе — это только
+подсказка (`suggested_person_id` у `video_speakers`), не факт: у неё есть
+`confidence`, и как её показывать — решает уже интерфейс.
 """
 import argparse
 import datetime
@@ -58,10 +66,29 @@ def connect(catalog):
           embedding BLOB, dims INTEGER,
           PRIMARY KEY(path, speaker)
         );
+        CREATE TABLE IF NOT EXISTS video_speaker_faces (
+          path TEXT NOT NULL REFERENCES photos(path) ON DELETE CASCADE,
+          speaker TEXT NOT NULL,
+          face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+          confidence REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY(path, speaker)
+        );
+        CREATE TABLE IF NOT EXISTS voice_prints (
+          person_id INTEGER PRIMARY KEY,
+          embedding BLOB NOT NULL, dims INTEGER NOT NULL,
+          samples INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+        );
     ''')
     columns = {row[1] for row in db.execute('PRAGMA table_info(video_speech_segments)')}
     if columns and 'speaker' not in columns:
         db.execute('ALTER TABLE video_speech_segments ADD COLUMN speaker TEXT')
+    speaker_columns = {row[1] for row in db.execute('PRAGMA table_info(video_speakers)')}
+    if 'suggested_person_id' not in speaker_columns:
+        # Подсказка по голосу — не то же самое, что подтверждённая видео
+        # связка (video_speaker_faces): её можно давать и без единого кадра
+        # с лицом, но это именно догадка, отсюда отдельные колонки.
+        db.execute('ALTER TABLE video_speakers ADD COLUMN suggested_person_id INTEGER')
+        db.execute('ALTER TABLE video_speakers ADD COLUMN suggested_confidence REAL NOT NULL DEFAULT 0')
     db.commit()
     return db
 
@@ -140,22 +167,167 @@ def assign_speakers(db, path, turns):
             'UPDATE video_speech_segments SET speaker=? WHERE path=? AND ord=?', updates)
 
 
-def save(db, path, size, modified, model, turns, speakers):
+def overlap_seconds(first_start, first_stop, second_start, second_stop):
+    return max(0.0, min(first_stop, second_stop) - max(first_start, second_start))
+
+
+def face_tracks(db, path):
+    """Треки лиц этого ролика — не фото и не старые покадровые записи
+    (у тех `track_start` пуст, сравнивать их с репликой по времени нечестно)."""
+    return db.execute(
+        'SELECT id,track_start,track_stop FROM faces '
+        'WHERE path=? AND track_start IS NOT NULL', (path,)).fetchall()
+
+
+def face_groups(db, path):
+    """Треки лиц, сгруппированные по уже подтверждённому человеку.
+
+    Один и тот же человек за ролик обычно выходит из кадра и возвращается
+    не раз — у каждого появления свой `track_id`, но это один голос. Если
+    все такие треки уже названы одним именем, группа — это имя; иначе
+    каждый трек остаётся сам за себя: неизвестно, один ли это человек в
+    разных появлениях или разные, и гадать тут не дело этой функции.
+    """
+    tracks = face_tracks(db, path)
+    if not tracks:
+        return {}
+    named = {}
+    has_people = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_people'").fetchone()
+    if has_people:
+        ids = [face_id for face_id, _, _ in tracks]
+        placeholders = ','.join('?' * len(ids))
+        named = dict(db.execute(
+            f'SELECT face_id,person_id FROM face_people WHERE face_id IN ({placeholders})',
+            ids))
+    groups = {}
+    for face_id, start, stop in tracks:
+        key = ('person', named[face_id]) if face_id in named else ('face', face_id)
+        groups.setdefault(key, []).append((face_id, start, stop))
+    return groups
+
+
+def link_speakers_to_faces(db, path, turns, min_overlap=0.3, dominance=0.7):
+    """Голос → лицо: только когда во время реплики в кадре было ровно одно
+    лицо (или одна уже подтверждённая личность), и так совпадало для
+    большинства реплик этого говорящего. Два лица в кадре или ни одного —
+    повод промолчать, а не гадать.
+    """
+    groups = face_groups(db, path)
+    if not groups or not turns:
+        return {}
+    votes = {}
+    for turn_start, turn_stop, speaker in turns:
+        active = []
+        for key, members in groups.items():
+            weight = sum(overlap_seconds(turn_start, turn_stop, start, stop)
+                         for _, start, stop in members)
+            if weight >= min_overlap:
+                active.append((key, weight))
+        if len(active) != 1:
+            continue
+        key, weight = active[0]
+        votes.setdefault(speaker, {}).setdefault(key, 0.0)
+        votes[speaker][key] += weight
+    links = {}
+    for speaker, candidates in votes.items():
+        total = sum(candidates.values())
+        key, weight = max(candidates.items(), key=lambda item: item[1])
+        confidence = weight / total
+        if confidence < dominance:
+            continue
+        # Представительное лицо для превью — самый долгий трек в группе.
+        face_id = max(groups[key], key=lambda item: item[2] - item[1])[0]
+        links[speaker] = (face_id, round(confidence, 3))
+    return links
+
+
+def update_voice_prints(db, links, speakers):
+    """Пополняет голосовой эталон человека — если лицо в кадре уже названо.
+
+    Эталон — не ролик, а человек: усредняется по всем подтверждённым
+    случаям, чтобы потом узнавать голос и там, где лица не видно вовсе.
+    """
+    has_people = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_people'").fetchone()
+    if not has_people or not links:
+        return
+    embeddings = {label: embedding for label, _, embedding in speakers}
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for speaker, (face_id, _) in links.items():
+        row = db.execute('SELECT person_id FROM face_people WHERE face_id=?',
+                         (face_id,)).fetchone()
+        if not row or speaker not in embeddings:
+            continue
+        person_id = row[0]
+        vector = embeddings[speaker]
+        vector = vector / (np.linalg.norm(vector) or 1)
+        existing = db.execute('SELECT embedding,samples FROM voice_prints WHERE person_id=?',
+                              (person_id,)).fetchone()
+        if existing:
+            old_vector = np.frombuffer(existing[0], dtype='<f4')
+            samples = existing[1]
+            merged = (old_vector * samples + vector) / (samples + 1)
+            samples += 1
+        else:
+            merged, samples = vector, 1
+        merged = merged / (np.linalg.norm(merged) or 1)
+        db.execute(
+            'INSERT INTO voice_prints(person_id,embedding,dims,samples,updated_at) '
+            'VALUES(?,?,?,?,?) ON CONFLICT(person_id) DO UPDATE SET '
+            'embedding=excluded.embedding,dims=excluded.dims,samples=excluded.samples,'
+            'updated_at=excluded.updated_at',
+            (person_id, merged.astype('<f4').tobytes(), merged.shape[0], samples, now))
+
+
+def suggest_from_voice(db, speakers, threshold=0.55):
+    """Догадка по голосу одна — когда лицо не помогло: сам голос уже
+    встречался у названного человека. Это подсказка, а не решение.
+    """
+    prints = db.execute('SELECT person_id,embedding FROM voice_prints').fetchall()
+    if not prints:
+        return {}
+    vectors = {person_id: np.frombuffer(embedding, dtype='<f4') for person_id, embedding in prints}
+    suggestions = {}
+    for label, _, embedding in speakers:
+        vector = embedding / (np.linalg.norm(embedding) or 1)
+        best_person, best_score = None, threshold
+        for person_id, print_vector in vectors.items():
+            score = float(np.dot(vector, print_vector))
+            if score > best_score:
+                best_person, best_score = person_id, score
+        if best_person is not None:
+            suggestions[label] = (best_person, round(best_score, 3))
+    return suggestions
+
+
+def save(db, path, size, modified, model, turns, speakers, links=None, suggestions=None):
     """Реплики говорящих, голосовые эмбеддинги и метки на тексте — одной транзакцией."""
+    links = links or {}
+    suggestions = suggestions or {}
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with db:
         db.execute('DELETE FROM video_speaker_turns WHERE path=?', (path,))
         db.execute('DELETE FROM video_speakers WHERE path=?', (path,))
+        db.execute('DELETE FROM video_speaker_faces WHERE path=?', (path,))
         db.executemany(
             'INSERT INTO video_speaker_turns(path,ord,start,stop,speaker) VALUES(?,?,?,?,?)',
             [(path, index, start, stop, speaker)
              for index, (start, stop, speaker) in enumerate(turns)])
         db.executemany(
-            'INSERT INTO video_speakers(path,speaker,seconds,embedding,dims) VALUES(?,?,?,?,?)',
+            'INSERT INTO video_speakers(path,speaker,seconds,embedding,dims,'
+            'suggested_person_id,suggested_confidence) VALUES(?,?,?,?,?,?,?)',
             [(path, speaker, seconds, embedding.astype(np.float32).tobytes(),
-              embedding.shape[0])
+              embedding.shape[0], *(suggestions.get(speaker) or (None, 0.0)))
              for speaker, seconds, embedding in speakers])
+        if links:
+            db.executemany(
+                'INSERT INTO video_speaker_faces(path,speaker,face_id,confidence) '
+                'VALUES(?,?,?,?)',
+                [(path, speaker, face_id, confidence)
+                 for speaker, (face_id, confidence) in links.items()])
         assign_speakers(db, path, turns)
+        update_voice_prints(db, links, speakers)
         db.execute(
             'INSERT INTO video_diarization(path,size,modified,speakers,model,status,error,'
             'analyzed_at) VALUES(?,?,?,?,?,?,NULL,?)'
@@ -317,7 +489,9 @@ def main():
             audio = decode_audio(path, sampling_rate=16000)
             turns, speakers = diarize(pipeline, audio)
             turns, speakers = merge_close_speakers(turns, speakers)
-            save(db, path, size, modified, args.model, turns, speakers)
+            links = link_speakers_to_faces(db, path, turns)
+            suggestions = suggest_from_voice(db, speakers)
+            save(db, path, size, modified, args.model, turns, speakers, links, suggestions)
             state['multi_speaker' if len(speakers) > 1 else 'single_speaker'] += 1
         except Exception as exc:
             fail(db, path, size, modified, args.model, 'error', f'Диаризация: {exc}')
