@@ -6,22 +6,22 @@ HomeCloud принципиально живёт только в домашней
 никакой регистрации, случайная неугадываемая ссылка, файл автоматически
 стирается по истечении срока.
 
-Из проверенных на месте вариантов (0x0.st, file.io, tmpfiles.org) рабочим
-оказался только этот: 0x0.st недоступен с этой сети (похоже, в блок-листах как
-типичный анонимный дамп), у file.io публичный анонимный приём файлов сейчас
-не работает, а tmpfiles.org отдаёт HTML-страницу вместо самой картинки — для
-поиска по URL нужна именно прямая ссылка на байты изображения.
+Из проверенных на месте вариантов основным был Litterbox. Если он временно
+отваливается, используем Uguu: он тоже возвращает прямую ссылку на байты
+изображения, а не HTML-страницу.
 
 У анонимных заливок в Litterbox нет способа удалить их раньше срока — только
 дождаться истечения. Самый короткий срок из тех, что принимает сервис, — час;
 это и используется, хотя пользователь и просил «пару минут».
 """
 import mimetypes
+import json
 import ssl
 import uuid
 from urllib.request import Request, urlopen
 
 UPLOAD_URL = 'https://litterbox.catbox.moe/resources/internals/api.php'
+UGUU_UPLOAD_URL = 'https://uguu.se/upload.php'
 # Меньше сервис не принимает — это минимальный срок жизни анонимной заливки.
 EXPIRES = '1h'
 
@@ -51,8 +51,7 @@ def _multipart(fields, files):
     return b''.join(parts), f'multipart/form-data; boundary={boundary}'
 
 
-def upload(image_bytes, filename='photo.jpg', timeout=30):
-    """Заливает картинку на Litterbox, возвращает прямую ссылку на файл."""
+def _upload_litterbox(image_bytes, filename, timeout):
     content_type = mimetypes.guess_type(filename)[0] or 'image/jpeg'
     body, content_header = _multipart(
         {'reqtype': 'fileupload', 'time': EXPIRES},
@@ -66,3 +65,35 @@ def upload(image_bytes, filename='photo.jpg', timeout=30):
     if not url.startswith('http'):
         raise RuntimeError(f'Litterbox ответил неожиданно: {url[:200]}')
     return url
+
+
+def _upload_uguu(image_bytes, filename, timeout):
+    content_type = mimetypes.guess_type(filename)[0] or 'image/jpeg'
+    body, content_header = _multipart(
+        {},
+        {'files[]': (filename, image_bytes, content_type)})
+    request = Request(UGUU_UPLOAD_URL, data=body, headers={
+        'Content-Type': content_header,
+        'User-Agent': 'HomeCloud/1.0 (private reverse-image-search helper)',
+    })
+    with urlopen(request, timeout=timeout, context=_UNVERIFIED_CONTEXT) as response:
+        data = response.read().decode('utf-8')
+    try:
+        payload = json.loads(data)
+        url = payload['files'][0]['url'].replace('\\/', '/')
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(f'Uguu ответил неожиданно: {data[:200]}') from exc
+    if not url.startswith('http'):
+        raise RuntimeError(f'Uguu ответил неожиданно: {url[:200]}')
+    return url
+
+
+def upload(image_bytes, filename='photo.jpg', timeout=30):
+    """Заливает картинку во временное хранилище, возвращает прямую ссылку."""
+    errors = []
+    for name, uploader in (('Litterbox', _upload_litterbox), ('Uguu', _upload_uguu)):
+        try:
+            return uploader(image_bytes, filename, timeout)
+        except Exception as exc:
+            errors.append(f'{name}: {exc}')
+    raise RuntimeError('; '.join(errors))
