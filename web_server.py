@@ -285,8 +285,8 @@ class SemanticService:
     def __init__(self, catalog):
         self.root = Path(__file__).resolve().parent
         self.catalog = Path(catalog).resolve()
-        self.python = (self.root / '..' / '..' / 'work' / 'vision-venv' /
-                       'Scripts' / 'python.exe').resolve()
+        # Same venv as vision_python in device_job.py.
+        self.python = self.root / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
         self.process = None
         self.model = None
         self.lock = threading.RLock()
@@ -351,8 +351,8 @@ class RouterController:
     def __init__(self, catalog):
         self.root = Path(__file__).resolve().parent
         self.catalog = Path(catalog).resolve()
-        self.python = (self.root / '..' / '..' / 'work' / 'vision-venv' /
-                       'Scripts' / 'python.exe').resolve()
+        # Same venv as vision_python in device_job.py.
+        self.python = self.root / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
         self.progress_file = self.catalog / 'router-progress.json'
         self.process = None
         self.lock = threading.RLock()
@@ -836,7 +836,7 @@ class ReclusterController:
     def _idle_state():
         return {'status': 'idle', 'step': '', 'step_index': 0,
                 'steps_total': len(ReclusterController.STEPS), 'done': 0, 'total': 0,
-                'faces_total': 0, 'message': '', 'error': '',
+                'faces_total': 0, 'message': '', 'error': '', 'scope': 'all',
                 'started_at': 0, 'step_started_at': 0, 'updated_at': 0}
 
     def status(self):
@@ -851,17 +851,28 @@ class ReclusterController:
         with self.lock:
             return self.stopping
 
-    def start(self):
+    def start(self, scope='all'):
+        """scope='all' — пересобрать всё; 'leftovers' — разобрать один остаток.
+
+        Второй проход нужен потому, что «шум» у HDBSCAN понятие относительное:
+        человек с четырьмя лицами рядом с гроздью из четырёхсот выглядит
+        разреженным и выпадает. На одном остатке масштаб плотности другой, и
+        такие люди находятся — на реальном каталоге так собралось 2736 лиц из
+        4902, ни разу не смешав разных людей в одной грозди.
+        """
+        if scope not in {'all', 'leftovers'}:
+            raise ValueError('Неизвестный объём пересборки')
         with self.lock:
             if self.thread and self.thread.is_alive():
                 return {**self.state, 'steps': self.STEPS}
             self.stopping = False
             now = time.time()
-            self.state = {**self._idle_state(), 'status': 'running',
+            self.state = {**self._idle_state(), 'status': 'running', 'scope': scope,
                           'step': self.STEPS[0]['key'], 'step_index': 1,
                           'message': self.STEPS[0]['title'], 'started_at': now,
                           'step_started_at': now}
-            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread = threading.Thread(
+                target=self._run_leftovers if scope == 'leftovers' else self._run, daemon=True)
             self.thread.start()
             return {**self.state, 'steps': self.STEPS}
 
@@ -957,6 +968,97 @@ class ReclusterController:
         except Exception as exc:
             print(f'Recluster failed: {exc}', file=sys.stderr, flush=True)
             self._set(status='error', error=str(exc), message='Ошибка пересборки')
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+
+    def _run_leftovers(self):
+        """Второй проход по одному остатку: то, что не собралось в группы.
+
+        Здесь ничего не стирается — трогаются только строки, у которых сейчас
+        label=-1. Названные лица и уже собранные группы не задеваются вовсе,
+        поэтому прерывание на любом шаге безопасно само по себе.
+        """
+        db = None
+        try:
+            options = catalog_settings.load(self.app.catalog)
+            smallest = int(options.get('noise_cluster_size', 3))
+            db = open_catalog_db(self.app.store.folder, check_same_thread=False)
+            self._set(step='prepare', step_index=1, message='Собираю остаток')
+            rows = db.execute('''
+                SELECT faces.id, faces.embedding FROM faces
+                JOIN face_clusters ON face_clusters.face_id = faces.id
+                LEFT JOIN face_people ON face_people.face_id = faces.id
+                LEFT JOIN face_exclusions ON face_exclusions.face_id = faces.id
+                WHERE face_clusters.label = -1 AND face_people.face_id IS NULL
+                  AND face_exclusions.face_id IS NULL
+                ORDER BY faces.id''').fetchall()
+            total = len(rows)
+            self._set(done=0, total=total, faces_total=total)
+            if total < smallest:
+                self._set(status='completed', message='Разбирать нечего')
+                return
+            if self._should_stop():
+                self._set(status='stopped', message='Остановлено — ничего не тронуто')
+                return
+
+            self._set(step='vectors', step_index=2, done=0, total=total,
+                      step_started_at=time.time(), message='Загружаю векторы лиц')
+            ids, vectors = [], []
+            for face_id, blob in rows:
+                vector = np.frombuffer(blob, dtype='<f4').astype('<f4')
+                vectors.append(vector / max(float(np.linalg.norm(vector)), 1e-12))
+                ids.append(face_id)
+                if len(ids) % 2000 == 0:
+                    self._set(done=len(ids))
+            self._set(done=total, total=total)
+            if self._should_stop():
+                self._set(status='stopped', message='Остановлено — ничего не тронуто')
+                return
+
+            self._set(step='cluster', step_index=3, done=0, total=1,
+                      step_started_at=time.time(), message='Ищу группы в остатке')
+            labels, probabilities = cluster_embeddings(
+                np.stack(vectors), algorithm='hdbscan', min_cluster_size=smallest)
+            self._set(done=1, total=1)
+            if self._should_stop():
+                self._set(status='stopped', message='Остановлено — ничего не тронуто')
+                return
+
+            # Новые метки продолжают нумерацию, иначе они слились бы с
+            # существующими группами.
+            highest = db.execute('SELECT MAX(label) FROM face_clusters').fetchone()[0]
+            offset = (highest if highest is not None else -1) + 1
+            found = [(face_id, int(label) + offset, float(probability))
+                     for face_id, label, probability in zip(ids, labels, probabilities)
+                     if int(label) >= 0]
+            self._set(step='save', step_index=4, done=0, total=len(found),
+                      step_started_at=time.time(), message='Сохраняю найденные группы')
+            now = datetime.now(timezone.utc).isoformat()
+            for start in range(0, len(found), 2000):
+                batch = found[start:start + 2000]
+                with db:
+                    db.executemany(
+                        'UPDATE face_clusters SET label=?,probability=?,method=?,computed_at=? '
+                        'WHERE face_id=? AND label=-1',
+                        [(label, probability, 'hdbscan-leftovers', now, face_id)
+                         for face_id, label, probability in batch])
+                self._set(done=min(start + 2000, len(found)))
+                if self._should_stop():
+                    break
+            db.close()
+            db = None
+            with self.app.lock:
+                self.app.store.reload_faces()
+            groups = len({label for _, label, _ in found})
+            self._set(status='completed', done=len(found), total=len(found),
+                      message=f'Собрано групп: {groups}, лиц: {len(found)}')
+        except Exception as exc:
+            print(f'Leftover recluster failed: {exc}', file=sys.stderr, flush=True)
+            self._set(status='error', error=str(exc), message='Ошибка разбора остатка')
         finally:
             if db is not None:
                 try:
@@ -1239,6 +1341,21 @@ class App:
                 similar.append({**self.group_summary(group), 'score': round(score, 4),
                                 'verdict': self.verdict(score)})
             return {'group': self.group_summary(target), 'similar': similar}
+
+    def face_suggestions(self):
+        """Подсказки «эта группа похожа на такого-то».
+
+        Считается по запросу, а не в /api/state: там опрос раз в полторы
+        секунды, а здесь надо поднять векторы всех безымянных лиц.
+        """
+        options = catalog_settings.load(self.catalog)
+        if not options.get('face_suggest_enabled', True):
+            return {'enabled': False, 'threshold': options['face_suggest_threshold'],
+                    'suggestions': []}
+        with self.lock:
+            found = self.store.suggest_people(float(options['face_suggest_threshold']))
+        return {'enabled': True, 'threshold': float(options['face_suggest_threshold']),
+                'suggestions': found}
 
     def similar_pairs(self, limit=20, minimum=0.38, named_only=False, smallest=2):
         """Самые похожие пары групп — кандидаты на объединение."""
@@ -2118,6 +2235,8 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 return self.json_response(self.app.similar_groups(
                     query.get('key', [''])[0], int(query.get('limit', ['10'])[0])))
+            if parsed.path == '/api/suggestions':
+                return self.json_response(self.app.face_suggestions())
             if parsed.path == '/api/similar-pairs':
                 query = parse_qs(parsed.query)
                 return self.json_response(self.app.similar_pairs(
@@ -2430,7 +2549,8 @@ class Handler(BaseHTTPRequestHandler):
                                             body.get('paths', []))
                 return self.json_response({'ok': True, **result})
             if path == '/api/recluster/start':
-                return self.json_response({'ok': True, 'job': self.app.recluster_job.start()})
+                return self.json_response({'ok': True, 'job': self.app.recluster_job.start(
+                    body.get('scope', 'all'))})
             if path == '/api/recluster/stop':
                 return self.json_response({'ok': True, 'job': self.app.recluster_job.stop()})
             if path == '/api/duplicates/scan':
