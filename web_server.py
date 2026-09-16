@@ -1907,18 +1907,28 @@ class App:
         return groups, summary
 
     def duplicate_groups(self, similar=False, limit=60, offset=0, viewer='', admin=False,
-                         kind='all', sort='size', hide_small=False):
-        """Страница групп копий с карточками снимков и сводкой по всем группам."""
+                         kind='all', sort='size', hide_small=False, folder=''):
+        """Страница групп копий с карточками снимков и сводкой по всем группам.
+
+        Когда задана папка, чистим только её копии: остальные файлы группы
+        лежат в других местах и трогать их никто не просил. Поэтому в ответе
+        рядом с полной группой едет folder_paths — что именно удалится, — и
+        карточки показываем для них, а не для первых путей подряд.
+        """
         groups, summary = self._duplicate_index(similar, viewer, admin)
-        chosen = duplicates.select(groups, kind, sort, hide_small)
+        chosen = duplicates.select(groups, kind, sort, hide_small, folder)
         page = chosen[offset:offset + limit]
+        scope = {group['key']: duplicates.in_folder(group, folder) for group in page} if folder else {}
         # Карточки готовим только для видимой части группы: копий одной
         # иконки бывают сотни, а показываем мы дюжину.
-        shown = [path for group in page for path in group['paths'][:self.CARDS]]
+        shown = [path for group in page for path in self._dup_cards(group, scope)]
+        # Вес лишнего в папке считаем по всем её копиям, не только по показанным.
+        sized = set(shown).union(*scope.values()) if scope else set(shown)
         with self.lock:
             shapes = {}
-            for start in range(0, len(shown), 400):
-                batch = shown[start:start + 400]
+            wanted = sorted(sized)
+            for start in range(0, len(wanted), 400):
+                batch = wanted[start:start + 400]
                 marks = ','.join('?' * len(batch))
                 shapes.update({row[0]: row[1:] for row in self.store.db.execute(
                     f'SELECT path,size,width,height FROM photo_hashes '
@@ -1927,7 +1937,7 @@ class App:
         result = []
         for group in page:
             items = []
-            for path in group['paths'][:self.CARDS]:
+            for path in self._dup_cards(group, scope):
                 card = cards.get(path)
                 if card is None:
                     continue
@@ -1936,9 +1946,20 @@ class App:
                               'width': width or 0, 'height': height or 0})
             if not items:
                 continue
-            result.append({**group, 'photos': items})
+            extra = {}
+            if folder:
+                paths = scope[group['key']]
+                extra = {'folder_paths': paths,
+                         'folder_extra': sum((shapes.get(path) or (0,))[0] or 0 for path in paths)}
+            result.append({**group, **extra, 'photos': items})
         return {'groups': result, 'total': len(chosen), 'summary': summary,
                 'offset': offset, 'limit': limit}
+
+    def _dup_cards(self, group, scope):
+        """Какие пути группы показать карточками: совет сервера и то, что удалим."""
+        if not scope:
+            return group['paths'][:self.CARDS]
+        return [group['keep'], *scope[group['key']][:self.CARDS - 1]]
 
     def hydrate_payloads(self, paths):
         """Карточки снимков для готового списка путей, одним запросом на порцию."""
@@ -2299,6 +2320,7 @@ class Handler(BaseHTTPRequestHandler):
                     viewer=viewer, admin=admin,
                     kind=query.get('kind', ['all'])[0],
                     sort=query.get('sort', ['size'])[0],
+                    folder=query.get('folder', [''])[0],
                     hide_small=query.get('hide_small', ['0'])[0] == '1'))
             if parsed.path == '/api/settings':
                 with self.app.lock:

@@ -258,11 +258,26 @@ def index(found, shapes):
     return groups, summary
 
 
-def select(groups, kind='all', sort='size', hide_small=False):
-    """Фильтр и порядок групп для выдачи."""
+def parent(path):
+    """Папка файла ровно в том виде, в каком её считает сводка."""
+    return str(Path(path).parent)
+
+
+def in_folder(group, folder):
+    """Лишние копии группы, лежащие прямо в этой папке, без вложенных."""
+    return [path for path in group['paths'][1:] if parent(path) == folder]
+
+
+def select(groups, kind='all', sort='size', hide_small=False, folder=''):
+    """Фильтр и порядок групп для выдачи.
+
+    folder оставляет группы, у которых лишняя копия лежит прямо в этой папке:
+    те самые, что сводка посчитала в «где больше всего лишних копий».
+    """
     chosen = [group for group in groups
               if (kind not in ('exact', 'similar') or group['kind'] == kind)
-              and not (hide_small and group['file_size'] < SMALL_FILE)]
+              and not (hide_small and group['file_size'] < SMALL_FILE)
+              and (not folder or in_folder(group, folder))]
     if sort == 'count':
         chosen.sort(key=lambda group: (-group['count'], -group['extra'], group['key']))
     else:
