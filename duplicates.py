@@ -210,3 +210,61 @@ def forget(db, paths):
     marks = ','.join('?' * len(paths))
     with db:
         db.execute(f'DELETE FROM photo_hashes WHERE path IN ({marks})', paths)
+
+
+# Файл меньше этого — скорее иконка или картинка интерфейса, чем снимок.
+SMALL_FILE = 100 * 1024
+
+
+def index(found, shapes):
+    """Группы с решением «что оставить», весом лишнего и общей сводкой.
+
+    shapes — {путь: (size, width, height)}. Оставляем самый крупный кадр, при
+    равенстве — самый тяжёлый файл и самый короткий путь; он идёт в группе
+    первым, чтобы попасть в видимые карточки.
+    """
+    groups = []
+    folders = {}
+    for group in found:
+        paths = group['paths']
+
+        def rank(path):
+            size, width, height = shapes.get(path) or (0, 0, 0)
+            return ((width or 0) * (height or 0), size or 0, -len(path))
+
+        keep = max(paths, key=rank)
+        sizes = {path: (shapes.get(path) or (0, 0, 0))[0] or 0 for path in paths}
+        extra = sum(sizes.values()) - sizes[keep]
+        for path in paths:
+            if path != keep:
+                folder = str(Path(path).parent)
+                folders[folder] = folders.get(folder, 0) + 1
+        groups.append({
+            'key': group['key'], 'kind': group['kind'], 'keep': keep,
+            'paths': [keep, *(path for path in paths if path != keep)],
+            'count': len(paths), 'extra': extra, 'file_size': max(sizes.values(), default=0),
+        })
+    summary = {
+        'groups': len(groups),
+        'exact': sum(1 for group in groups if group['kind'] == 'exact'),
+        'similar': sum(1 for group in groups if group['kind'] == 'similar'),
+        'files': sum(group['count'] for group in groups),
+        'extra_files': sum(group['count'] - 1 for group in groups),
+        'extra_bytes': sum(group['extra'] for group in groups),
+        'small_groups': sum(1 for group in groups if group['file_size'] < SMALL_FILE),
+        'top_folders': [{'folder': folder, 'copies': copies} for folder, copies in
+                        sorted(folders.items(), key=lambda item: (-item[1], item[0]))[:6]],
+    }
+    return groups, summary
+
+
+def select(groups, kind='all', sort='size', hide_small=False):
+    """Фильтр и порядок групп для выдачи."""
+    chosen = [group for group in groups
+              if (kind not in ('exact', 'similar') or group['kind'] == kind)
+              and not (hide_small and group['file_size'] < SMALL_FILE)]
+    if sort == 'count':
+        chosen.sort(key=lambda group: (-group['count'], -group['extra'], group['key']))
+    else:
+        chosen.sort(key=lambda group: (-group['extra'], -group['count'], group['key']))
+    return chosen

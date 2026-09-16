@@ -1098,6 +1098,9 @@ class App:
         # Разбивка галереи на группы: пересчёт всего каталога, поэтому держим
         # недолго и сбрасываем при любом изменении через API.
         self.group_cache = {}
+        # Сводка дубликатов пересчитывает все группы — держим до конца минуты
+        # или до нового прохода поиска.
+        self.dup_cache = {}
 
     def file_for(self, path):
         """Скрытый снимок живёт в личной папке — оттуда его и читаем."""
@@ -1877,29 +1880,51 @@ class App:
     # Сколько копий показываем в группе: остальные считаются, но не рисуются.
     CARDS = 12
 
-    def duplicate_groups(self, similar=False, limit=60, offset=0, viewer='', admin=False):
-        """Группы копий с карточками снимков и подсказкой, какой оставить."""
+    DUP_TTL = 60
+
+    def _duplicate_index(self, similar, viewer, admin):
+        """Все группы копий с решением «что оставить» и сводка по ним."""
+        scan = self.duplicates.status()
+        key = (bool(similar), '*' if admin else viewer, scan.get('started_at'), scan.get('status'))
+        now = time.monotonic()
+        hit = self.dup_cache.get(key)
+        if hit and now - hit[0] < self.DUP_TTL:
+            return hit[1], hit[2]
         with self.lock:
             # Чужое спрятанное в дубликаты не показываем: это тот же каталог.
             skip = {row[0] for row in self.store.db.execute(
                 'SELECT path FROM hidden_photos' + ('' if admin else ' WHERE owner<>?'),
                 () if admin else (viewer or '',))}
-            found, total = duplicates.groups(
-                self.store.db, similar=similar, limit=limit, offset=offset, skip=skip)
+            found, _ = duplicates.groups(self.store.db, similar=similar, limit=10 ** 9, skip=skip)
+            shapes = {row[0]: row[1:] for row in self.store.db.execute(
+                'SELECT path,size,width,height FROM photo_hashes')}
+        groups, summary = duplicates.index(found, shapes)
+        summary['hashed'] = scan.get('hashed', 0)
+        summary['pictured'] = scan.get('pictured', 0)
+        self.dup_cache.clear()
+        self.dup_cache[key] = (now, groups, summary)
+        return groups, summary
+
+    def duplicate_groups(self, similar=False, limit=60, offset=0, viewer='', admin=False,
+                         kind='all', sort='size', hide_small=False):
+        """Страница групп копий с карточками снимков и сводкой по всем группам."""
+        groups, summary = self._duplicate_index(similar, viewer, admin)
+        chosen = duplicates.select(groups, kind, sort, hide_small)
+        page = chosen[offset:offset + limit]
+        # Карточки готовим только для видимой части группы: копий одной
+        # иконки бывают сотни, а показываем мы дюжину.
+        shown = [path for group in page for path in group['paths'][:self.CARDS]]
+        with self.lock:
             shapes = {}
-            paths = [path for group in found for path in group['paths']]
-            # Карточки готовим только для видимой части группы: копий одной
-            # иконки бывают сотни, а показываем мы дюжину.
-            shown = [path for group in found for path in group['paths'][:self.CARDS]]
-            for start in range(0, len(paths), 400):
-                batch = paths[start:start + 400]
+            for start in range(0, len(shown), 400):
+                batch = shown[start:start + 400]
                 marks = ','.join('?' * len(batch))
                 shapes.update({row[0]: row[1:] for row in self.store.db.execute(
                     f'SELECT path,size,width,height FROM photo_hashes '
                     f'WHERE path IN ({marks})', batch)})
         cards = {item['path']: item for item in self.hydrate_payloads(shown)}
         result = []
-        for group in found:
+        for group in page:
             items = []
             for path in group['paths'][:self.CARDS]:
                 card = cards.get(path)
@@ -1908,18 +1933,11 @@ class App:
                 size, width, height = shapes.get(path, (0, 0, 0))
                 items.append({**card, 'size': size or 0,
                               'width': width or 0, 'height': height or 0})
-            if len(items) < 2:
+            if not items:
                 continue
-            # Оставляем самый крупный кадр, при равенстве — самый тяжёлый файл.
-            best = max(items, key=lambda item: ((item['width'] or 0) * (item['height'] or 0),
-                                                item['size'], -len(item['path'])))
-            weight = sum((shapes.get(path, (0,))[0] or 0) for path in group['paths']
-                         if path != best['path'])
-            result.append({'key': group['key'], 'kind': group['kind'],
-                           'keep': best['path'], 'photos': items,
-                           'paths': group['paths'], 'count': len(group['paths']),
-                           'extra': weight})
-        return {'groups': result, 'total': total, 'offset': offset, 'limit': limit}
+            result.append({**group, 'photos': items})
+        return {'groups': result, 'total': len(chosen), 'summary': summary,
+                'offset': offset, 'limit': limit}
 
     def hydrate_payloads(self, paths):
         """Карточки снимков для готового списка путей, одним запросом на порцию."""
@@ -2265,7 +2283,10 @@ class Handler(BaseHTTPRequestHandler):
                     similar=query.get('similar', ['0'])[0] == '1',
                     limit=int(query.get('limit', ['60'])[0] or 60),
                     offset=int(query.get('offset', ['0'])[0] or 0),
-                    viewer=viewer, admin=admin))
+                    viewer=viewer, admin=admin,
+                    kind=query.get('kind', ['all'])[0],
+                    sort=query.get('sort', ['size'])[0],
+                    hide_small=query.get('hide_small', ['0'])[0] == '1'))
             if parsed.path == '/api/settings':
                 with self.app.lock:
                     return self.json_response({
@@ -2419,6 +2440,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.error_json(403, 'Неверный локальный токен')
         # Любое изменение может перетасовать группы галереи.
         self.app.group_cache.clear()
+        self.app.dup_cache.clear()
         try:
             length = int(self.headers.get('Content-Length', 0))
             if length > 1024 * 1024:
