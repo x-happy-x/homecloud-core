@@ -1380,7 +1380,7 @@ class App:
         Считается по запросу, а не в /api/state: там опрос раз в полторы
         секунды, а здесь надо поднять векторы всех безымянных лиц.
         """
-        options = catalog_settings.load(self.catalog)
+        options = catalog_settings.load(self.catalog_folder)
         if not options.get('face_suggest_enabled', True):
             return {'enabled': False, 'threshold': options['face_suggest_threshold'],
                     'suggestions': []}
