@@ -993,11 +993,15 @@ class App:
         self._centroids_stamp = None
         self._centroids_cache = {}
         self.lock = threading.RLock()
+        # Разбивка галереи на группы: пересчёт всего каталога, поэтому держим
+        # недолго и сбрасываем при любом изменении через API.
+        self.group_cache = {}
 
     def file_for(self, path):
         """Скрытый снимок живёт в личной папке — оттуда его и читаем."""
-        row = self.store.db.execute(
-            'SELECT stored FROM hidden_photos WHERE path=?', (str(path),)).fetchone()
+        with self.lock:
+            row = self.store.db.execute(
+                'SELECT stored FROM hidden_photos WHERE path=?', (str(path),)).fetchone()
         return Path(row[0]) if row else Path(path)
 
     def router_batch_archive(self, hide_adult=False):
@@ -1411,61 +1415,217 @@ class App:
                 found[row[0]] = row
         return [found[path] for path in paths if path in found]
 
+    def _search_rows(self, names, query, where, values):
+        """Снимки с поиском или по людям в порядке выдачи. Считаются в памяти."""
+        if names:
+            placeholders = ','.join('?' for _ in names)
+            rows = self.store.db.execute(
+                f'SELECT {self.PHOTO_COLUMNS.replace("photos.path,", "faces.path,")} '
+                f'FROM faces JOIN photos ON photos.path=faces.path '
+                f'JOIN face_people ON face_people.face_id=faces.id '
+                f'JOIN people ON people.id=face_people.person_id '
+                f'LEFT JOIN photo_analysis ON photo_analysis.path=faces.path '
+                f'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=faces.path '
+                f'LEFT JOIN video_speech ON video_speech.path=faces.path '
+                f'WHERE people.name IN ({placeholders}){where} GROUP BY faces.path '
+                f'HAVING COUNT(DISTINCT people.name)=?',
+                [*names, *values, len(names)]).fetchall()
+        else:
+            rows = self.store.db.execute(
+                f'SELECT {self.LIGHT_COLUMNS} {self.LIGHT_SOURCE}{where}',
+                values).fetchall()
+        if query:
+            # Совпадение по тексту ищем по лёгким колонкам, без картинок и векторов.
+            index = ((0, 1, 2, 3, 4, 5, 7, 8, 9, 10) if not names
+                     else (0, 2, 4, 5, 10, 12, 16, 17, 18, 20))
+            textual = [row for row in rows if query in ' '.join(
+                str(row[position] or '') for position in index).casefold()]
+            semantic = []
+            if len(query) >= 3 and self.store.db.execute(
+                    'SELECT 1 FROM photo_analysis WHERE embedding IS NOT NULL '
+                    'LIMIT 1').fetchone():
+                rank = {item['path']: position for position, item in enumerate(
+                    self.semantic.query(query, 500))}
+                semantic = sorted((row for row in rows if row[0] in rank),
+                                  key=lambda row: rank[row[0]])
+            seen = set()
+            rows = [row for row in [*textual, *semantic]
+                    if not (row[0] in seen or seen.add(row[0]))]
+        elif names:
+            rows.sort(key=lambda row: (-(row[13] or 0), row[0]))
+        else:
+            rows.sort(key=lambda row: (-(row[6] or 0), row[0]))
+        return rows
+
+    GROUP_BY = ('year', 'month', 'day', 'folder', 'album', 'person', 'type', 'kind')
+    GROUP_ORDERS = ('new', 'old', 'name', 'count')
+    # Ключ группы «без альбома», «без людей», «без даты».
+    GROUP_NONE = '~none'
+    GROUP_TTL = 30
+
+    def _grouped(self, by, order, names, query, where, values):
+        """Подходящие снимки по группам: {ключ: [(путь, modified)]} и число снимков.
+
+        Снимок может лежать в нескольких группах (альбомы, люди). Внутри группы —
+        порядок галереи; «old» без поиска разворачивает его.
+        """
+        cache_key = (by, order == 'old', tuple(names), query, where, tuple(values))
+        now = time.monotonic()
+        hit = self.group_cache.get(cache_key)
+        if hit and now - hit[0] < self.GROUP_TTL:
+            return hit[1], hit[2]
+        db = self.store.db
+        if names or query:
+            rows = self._search_rows(names, query, where, values)
+            at = 13 if names else 6
+            items = [(row[0], row[at] or 0) for row in rows]
+        else:
+            items = db.execute(
+                f'SELECT photos.path,photos.modified {self.LIGHT_SOURCE}{where} '
+                'ORDER BY photos.modified DESC, photos.path', values).fetchall()
+        if order == 'old' and not query:
+            items.reverse()
+
+        none = self.GROUP_NONE
+        if by in ('year', 'month', 'day'):
+            width = {'year': 4, 'month': 7, 'day': 10}[by]
+            days = {}
+
+            def keys_of(path, modified):
+                if not modified:
+                    return (none,)
+                # Секунды до суток: дата одна на весь день, strftime на каждый снимок дорог.
+                stamp = modified // 1_000_000_000
+                bucket = stamp // 3600
+                if bucket not in days:
+                    try:
+                        days[bucket] = datetime.fromtimestamp(stamp).strftime('%Y-%m-%d')
+                    except (OverflowError, OSError, ValueError):
+                        days[bucket] = ''
+                return (days[bucket][:width] or none,)
+        elif by == 'folder':
+            dirs = dict(db.execute("SELECT path,dir FROM photos WHERE status='ok'"))
+
+            def keys_of(path, modified):
+                return (dirs.get(path) or str(Path(path).parent),)
+        elif by in ('album', 'person'):
+            sql = ('SELECT path,album_id FROM album_photos' if by == 'album' else
+                   'SELECT DISTINCT faces.path,people.name FROM faces '
+                   'JOIN face_people ON face_people.face_id=faces.id '
+                   'JOIN people ON people.id=face_people.person_id')
+            links = {}
+            for path, key in db.execute(sql):
+                links.setdefault(path, []).append(str(key))
+
+            def keys_of(path, modified):
+                return links.get(path) or (none,)
+        elif by == 'type':
+            graphics = {'game', 'meme'}
+            types = dict(db.execute('SELECT path,content_type FROM photo_analysis'))
+
+            def keys_of(path, modified):
+                value = types.get(path)
+                return ('graphics' if value in graphics else value or none,)
+        else:
+            kinds = dict(db.execute(
+                "SELECT path,COALESCE(kind,'photo') FROM photos WHERE status='ok'"))
+
+            def keys_of(path, modified):
+                return (kinds.get(path) or 'photo',)
+
+        groups = {}
+        for path, modified in items:
+            for key in keys_of(path, modified):
+                groups.setdefault(key, []).append((path, modified or 0))
+        if len(self.group_cache) > 24:
+            self.group_cache.clear()
+        self.group_cache[cache_key] = (now, groups, len(items))
+        return groups, len(items)
+
+    def photo_groups(self, by, order='', names=None, query='', content_type='', blurry=False,
+                     adult=False, folder='', folder_deep=True, folder_exclude='', album=0,
+                     album_deep=True, kind='', viewer='', admin=False, hidden=False):
+        """Группы галереи: ключ, подпись, число снимков, даты и обложки."""
+        names = [name for name in (names or []) if name]
+        query = query.casefold().strip()
+        by = by if by in self.GROUP_BY else 'month'
+        order = order if order in self.GROUP_ORDERS else (
+            'new' if by in ('year', 'month', 'day') else 'name')
+        with self.lock:
+            where, values = self.photo_filters(
+                '', content_type, blurry, adult, folder, folder_deep, folder_exclude,
+                album, album_deep, kind, viewer, admin, hidden)
+            groups, total = self._grouped(by, order, names, query, where, values)
+            trails = ({str(item['id']): item['trail'] for item in albums.tree(self.store.db)}
+                      if by == 'album' else {})
+            # Обложкам нужна оценка 18+: без неё интерфейс не решит, замыливать ли кадр.
+            cover_paths = list({path for members in groups.values() for path, _ in members[:4]})
+            ratings = {}
+            for start in range(0, len(cover_paths), 400):
+                batch = cover_paths[start:start + 400]
+                marks = ','.join('?' * len(batch))
+                ratings.update(self.store.db.execute(
+                    f'SELECT path,rating FROM photo_adult_analysis WHERE path IN ({marks})', batch))
+        result = []
+        for key, members in groups.items():
+            stamps = [modified for _, modified in members if modified]
+            result.append({
+                'key': key,
+                'label': trails.get(key, key) if key != self.GROUP_NONE else '',
+                'count': len(members),
+                'newest': round(max(stamps) / 1e6) if stamps else None,
+                'oldest': round(min(stamps) / 1e6) if stamps else None,
+                # Путь и отметка вместо готового адреса: в адресе кириллица раздувается
+                # втрое, а папок в каталоге — тысячи.
+                'covers': [{
+                    'path': path, 'v': round(modified / 1e6),
+                    'adult_rating': ratings.get(path) or 'unknown',
+                } for path, modified in members[:4]],
+            })
+        dated = by in ('year', 'month', 'day')
+        if order == 'count':
+            result.sort(key=lambda item: (-item['count'], item['label'].casefold()))
+        elif order == 'old':
+            result.sort(key=lambda item: item['key'] if dated else (item['oldest'] or 0, item['key']))
+        elif order == 'new' or dated:
+            result.sort(key=lambda item: item['key'] if dated else (-(item['newest'] or 0), item['key']),
+                        reverse=dated)
+        else:
+            result.sort(key=lambda item: (item['label'].casefold(), item['key']))
+        # «Без даты», «без альбома» и прочие остатки — всегда в конце.
+        result.sort(key=lambda item: item['key'] == self.GROUP_NONE)
+        return {'by': by, 'order': order, 'groups': result, 'total': total}
+
     def photo_payloads(self, names=None, query='', content_type='', blurry=False,
                        exact_path='', adult=False, limit=200, offset=0,
                        folder='', folder_deep=True, folder_exclude='', album=0,
                        album_deep=True, kind='', viewer='', admin=False, hidden=False,
-                       wanted=()):
-        """Возвращает страницу снимков и общее число подходящих."""
+                       wanted=(), group_by='', group=None, order=''):
+        """Возвращает страницу снимков и общее число подходящих.
+
+        С group_by и group — только снимки этой группы (см. photo_groups).
+        """
         names = [name for name in (names or []) if name]
         query = query.casefold().strip()
         limit = min(max(int(limit or 0), 1), 500)
         offset = max(int(offset or 0), 0)
         with self.lock:
-            if names or query:
+            if group_by in self.GROUP_BY and group is not None:
+                where, values = self.photo_filters(
+                    exact_path, content_type, blurry, adult,
+                    folder, folder_deep, folder_exclude, album, album_deep, kind,
+                    viewer, admin, hidden, wanted)
+                groups, _ = self._grouped(group_by, order, names, query, where, values)
+                members = groups.get(group, [])
+                total = len(members)
+                rows = self.hydrate([path for path, _ in members[offset:offset + limit]])
+            elif names or query:
                 # Поиск и фильтр по людям считаются в памяти: там нужен порядок выдачи.
                 where, values = self.photo_filters(
                     exact_path, content_type, blurry, adult,
                     folder, folder_deep, folder_exclude, album, album_deep, kind,
                     viewer, admin, hidden, wanted)
-                if names:
-                    placeholders = ','.join('?' for _ in names)
-                    rows = self.store.db.execute(
-                        f'SELECT {self.PHOTO_COLUMNS.replace("photos.path,", "faces.path,")} '
-                        f'FROM faces JOIN photos ON photos.path=faces.path '
-                        f'JOIN face_people ON face_people.face_id=faces.id '
-                        f'JOIN people ON people.id=face_people.person_id '
-                        f'LEFT JOIN photo_analysis ON photo_analysis.path=faces.path '
-                        f'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=faces.path '
-                        f'LEFT JOIN video_speech ON video_speech.path=faces.path '
-                        f'WHERE people.name IN ({placeholders}){where} GROUP BY faces.path '
-                        f'HAVING COUNT(DISTINCT people.name)=?',
-                        [*names, *values, len(names)]).fetchall()
-                else:
-                    rows = self.store.db.execute(
-                        f'SELECT {self.LIGHT_COLUMNS} {self.LIGHT_SOURCE}{where}',
-                        values).fetchall()
-                if query:
-                    # Совпадение по тексту ищем по лёгким колонкам, без картинок и векторов.
-                    index = ((0, 1, 2, 3, 4, 5, 7, 8, 9, 10) if not names
-                             else (0, 2, 4, 5, 10, 12, 16, 17, 18, 20))
-                    textual = [row for row in rows if query in ' '.join(
-                        str(row[position] or '') for position in index).casefold()]
-                    semantic = []
-                    if len(query) >= 3 and self.store.db.execute(
-                            'SELECT 1 FROM photo_analysis WHERE embedding IS NOT NULL '
-                            'LIMIT 1').fetchone():
-                        rank = {item['path']: position for position, item in enumerate(
-                            self.semantic.query(query, 500))}
-                        semantic = sorted((row for row in rows if row[0] in rank),
-                                          key=lambda row: rank[row[0]])
-                    seen = set()
-                    rows = [row for row in [*textual, *semantic]
-                            if not (row[0] in seen or seen.add(row[0]))]
-                elif names:
-                    rows.sort(key=lambda row: (-(row[13] or 0), row[0]))
-                else:
-                    rows.sort(key=lambda row: (-(row[6] or 0), row[0]))
+                rows = self._search_rows(names, query, where, values)
                 total = len(rows)
                 rows = rows[offset:offset + limit]
                 if not names:
@@ -2013,9 +2173,28 @@ class Handler(BaseHTTPRequestHandler):
                     album_deep=query.get('album_deep', ['1'])[0] == '1',
                     kind=query.get('kind', [''])[0],
                     viewer=viewer, admin=admin,
-                    hidden=query.get('hidden', ['0'])[0] == '1')
+                    hidden=query.get('hidden', ['0'])[0] == '1',
+                    group_by=query.get('group_by', [''])[0],
+                    group=query['group'][0] if 'group' in query else None,
+                    order=query.get('order', [''])[0])
                 return self.json_response({'photos': photos, 'total': total,
                                            'offset': offset, 'limit': limit})
+            if parsed.path == '/api/photos/groups':
+                query = parse_qs(parsed.query)
+                viewer, admin = self.viewer
+                return self.json_response(self.app.photo_groups(
+                    query.get('by', [''])[0], query.get('order', [''])[0],
+                    query.get('person', []), query.get('q', [''])[0], query.get('type', [''])[0],
+                    query.get('blurry', ['0'])[0] == '1',
+                    adult=query.get('adult', ['0'])[0] == '1',
+                    folder=query.get('folder', [''])[0],
+                    folder_deep=query.get('folder_deep', ['1'])[0] == '1',
+                    folder_exclude=query.get('exclude_folder', [''])[0],
+                    album=int(query.get('album', ['0'])[0] or 0),
+                    album_deep=query.get('album_deep', ['1'])[0] == '1',
+                    kind=query.get('kind', [''])[0],
+                    viewer=viewer, admin=admin,
+                    hidden=query.get('hidden', ['0'])[0] == '1'))
             if parsed.path == '/api/photo':
                 query = parse_qs(parsed.query)
                 path = query.get('path', [''])[0]
@@ -2119,6 +2298,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.error_json(403, 'Недопустимый Origin')
         if not secrets.compare_digest(self.headers.get('X-Local-Token', ''), self.app.token):
             return self.error_json(403, 'Неверный локальный токен')
+        # Любое изменение может перетасовать группы галереи.
+        self.app.group_cache.clear()
         try:
             length = int(self.headers.get('Content-Length', 0))
             if length > 1024 * 1024:
@@ -2384,8 +2565,9 @@ class Handler(BaseHTTPRequestHandler):
             row = self.app.store.by_id[face_id]
         except (ValueError, KeyError):
             return self.error_json(404, 'Лицо не найдено')
-        box = self.app.store.db.execute(
-            'SELECT box,frame_time FROM faces WHERE id=?', (face_id,)).fetchone()
+        with self.app.lock:
+            box = self.app.store.db.execute(
+                'SELECT box,frame_time FROM faces WHERE id=?', (face_id,)).fetchone()
         path = self.app.file_for(row[1]).resolve()
         if box is None or not box[0] or not path.is_file():
             return self.error_json(404, 'Файл не найден')
@@ -2481,9 +2663,10 @@ class Handler(BaseHTTPRequestHandler):
                 source.draft('RGB', (size * 2, size * 2))
                 image = ImageOps.exif_transpose(source).convert('RGB')
         if blur:
-            row = self.app.store.db.execute(
-                'SELECT rating,regions_json FROM photo_adult_analysis '
-                "WHERE path=? AND status='ok'", (raw_path,)).fetchone()
+            with self.app.lock:
+                row = self.app.store.db.execute(
+                    'SELECT rating,regions_json FROM photo_adult_analysis '
+                    "WHERE path=? AND status='ok'", (raw_path,)).fetchone()
             rating = row[0] if row else 'unknown'
             regions = json.loads(row[1]) if row else []
             covered = 0 if blur == 'full' else self.blur_regions(image, regions, blur)
@@ -2538,9 +2721,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 left -= len(chunk)
 
+    # Соединение с каталогом одно на все потоки, поэтому даже короткое чтение —
+    # под замком: плитки галереи грузятся параллельно с запросами групп, и без
+    # него кэш запросов sqlite3 ломается насовсем (KeyError с текстом SQL).
     def send_video(self, raw_path):
-        row = self.app.store.db.execute(
-            "SELECT path FROM photos WHERE path=? AND status='ok'", (raw_path,)).fetchone()
+        with self.app.lock:
+            row = self.app.store.db.execute(
+                "SELECT path FROM photos WHERE path=? AND status='ok'", (raw_path,)).fetchone()
         if row is None:
             return self.error_json(404, 'Видео не найдено в каталоге')
         path = self.app.file_for(row[0]).resolve()
@@ -2550,8 +2737,9 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_range(path, content_type)
 
     def send_photo(self, raw_path, blur='', size=0, moment=0):
-        row = self.app.store.db.execute(
-            "SELECT path FROM photos WHERE path=? AND status='ok'", (raw_path,)).fetchone()
+        with self.app.lock:
+            row = self.app.store.db.execute(
+                "SELECT path FROM photos WHERE path=? AND status='ok'", (raw_path,)).fetchone()
         if row is None:
             return self.error_json(404, 'Фотография не найдена в каталоге')
         path = self.app.file_for(row[0]).resolve()

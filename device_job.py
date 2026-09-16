@@ -39,12 +39,73 @@ def read_json(path):
         return {}
 
 
+ANALYSIS_FEATURES = ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', 'authenticity')
+
+
+def planned_phases(features):
+    """Этапы задания в том порядке, в котором их на самом деле выполняет run()."""
+    plan = []
+    if features.get('inventory') or (
+            not features.get('faces') and any(features.get(name) for name in ANALYSIS_FEATURES)):
+        plan.append('inventory')
+    if features.get('faces'):
+        plan.append('faces')
+    if any(features.get(name) for name in ('visual', 'ocr', 'caption')):
+        plan.append('visual')
+    plan.extend(name for name in ('ocr', 'adult', 'caption', 'speech', 'authenticity', 'diarize')
+                if features.get(name))
+    return plan
+
+
+# Замеры прошлых запусков: сколько этап грузит модель и сколько тратит на файл.
+# Интерфейс собирает из них оценку «сколько осталось» для всего задания.
+TIMINGS_KEEP = 0.6
+
+
+def timings_file(args):
+    return args.progress_file.with_name('device-timings.json')
+
+
+def timing_key(args, phase):
+    """Скорость зависит от вида файлов: ролик в разы дороже снимка."""
+    return f'{phase}:{args.kinds.get(phase, "all")}'
+
+
+def learn_timing(args, phase, record):
+    """Законченный без ошибок этап обновляет скользящее среднее своей скорости."""
+    started, finished = record.get('started_at'), record.get('finished_at')
+    loaded = record.get('loaded_at')
+    completed = int(record.get('completed') or 0)
+    if not started or not finished or completed <= 0:
+        return
+    timings = args.timings
+    item = dict(timings.get(timing_key(args, phase), {}))
+    load = max(0.0, (loaded or started) - started)
+    after_load = completed - int(record.get('completed_at_load') or 0)
+    work = max(0.0, finished - (loaded or started))
+    observed = {'load': load}
+    if after_load >= 3 and work > 0:
+        observed['per_file'] = work / after_load
+    elif completed >= 3:
+        observed['per_file'] = max(0.0, finished - started - load) / completed
+    for name, value in observed.items():
+        old = item.get(name)
+        item[name] = value if old is None else old * TIMINGS_KEEP + value * (1 - TIMINGS_KEEP)
+    item['runs'] = int(item.get('runs') or 0) + 1
+    item['last_total'] = int(record.get('total') or 0)
+    timings[timing_key(args, phase)] = item
+    write_json(timings_file(args), timings)
+
+
 def publish(args, status, phase, **extra):
     state = {
         'status': status, 'phase': phase, 'roots': [str(root) for root in args.root],
         'paths': [str(path) for path in args.path],
         'features': args.features, 'kinds': args.kinds, 'pid': os.getpid(),
         'job_started_at': getattr(args, 'job_started_at', time.time()),
+        'plan': getattr(args, 'plan', []),
+        'phase_history': getattr(args, 'history', {}),
+        'timings': getattr(args, 'timings', {}),
         'updated_at': time.time(), **extra,
     }
     write_json(args.progress_file, state)
@@ -66,6 +127,11 @@ def run_child(args, command, phase):
     stage = args.progress_file.with_name('device-stage-progress.json')
     stage.unlink(missing_ok=True)
     phase_started_at = time.time()
+    # Этап лиц идёт по разу на каждую папку — история копит их в одну запись.
+    record = args.history.setdefault(phase, {'started_at': phase_started_at, 'status': 'running'})
+    record['status'] = 'running'
+    base_completed = int(record.get('completed') or 0)
+    base_total = int(record.get('total') or 0)
     # Вывод этапа раньше уходил в никуда: у web_server.py stdout и stderr —
     # DEVNULL, и упавший этап сообщал только «код 1», без причины. Теперь он
     # пишется в файл рядом с прогрессом, а последние строки идут в задание.
@@ -75,31 +141,64 @@ def run_child(args, command, phase):
                                    stdout=sink, stderr=subprocess.STDOUT)
         while process.poll() is None:
             child = read_json(stage)
+            track_child(record, child, base_completed, base_total)
             publish(args, 'running', phase, phase_started_at=phase_started_at, **{
                 key: value for key, value in child.items()
                 if key not in {'status', 'phase', 'pid', 'updated_at'}
             })
             time.sleep(.5)
     child = read_json(stage)
+    track_child(record, child, base_completed, base_total)
+    record['finished_at'] = time.time()
     if process.returncode:
+        record['status'] = 'error'
         publish(args, 'error', phase, return_code=process.returncode,
                 error=child.get('error') or last_error(log, process.returncode))
         raise SystemExit(process.returncode)
+    record['status'] = 'stopped' if args.stop_file.exists() else 'done'
+    if record['status'] == 'done':
+        learn_timing(args, phase, record)
+
+
+def track_child(record, child, base_completed=0, base_total=0):
+    """Счётчики этапа и миг, когда модель загрузилась и пошёл первый файл."""
+    completed = base_completed + int(child.get('completed') or 0)
+    total = base_total + int(child.get('total') or 0)
+    record['completed'] = completed
+    record['total'] = max(total, completed)
+    if child.get('videos_total') is not None:
+        record['videos_total'] = int(child.get('videos_total') or 0)
+    if completed > base_completed and not record.get('loaded_at'):
+        record['loaded_at'] = time.time()
+        record['completed_at_load'] = completed
 
 
 def inventory(args):
     """Опись: обход выбранных папок и сверка с прошлым разом."""
     db = index_db(args.catalog)
 
+    record = args.history.setdefault('inventory', {'started_at': time.time(), 'status': 'running'})
+
     def report(done, current, total=0):
+        record['completed'], record['total'] = done, max(total, done)
+        if done and not record.get('loaded_at'):
+            record['loaded_at'], record['completed_at_load'] = time.time(), done
         publish(args, 'running', 'inventory', total=total, completed=done, current=current)
 
     try:
         # Даже остановленный на середине обход уже что-то нашёл и сохранил —
         # эти цифры возвращаем тоже, а не отбрасываем как пустой результат.
-        return take_inventory(db, args.root or [path.parent for path in args.path],
-                              report=report, stop=args.stop_file.exists,
-                              rules=pathrules.load(args.catalog))
+        summary = take_inventory(db, args.root or [path.parent for path in args.path],
+                                 report=report, stop=args.stop_file.exists,
+                                 rules=pathrules.load(args.catalog))
+        record['finished_at'] = time.time()
+        record['status'] = 'stopped' if summary.get('stopped') else 'done'
+        if summary.get('total') is not None:
+            record['total'] = int(summary['total'])
+            record['completed'] = max(int(record.get('completed') or 0), int(summary['total']))
+        if record['status'] == 'done':
+            learn_timing(args, 'inventory', record)
+        return summary
     finally:
         db.close()
 
@@ -131,6 +230,9 @@ def parse_args():
 
 def run(args):
     args.job_started_at = time.time()
+    args.plan = planned_phases(args.features)
+    args.history = {}
+    args.timings = read_json(timings_file(args))
     args.stop_file.unlink(missing_ok=True)
     publish(args, 'preparing', 'inventory', total=0, completed=0)
 
