@@ -1352,8 +1352,9 @@ class App:
                      'photo_analysis.caption_tags_json,video_speech.text')
 
     def photo_filters(self, exact_path='', content_type='', blurry=False, adult=False,
-                      folder='', folder_deep=True, album=0, album_deep=True, kind='',
-                      viewer='', admin=False, hidden=False, wanted=()):
+                      folder='', folder_deep=True, folder_exclude='', album=0,
+                      album_deep=True, kind='', viewer='', admin=False, hidden=False,
+                      wanted=()):
         """Фильтры галереи прямо в SQL — иначе пришлось бы тянуть весь каталог."""
         clause, arguments = privacy.where(viewer, admin, hidden)
         # Исключённые правилами пути не показываем никому и нигде.
@@ -1369,6 +1370,10 @@ class App:
         if folder:
             clause, arguments = albums.folder_clause(folder, folder_deep)
             where += clause
+            values.extend(arguments)
+        if folder_exclude:
+            clause, arguments = albums.folder_clause(folder_exclude, True)
+            where += ' AND NOT (' + clause[5:] + ')'
             values.extend(arguments)
         if album:
             ids = albums.descendants(self.store.db, album) if album_deep else [int(album)]
@@ -1408,8 +1413,9 @@ class App:
 
     def photo_payloads(self, names=None, query='', content_type='', blurry=False,
                        exact_path='', adult=False, limit=200, offset=0,
-                       folder='', folder_deep=True, album=0, album_deep=True, kind='',
-                       viewer='', admin=False, hidden=False, wanted=()):
+                       folder='', folder_deep=True, folder_exclude='', album=0,
+                       album_deep=True, kind='', viewer='', admin=False, hidden=False,
+                       wanted=()):
         """Возвращает страницу снимков и общее число подходящих."""
         names = [name for name in (names or []) if name]
         query = query.casefold().strip()
@@ -1420,7 +1426,7 @@ class App:
                 # Поиск и фильтр по людям считаются в памяти: там нужен порядок выдачи.
                 where, values = self.photo_filters(
                     exact_path, content_type, blurry, adult,
-                    folder, folder_deep, album, album_deep, kind,
+                    folder, folder_deep, folder_exclude, album, album_deep, kind,
                     viewer, admin, hidden, wanted)
                 if names:
                     placeholders = ','.join('?' for _ in names)
@@ -1468,7 +1474,7 @@ class App:
             else:
                 where, values = self.photo_filters(
                     exact_path, content_type, blurry, adult,
-                    folder, folder_deep, album, album_deep, kind,
+                    folder, folder_deep, folder_exclude, album, album_deep, kind,
                     viewer, admin, hidden, wanted)
                 total = self.store.db.execute(
                     f'SELECT COUNT(*) {self.LIGHT_SOURCE}{where}', values).fetchone()[0]
@@ -1658,11 +1664,22 @@ class App:
                     f'{Path(raw_path).resolve()}|{stamp}|{size}|{blur}'.encode('utf-8')).hexdigest()
                 (folder / key[:2] / f'{key}.jpg').unlink(missing_ok=True)
 
+    def folder_paths(self, folder):
+        clause, arguments = albums.folder_clause(folder, True)
+        with self.lock:
+            return [row[0] for row in self.store.db.execute(
+                f"SELECT path FROM photos WHERE status='ok'{clause} ORDER BY path",
+                arguments)]
+
     def delete_photos(self, paths):
+        return self._delete_photos(paths, limit=500)
+
+    def _delete_photos(self, paths, limit=None):
         from send2trash import send2trash
         paths = list(dict.fromkeys(str(path) for path in (paths or [])))
-        if not paths or len(paths) > 500:
-            raise ValueError('Выберите от 1 до 500 фотографий')
+        if not paths or (limit is not None and len(paths) > limit):
+            raise ValueError(f'Выберите от 1 до {limit} фотографий' if limit
+                             else 'Выберите фотографии')
         placeholders = ','.join('?' for _ in paths)
         with self.lock:
             known = {row[0] for row in self.store.db.execute(
@@ -1710,6 +1727,108 @@ class App:
                             pass
                 self.store.reload_faces()
             return {'deleted': len(deleted), 'errors': errors}
+
+    def delete_folder_media(self, folder):
+        folder = str(folder or '').strip()
+        if not folder:
+            raise ValueError('Папка не выбрана')
+        paths = self.folder_paths(folder)
+        if paths:
+            result = self._delete_photos(paths, limit=None)
+            self.folders.refresh(force=True)
+            return {**result, 'folder_removed': False}
+        directory = Path(folder).resolve()
+        if not directory.is_dir():
+            raise ValueError('Папка не найдена')
+        try:
+            directory.rmdir()
+        except OSError as exc:
+            raise ValueError('Папка не пуста или недоступна') from exc
+        self.folders.refresh(force=True)
+        return {'deleted': 0, 'folder_removed': True, 'errors': []}
+
+    def move_folder_media(self, folder, target):
+        folder = str(folder or '').strip()
+        target = str(target or '').strip()
+        if not folder or not target:
+            raise ValueError('Выберите исходную папку и папку назначения')
+        source_dir, target_dir = Path(folder).resolve(), Path(target).resolve()
+        if not target_dir.is_dir():
+            raise ValueError('Папка назначения не найдена')
+        if target_dir == source_dir or source_dir in target_dir.parents:
+            raise ValueError('Нельзя перемещать папку внутрь самой себя')
+        destination_root = target_dir / source_dir.name
+        paths = self.folder_paths(folder)
+        if not paths:
+            raise ValueError('В этой папке нет медиа из каталога')
+        hidden = {row[0] for row in self.store.db.execute(
+            f"SELECT path FROM hidden_photos WHERE path IN ({','.join('?' for _ in paths)})",
+            paths)}
+        if hidden:
+            raise ValueError('В папке есть скрытые медиа; сначала верните их из скрытого альбома')
+        moves, errors = [], []
+        for raw in paths:
+            source = self.file_for(raw).resolve()
+            try:
+                relative = source.relative_to(source_dir)
+            except ValueError:
+                relative = Path(raw).name
+            destination = destination_root / relative
+            if destination.exists():
+                errors.append({'path': raw, 'error': 'Файл уже есть в папке назначения'})
+                continue
+            if not source.is_file():
+                errors.append({'path': raw, 'error': 'Файл не найден на диске'})
+                continue
+            moves.append((raw, str(destination), source, destination))
+        if errors:
+            return {'moved': 0, 'target': target, 'errors': errors}
+        old_paths = [item[0] for item in moves]
+        new_paths = [item[1] for item in moves]
+        if new_paths:
+            marks = ','.join('?' for _ in new_paths)
+            with self.lock:
+                conflict = self.store.db.execute(
+                    f'SELECT path FROM photos WHERE path IN ({marks}) LIMIT 1',
+                    new_paths).fetchone()
+            if conflict:
+                raise ValueError(f'Путь уже есть в каталоге: {conflict[0]}')
+        moved = []
+        try:
+            for raw, new_raw, source, destination in moves:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+                moved.append((raw, new_raw, source, destination))
+            with self.lock, self.store.db:
+                for old, new, _source, _destination in moved:
+                    new_dir = str(Path(new).parent)
+                    for table in (
+                        'faces', 'photo_analysis', 'photo_adult_analysis',
+                        'photo_embeddings', 'photo_hashes', 'album_photos',
+                        'router_batch_items', 'router_predictions', 'router_reviews',
+                        'router_training_labels', 'video_diarization',
+                        'video_speaker_faces', 'video_speaker_turns',
+                        'video_speakers', 'video_speech', 'video_speech_segments',
+                    ):
+                        try:
+                            self.store.db.execute(
+                                f'UPDATE {table} SET path=? WHERE path=?', (new, old))
+                        except sqlite3.Error:
+                            pass
+                    self.store.db.execute('UPDATE photos SET path=?,dir=? WHERE path=?',
+                                          (new, new_dir, old))
+                self.store.reload_faces()
+            self.folders.refresh(force=True)
+            return {'moved': len(moved), 'target': str(destination_root), 'errors': []}
+        except Exception:
+            for old, _new, source, destination in reversed(moved):
+                try:
+                    if destination.exists() and not source.exists():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(destination), str(source))
+                except OSError:
+                    print(f'Failed to roll back move for {old}', file=sys.stderr, flush=True)
+            raise
 
     def resolve_groups(self, keys):
         wanted = set(keys)
@@ -1889,6 +2008,7 @@ class Handler(BaseHTTPRequestHandler):
                     adult=query.get('adult', ['0'])[0] == '1', limit=limit, offset=offset,
                     folder=query.get('folder', [''])[0],
                     folder_deep=query.get('folder_deep', ['1'])[0] == '1',
+                    folder_exclude=query.get('exclude_folder', [''])[0],
                     album=int(query.get('album', ['0'])[0] or 0),
                     album_deep=query.get('album_deep', ['1'])[0] == '1',
                     kind=query.get('kind', [''])[0],
@@ -2208,6 +2328,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/photos/delete':
                 return self.json_response({'ok': True, **self.app.delete_photos(
                     body.get('paths', []))})
+            if path == '/api/photos/folder/delete':
+                return self.json_response({'ok': True, **self.app.delete_folder_media(
+                    body.get('folder', ''))})
+            if path == '/api/photos/folder/move':
+                return self.json_response({'ok': True, **self.app.move_folder_media(
+                    body.get('folder', ''), body.get('target', ''))})
             with self.app.lock:
                 if path == '/api/assign-groups':
                     self.app.store.assign(self.app.resolve_groups(body.get('group_keys', [])),
