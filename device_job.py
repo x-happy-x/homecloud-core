@@ -43,29 +43,47 @@ def publish(args, status, phase, **extra):
     state = {
         'status': status, 'phase': phase, 'roots': [str(root) for root in args.root],
         'paths': [str(path) for path in args.path],
-        'features': args.features, 'pid': os.getpid(),
+        'features': args.features, 'kinds': args.kinds, 'pid': os.getpid(),
         'job_started_at': getattr(args, 'job_started_at', time.time()),
         'updated_at': time.time(), **extra,
     }
     write_json(args.progress_file, state)
 
 
+def last_error(log, code):
+    """Причина падения этапа: последние строки его вывода."""
+    try:
+        lines = [line.strip() for line
+                 in log.read_text(encoding='utf-8', errors='replace').splitlines()
+                 if line.strip()]
+    except OSError:
+        lines = []
+    tail = ' · '.join(lines[-3:])
+    return f'Этап завершился с кодом {code}' + (f': {tail}' if tail else '')
+
+
 def run_child(args, command, phase):
     stage = args.progress_file.with_name('device-stage-progress.json')
     stage.unlink(missing_ok=True)
     phase_started_at = time.time()
-    process = subprocess.Popen(command, cwd=Path(__file__).parent)
-    while process.poll() is None:
-        child = read_json(stage)
-        publish(args, 'running', phase, phase_started_at=phase_started_at, **{
-            key: value for key, value in child.items()
-            if key not in {'status', 'phase', 'pid', 'updated_at'}
-        })
-        time.sleep(.5)
+    # Вывод этапа раньше уходил в никуда: у web_server.py stdout и stderr —
+    # DEVNULL, и упавший этап сообщал только «код 1», без причины. Теперь он
+    # пишется в файл рядом с прогрессом, а последние строки идут в задание.
+    log = args.progress_file.with_name(f'device-stage-{phase}.log')
+    with log.open('w', encoding='utf-8', errors='replace') as sink:
+        process = subprocess.Popen(command, cwd=Path(__file__).parent,
+                                   stdout=sink, stderr=subprocess.STDOUT)
+        while process.poll() is None:
+            child = read_json(stage)
+            publish(args, 'running', phase, phase_started_at=phase_started_at, **{
+                key: value for key, value in child.items()
+                if key not in {'status', 'phase', 'pid', 'updated_at'}
+            })
+            time.sleep(.5)
     child = read_json(stage)
     if process.returncode:
         publish(args, 'error', phase, return_code=process.returncode,
-                error=child.get('error', f'Этап завершился с кодом {process.returncode}'))
+                error=child.get('error') or last_error(log, process.returncode))
         raise SystemExit(process.returncode)
 
 

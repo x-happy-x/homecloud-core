@@ -1,3 +1,8 @@
+# Ставить только через setup.ps1. insightface тянет за собой CPU-пакет
+# onnxruntime: он занимает тот же модуль Python, что и onnxruntime-gpu, и
+# перекрывает его — видеокарта отваливается, а выясняется это лишь посреди
+# сканирования («CUDA initialization failed»). setup.ps1 после установки
+# сносит CPU-пакет и переставляет GPU-сборку; без этого шага лица не считаются.
 numpy>=1.26,<2
 Pillow>=10,<12
 onnxruntime-gpu[cuda,cudnn]>=1.21,<1.27

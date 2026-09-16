@@ -14,4 +14,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Dependencies not installed. See README.md for 
 & $python -m pip install --force-reinstall --no-deps 'onnxruntime-gpu>=1.21,<1.27'
 if ($LASTEXITCODE -ne 0) { throw 'GPU runtime installation failed' }
 & $python prototype.py doctor
+# doctor поднимает модели и проверяет, что операции идут на видеокарте:
+# CPU-пакет onnxruntime или несовместимая версия видны сразу, а не в середине скана.
+if ($LASTEXITCODE -ne 0) { throw 'GPU-проверка не прошла: см. вывод doctor' }
 Write-Host "Ready. Python environment: $envPath"

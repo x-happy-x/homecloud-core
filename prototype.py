@@ -72,7 +72,7 @@ def database(folder, check_same_thread=True):
     return db
 
 
-def doctor():
+def doctor(models=None):
     print('Python:', sys.version)
     subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version,memory.total',
                     '--format=csv'], check=False)
@@ -82,7 +82,50 @@ def doctor():
     ort.preload_dlls(directory='')
     print('ONNX Runtime:', ort.__version__)
     print('Available providers:', ort.get_available_providers())
-    print('Provider availability alone does not verify GPU inference. Run scan.')
+    # Список провайдеров ничего не доказывает: при подмене GPU-сборки CPU-пакетом
+    # onnxruntime он тот же, а операции уходят на процессор. Поэтому поднимаем
+    # настоящие модели — load_models считает CUDA-операции в профиле разогрева.
+    folder = Path(models) if models else Path(__file__).resolve().parent / 'models' / 'buffalo_l'
+    if not folder.is_dir():
+        print(f'Models folder not found: {folder}')
+        raise SystemExit(1)
+    try:
+        load_models(folder)
+    except Exception as exc:
+        print(f'GPU check failed: {exc}')
+        raise SystemExit(1)
+    print('GPU check passed: models really run on the video card.')
+
+
+def verify_cuda(model_path, ort, folder):
+    """Считает операции на видеокарте, прогнав модель в своей сессии.
+
+    Профиль сессий insightface для этого не годится: под каждое разрешение он
+    держит отдельную сессию, её профиль записывается только при закрытии, а у
+    основной сессии остаётся пусто — проверка ложно объявляла, что видеокарта
+    не работает. Своя сессия отвечает ровно на нужный вопрос: выполняются ли
+    узлы этой модели на CUDA.
+    """
+    import json
+    import numpy as np
+    options = ort.SessionOptions()
+    options.enable_profiling = True
+    options.profile_file_prefix = str(folder / (model_path.stem + '-warmup'))
+    session = ort.InferenceSession(str(model_path), sess_options=options,
+                                   providers=['CUDAExecutionProvider'])
+    spec = session.get_inputs()[0]
+    shape = [size if isinstance(size, int) and size > 0 else 640 for size in spec.shape]
+    shape[0] = 1
+    if len(shape) == 4:
+        shape[1] = 3
+    session.run(None, {spec.name: np.zeros(shape, dtype=np.float32)})
+    profile = Path(session.end_profiling())
+    if not profile.is_file():
+        raise RuntimeError(f'runtime profile was not created: {model_path.name}')
+    events = json.loads(profile.read_text(encoding='utf-8'))
+    profile.unlink(missing_ok=True)
+    return sum(event.get('args', {}).get('provider') == 'CUDAExecutionProvider'
+               for event in events)
 
 
 def load_models(folder):
@@ -97,19 +140,23 @@ def load_models(folder):
         raise ValueError('No local ONNX files. See README.md.')
     digest = hashlib.sha256()
     models = {}
+    sources = {}
+    # Профили пишутся рядом с моделями; от прошлых запусков они только мешают.
+    for stale in folder.glob('*-warmup*.json'):
+        stale.unlink(missing_ok=True)
     for path in files:
         with path.open('rb') as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b''):
                 digest.update(block)
-        options = ort.SessionOptions()
-        options.enable_profiling = True
-        options.profile_file_prefix = str(folder / (path.stem + '-warmup'))
+        # Профилирование на рабочих сессиях не включаем: оно замедляет весь
+        # скан и плодит файлы, а видеокарту проверяет отдельная сессия ниже.
         model = ModelRouter(str(path.resolve())).get_model(
-            sess_options=options, providers=['CUDAExecutionProvider'])
+            providers=['CUDAExecutionProvider'])
         if model is not None and model.taskname in {'detection', 'recognition'}:
             if 'CUDAExecutionProvider' not in model.session.get_providers():
                 raise RuntimeError(f'CUDA initialization failed: {path.name}')
             models[model.taskname] = model
+            sources[model.taskname] = path.resolve()
     if set(models) != {'detection', 'recognition'}:
         raise ValueError('Need compatible SCRFD detector and ArcFace recognition ONNX models.')
     models['detection'].prepare(ctx_id=0, input_size=(640, 640), det_thresh=0.6)
@@ -117,15 +164,13 @@ def load_models(folder):
     # Exercise both networks even if the first photo contains no faces.
     models['detection'].detect(np.zeros((640, 640, 3), dtype=np.uint8))
     models['recognition'].get_feat(np.zeros((112, 112, 3), dtype=np.uint8))
-    for name, model in models.items():
-        profile = Path(model.session.end_profiling())
-        if not profile.is_file():
-            raise RuntimeError(f'{name}: runtime profile was not created')
-        events = json.loads(profile.read_text(encoding='utf-8'))
-        gpu_ops = sum(event.get('args', {}).get('provider') == 'CUDAExecutionProvider' for event in events)
+    for name, model_path in sources.items():
+        gpu_ops = verify_cuda(model_path, ort, folder)
         if not gpu_ops:
             raise RuntimeError(f'{name}: no GPU operations found in runtime profile')
         print(f'{name}: verified {gpu_ops} CUDA operations during warm-up')
+    for profile in folder.glob('*-warmup*.json'):
+        profile.unlink(missing_ok=True)
     return models, digest.hexdigest()
 
 

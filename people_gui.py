@@ -75,14 +75,15 @@ class CatalogStore:
         # Векторы в памяти не держим: на большом каталоге это сотни мегабайт.
         self.rows = self.db.execute(
             'SELECT id,path,NULL,thumbnail,frame_time FROM faces ORDER BY id').fetchall()
-        if not self.rows:
-            raise ValueError('В каталоге пока нет найденных лиц')
         if max_faces and len(self.rows) > max_faces:
             raise ValueError(
                 f'В каталоге {len(self.rows)} лиц, а разрешено {max_faces}. '
                 'Поднимите потолок: backend.ps1 -MaxFaces <число>')
         self.by_id = {row[0]: row for row in self.rows}
-        self.auto_labels, self.auto_confidence = self._cluster()
+        if self.rows:
+            self.auto_labels, self.auto_confidence = self._cluster()
+        else:
+            self.auto_labels, self.auto_confidence = {}, {}
 
     def reload_faces(self):
         """Refresh in-memory face rows after a scan or photo deletion."""

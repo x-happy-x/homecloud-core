@@ -20,6 +20,15 @@ if (!(Test-Path $python)) { throw 'Run setup.ps1 first' }
 if (!(Test-Path -LiteralPath (Join-Path $Catalog 'catalog.sqlite'))) {
     throw "Catalog not found: $Catalog"
 }
+# Без GPU-провайдера этапы с моделями не сработают, а узнать об этом
+# посреди сканирования — дорого.
+try {
+    $providers = & $python -c "import onnxruntime as o; print(','.join(o.get_available_providers()))"
+} catch { $providers = 'проверить не удалось' }
+if ($providers -notmatch 'CUDAExecutionProvider') {
+    Write-Warning "onnxruntime не видит видеокарту (провайдеры: $providers). Лица не посчитаются — запустите setup.ps1."
+}
+
 & $python web_server.py --data $Catalog --host $ListenAddress --port $Port `
     --min-cluster-size $MinClusterSize --max-faces $MaxFaces `
     --token-file $TokenFile --no-browser `

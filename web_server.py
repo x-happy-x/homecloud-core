@@ -1,5 +1,7 @@
 """Private localhost web interface for the local face catalog."""
 import argparse
+import base64
+import binascii
 import hashlib
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -43,6 +45,60 @@ from prototype import cluster_embeddings, database as open_catalog_db
 
 
 WEB_ROOT = Path(__file__).with_name('web').resolve()
+SEARCH_FRAME_MAX_BYTES = 700 * 1024
+SEARCH_FRAME_MAX_SIDE = 1600
+
+
+def _encode_search_jpeg(image):
+    image = ImageOps.exif_transpose(image).convert('RGB')
+    image.thumbnail((SEARCH_FRAME_MAX_SIDE, SEARCH_FRAME_MAX_SIDE), Image.Resampling.LANCZOS)
+    for quality in (88, 82, 76, 70, 64, 58, 50, 42, 34):
+        stream = io.BytesIO()
+        image.save(stream, 'JPEG', quality=quality, optimize=True)
+        payload = stream.getvalue()
+        if len(payload) <= SEARCH_FRAME_MAX_BYTES:
+            return payload
+    raise ValueError('Кадр видео слишком большой')
+
+
+def _decode_search_frame(frame_jpeg):
+    if not isinstance(frame_jpeg, str) or not frame_jpeg.strip():
+        raise ValueError('Не передан кадр видео')
+    if frame_jpeg.startswith('data:'):
+        _prefix, _sep, frame_jpeg = frame_jpeg.partition(',')
+    try:
+        raw = base64.b64decode(frame_jpeg, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError('Кадр видео должен быть JPEG в base64') from exc
+    if not raw or len(raw) > SEARCH_FRAME_MAX_BYTES:
+        raise ValueError('Кадр видео слишком большой')
+    with Image.open(io.BytesIO(raw)) as image:
+        if image.format not in {'JPEG', 'PNG', 'WEBP'}:
+            raise ValueError('Неподдерживаемый формат кадра')
+        return _encode_search_jpeg(image)
+
+
+def _build_search_upload(app, raw_path, frame_jpeg=None):
+    row = app.store.db.execute(
+        "SELECT path, kind FROM photos WHERE path=? AND status='ok'",
+        (raw_path,)).fetchone()
+    if row is None:
+        raise LookupError('Снимок не найден в каталоге')
+    file_path = app.file_for(row[0]).resolve()
+    if not file_path.is_file():
+        raise FileNotFoundError('Файл не найден')
+    if frame_jpeg:
+        if row[1] != 'video':
+            raise ValueError('Кадр можно передать только для видео')
+        return _decode_search_frame(frame_jpeg), f'{Path(raw_path).stem}-frame.jpg'
+    # Фото идут старым путём; для видео без кадра остаётся совместимый fallback
+    # на представительный кадр.
+    return _encode_search_jpeg(video_media.open_frame(file_path)), Path(raw_path).name
+
+
+def _upload_search_image(app, raw_path, frame_jpeg=None):
+    payload, upload_name = _build_search_upload(app, raw_path, frame_jpeg)
+    return reverse_search.upload(payload, upload_name)
 
 
 class ScanController:
@@ -2018,22 +2074,14 @@ class Handler(BaseHTTPRequestHandler):
                     video_features=body.get('video_features'))})
             if path == '/api/photos/search-upload':
                 raw_path = body.get('path', '')
-                row = self.app.store.db.execute(
-                    "SELECT path FROM photos WHERE path=? AND status='ok'",
-                    (raw_path,)).fetchone()
-                if row is None:
-                    return self.error_json(404, 'Снимок не найден в каталоге')
-                file_path = self.app.file_for(row[0]).resolve()
-                if not file_path.is_file():
-                    return self.error_json(404, 'Файл не найден')
                 try:
-                    # У ролика для поиска берём тот же представительный кадр,
-                    # что и для остальных этапов анализа.
-                    image = video_media.open_frame(file_path)
-                    image.thumbnail((1600, 1600))
-                    stream = io.BytesIO()
-                    image.save(stream, 'JPEG', quality=88, optimize=True)
-                    url = reverse_search.upload(stream.getvalue(), Path(raw_path).name)
+                    url = _upload_search_image(self.app, raw_path, body.get('frame_jpeg'))
+                except LookupError as exc:
+                    return self.error_json(404, str(exc))
+                except FileNotFoundError as exc:
+                    return self.error_json(404, str(exc))
+                except ValueError as exc:
+                    return self.error_json(400, str(exc))
                 except Exception as exc:
                     print(f'Reverse search upload failed for {raw_path}: {exc}',
                          file=sys.stderr, flush=True)
