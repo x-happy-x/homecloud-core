@@ -212,6 +212,12 @@ def scan(args):
                 time.sleep(0.05 * (attempt + 1))
         last_progress_write = now
 
+    # Вид файлов задаёт задание; при 'all' остаётся прежний ответ настройки.
+    kinds = args.kinds if args.kinds != 'all' else (
+        'all' if options['video_enabled'] else 'photos')
+    keep_kind = video_media.keeps(kinds)
+    suffixes = PICTURES if kinds == 'photos' else (
+        video_media.SUPPORTED if kinds == 'videos' else SUPPORTED)
     publish('counting', force=True)
     if args.use_inventory:
         # Опись уже обошла диск — берём готовый список вместо повторного обхода.
@@ -225,7 +231,7 @@ def scan(args):
             candidate = Path(found)
             if pathrules.blocked(found, block_rules, allow_rules):
                 continue
-            if not options['video_enabled'] and video_media.is_video(candidate):
+            if not keep_kind(candidate):
                 continue
             if included_paths and candidate.resolve() not in included_paths:
                 continue
@@ -264,8 +270,7 @@ def scan(args):
                 continue
             paths.extend(
                 Path(current) / filename for filename in sorted(filenames)
-                if (Path(filename).suffix.lower() in (
-                        SUPPORTED if options['video_enabled'] else PICTURES)
+                if (Path(filename).suffix.lower() in suffixes
                     and not (Path(current) / filename).is_symlink()
                     and (not included_paths or (Path(current) / filename).resolve() in included_paths)
                     and not any(fnmatch.fnmatch(filename.casefold(), pattern)
@@ -619,6 +624,8 @@ def main():
     sub.add_parser('doctor')
     scan_parser = sub.add_parser('scan')
     scan_parser.add_argument('--photos', type=Path, required=True)
+    scan_parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
+                             help='Сканировать снимки, ролики или всё сразу')
     scan_parser.add_argument('--models', type=Path, required=True)
     scan_parser.add_argument('--data', type=Path, default=Path('data'))
     scan_parser.add_argument('--limit', type=int, default=1000)

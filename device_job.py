@@ -92,6 +92,8 @@ def parse_args():
     parser.add_argument('--root', action='append', type=Path, default=[])
     parser.add_argument('--path', action='append', type=Path, default=[])
     parser.add_argument('--features', required=True)
+    parser.add_argument('--kinds', default='{}',
+                        help='JSON «фаза → вид файлов»: all, photos или videos')
     parser.add_argument('--progress-file', type=Path, required=True)
     parser.add_argument('--stop-file', type=Path, required=True)
     parser.add_argument('--force', action='store_true',
@@ -103,6 +105,7 @@ def parse_args():
     if not args.root and not args.path:
         parser.error('provide at least one --root or --path')
     args.features = json.loads(args.features)
+    args.kinds = json.loads(args.kinds)
     args.progress_file = args.progress_file.resolve()
     args.stop_file = args.stop_file.resolve()
     return args
@@ -115,6 +118,10 @@ def run(args):
 
     # По умолчанию каждый этап пропускает файлы, посчитанные для этой же версии.
     force = ['--force'] if args.force else []
+
+    def kinds_of(phase):
+        """Вид файлов этапа. Без карты — всё сразу, как в прежних заданиях."""
+        return ['--kinds', args.kinds.get(phase, 'all')]
 
     def indexed(folder):
         """Есть ли готовая опись этой папки: тогда лица не будут обходить диск."""
@@ -164,7 +171,8 @@ def run(args):
             command = [str(face_python), str(here / 'prototype.py'), 'scan',
                        '--photos', str(root), '--models', str(here / 'models' / 'buffalo_l'),
                        '--data', str(args.catalog), '--limit', str(len(paths)), '--min-side', '160',
-                       '--progress-file', str(stage), '--stop-file', str(args.stop_file), *force]
+                       '--progress-file', str(stage), '--stop-file', str(args.stop_file),
+                       *force, *kinds_of('faces')]
             for path in paths:
                 command.extend(('--include-path', str(path)))
             run_child(args, command, 'faces')
@@ -177,7 +185,7 @@ def run(args):
                        '--photos', str(root), '--models', str(here / 'models' / 'buffalo_l'),
                        '--data', str(args.catalog), '--limit', '1000000', '--min-side', '160',
                        '--progress-file', str(stage), '--stop-file', str(args.stop_file),
-                       *force, *indexed(root)]
+                       *force, *indexed(root), *kinds_of('faces')]
             for name in sorted(EXCLUDED_NAMES):
                 command.extend(('--exclude-dir-name', name))
             run_child(args, command, 'faces')
@@ -200,7 +208,7 @@ def run(args):
                    '--catalog', str(args.catalog), '--limit', '100000000', '--batch-size', '24',
                    '--model', options['visual_model'],
                    '--progress-file', str(stage), '--stop-file', str(args.stop_file),
-                   *force, *root_args]
+                   *force, *kinds_of('visual'), *root_args]
         old_env = os.environ.copy()
         os.environ.update(env)
         try:
@@ -218,7 +226,7 @@ def run(args):
         run_child(args, [str(ocr_python), str(here / 'ocr_photos.py'),
                   '--catalog', str(args.catalog), '--limit', '100000000',
                   '--progress-file', str(stage), '--stop-file', str(args.stop_file),
-                  *force, *root_args], 'ocr')
+                  *force, *kinds_of('ocr'), *root_args], 'ocr')
     if args.stop_file.exists():
         publish(args, 'stopped', 'ocr')
         return
@@ -230,7 +238,7 @@ def run(args):
         run_child(args, [str(vision_python), str(here / 'adult_photos.py'),
                   '--catalog', str(args.catalog), '--limit', '100000000',
                   '--progress-file', str(stage), '--stop-file', str(args.stop_file),
-                  *force, *root_args], 'adult')
+                  *force, *kinds_of('adult'), *root_args], 'adult')
     if args.stop_file.exists():
         publish(args, 'stopped', 'adult')
         return
@@ -243,7 +251,7 @@ def run(args):
                   '--backend', options['caption_backend'], '--model', options['caption_model'],
                   '--lmstudio-url', options['caption_lmstudio_url'],
                   '--progress-file', str(stage), '--stop-file', str(args.stop_file),
-                  *force, *root_args], 'caption')
+                  *force, *kinds_of('caption'), *root_args], 'caption')
     if args.stop_file.exists():
         publish(args, 'stopped', 'caption')
         return
@@ -269,7 +277,7 @@ def run(args):
         run_child(args, [str(imgutils_python), str(here / 'authenticity_photos.py'),
                   '--catalog', str(args.catalog), '--limit', '1000000',
                   '--progress-file', str(stage), '--stop-file', str(args.stop_file),
-                  *force, *root_args], 'authenticity')
+                  *force, *kinds_of('authenticity'), *root_args], 'authenticity')
     if args.stop_file.exists():
         publish(args, 'stopped', 'authenticity')
         return

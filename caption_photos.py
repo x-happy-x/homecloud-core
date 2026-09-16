@@ -146,6 +146,8 @@ def main():
     parser.add_argument('--stop-file', type=Path)
     parser.add_argument('--root', action='append', type=Path, default=[])
     parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
+                        help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--force', action='store_true',
                         help='Описать заново, даже если описание уже есть')
     args = parser.parse_args()
@@ -172,6 +174,7 @@ def main():
         + candidate_sql + root_sql +
         " ORDER BY CASE WHEN photo_analysis.content_type='photo' THEN 0 ELSE 1 END,photo_analysis.path LIMIT ?",
         (*root_values, args.limit)).fetchall()
+    rows = video_media.only(args.kinds, rows)
     target = args.progress_file.resolve() if args.progress_file else None
     stop = args.stop_file.resolve() if args.stop_file else None
     state = {'status': 'preparing', 'phase': 'caption', 'total': len(rows),

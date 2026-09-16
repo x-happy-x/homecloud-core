@@ -17,6 +17,25 @@ def is_video(path):
     return Path(path).suffix.casefold() in SUPPORTED
 
 
+# Вид файлов у фазы обработки: снимки, ролики или всё сразу.
+KINDS = ('all', 'photos', 'videos')
+
+
+def keeps(kinds):
+    """Проверка вида: photos — без роликов, videos — только ролики."""
+    if kinds == 'photos':
+        return lambda path: not is_video(path)
+    if kinds == 'videos':
+        return is_video
+    return lambda path: True
+
+
+def only(kinds, rows, index=0):
+    """Оставляет строки нужного вида; путь у каждой фазы в своём столбце."""
+    keep = keeps(kinds)
+    return [row for row in rows if keep(row[index])]
+
+
 def _open(path):
     """VideoCapture, с запасным вариантом короткого пути Windows."""
     import cv2

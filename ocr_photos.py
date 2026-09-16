@@ -52,6 +52,8 @@ def main():
     parser.add_argument('--stop-file', type=Path)
     parser.add_argument('--root', action='append', type=Path, default=[])
     parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
+                        help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--force', action='store_true',
                         help='Распознать текст заново, даже если он уже есть')
     args = parser.parse_args()
@@ -78,6 +80,7 @@ def main():
         WHERE status='ok' ''' + fresh_sql
         + candidate_sql + root_sql + ' ORDER BY path LIMIT ?',
         (*root_values, args.limit)).fetchall()
+    rows = video_media.only(args.kinds, rows)
     state = {'status': 'preparing', 'phase': 'ocr', 'total': len(rows),
              'completed': 0, 'with_text': 0, 'errors': 0, 'current': '',
              'videos_total': sum(video_media.is_video(row[0]) for row in rows),

@@ -243,6 +243,7 @@ def analyze(args):
           AND COALESCE(photos.blocked,0)=0 '''
         + fresh_sql + root_sql + ' ORDER BY photos.path LIMIT ?',
         (*fresh_values, *root_values, args.limit)).fetchall()
+    rows = video_media.only(args.kinds, rows)
     progress_path = args.progress_file.resolve() if args.progress_file else None
     stop_path = args.stop_file.resolve() if args.stop_file else None
     state = dict(status='preparing', total=len(rows), completed=0, indexed=0,
@@ -415,6 +416,8 @@ def main():
     analyze_parser.add_argument('--stop-file', type=Path)
     analyze_parser.add_argument('--root', action='append', type=Path, default=[])
     analyze_parser.add_argument('--path', action='append', type=Path, default=[])
+    analyze_parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
+                                help='Считать снимки, ролики или всё сразу')
     query_parser = sub.add_parser('query')
     query_parser.add_argument('--catalog', type=Path, required=True)
     query_parser.add_argument('--model', default=DEFAULT_MODEL)

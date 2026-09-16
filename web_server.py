@@ -28,6 +28,7 @@ import albums
 import people_albums
 import catalog_index
 import duplicates
+import job_features
 import pathrules
 import privacy
 import reverse_search
@@ -342,8 +343,7 @@ class RouterController:
 
 class DeviceController:
     """Expose this computer as a configurable HomeCloud worker device."""
-    FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize',
-               'authenticity')
+    FEATURES = job_features.FEATURES
 
     def __init__(self, catalog, device_id=None, device_name=None):
         self.root = Path(__file__).resolve().parent
@@ -595,7 +595,8 @@ class DeviceController:
                 pass
             return payload
 
-    def start(self, roots, features, paths=None, force=False, visual_model=None):
+    def start(self, roots, features, paths=None, force=False, visual_model=None,
+              video_features=None):
         with self.lock:
             if self.status()['active']:
                 raise ValueError('На устройстве уже выполняется задание')
@@ -627,19 +628,15 @@ class DeviceController:
             if not resolved and not selected_paths:
                 raise ValueError('Выберите хотя бы один диск, папку или фотографию')
             supported = self.info()['capabilities']
-            selected = {name: bool((features or {}).get(name)) for name in self.FEATURES}
+            # Наборы для снимков и для роликов разбираются вместе: зависимости
+            # этапов действуют внутри своего вида, а заданию идёт объединение.
+            selected, kinds = job_features.resolve(features, video_features, supported)
             if not any(selected.values()):
                 raise ValueError('Выберите хотя бы одну возможность')
-            if selected['caption']:
-                selected['visual'] = True
-                # Подробное описание использует рейтинг и уверенные теги WD.
-                selected['adult'] = bool(supported.get('adult'))
             unavailable = [name for name, enabled in selected.items()
                            if enabled and not supported.get(name)]
             if unavailable:
                 raise ValueError('Недоступно на устройстве: ' + ', '.join(unavailable))
-            if selected['ocr']:
-                selected['visual'] = True
             if selected['visual'] and visual_model is not None:
                 model = str(visual_model)
                 available = {item['id']: item for item in catalog_settings.visual_models()}
@@ -662,12 +659,13 @@ class DeviceController:
                 'status': 'preparing', 'phase': 'inventory',
                 'roots': [str(item) for item in resolved],
                 'paths': [str(item) for item in selected_paths],
-                'features': selected, 'total': 0, 'completed': 0,
+                'features': selected, 'kinds': kinds, 'total': 0, 'completed': 0,
                 'updated_at': time.time(), 'pid': os.getpid()}, ensure_ascii=False),
                 encoding='utf-8')
             flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             command = [sys.executable, str(self.root / 'device_job.py'),
                        '--catalog', str(self.catalog), '--features', json.dumps(selected),
+                       '--kinds', json.dumps(kinds),
                        '--progress-file', str(self.progress_file), '--stop-file', str(self.stop_file)]
             if force:
                 command.append('--force')
@@ -2009,13 +2007,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/device/job/start':
                 return self.json_response({'ok': True, 'job': self.app.device.start(
                     body.get('roots', []), body.get('features', {}), body.get('paths', []),
-                    force=bool(body.get('force')), visual_model=body.get('visual_model'))})
+                    force=bool(body.get('force')), visual_model=body.get('visual_model'),
+                    video_features=body.get('video_features'))})
             if path == '/api/device/job/stop':
                 return self.json_response({'ok': True, 'job': self.app.device.stop()})
             if path == '/api/photos/process':
                 return self.json_response({'ok': True, 'job': self.app.device.start(
                     [], body.get('features', {}), body.get('paths', []),
-                    force=bool(body.get('force')), visual_model=body.get('visual_model'))})
+                    force=bool(body.get('force')), visual_model=body.get('visual_model'),
+                    video_features=body.get('video_features'))})
             if path == '/api/photos/search-upload':
                 raw_path = body.get('path', '')
                 row = self.app.store.db.execute(

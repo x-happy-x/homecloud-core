@@ -94,11 +94,12 @@ def pending(db, args):
     where, values = scope_sql(args.root, args.path, 'faces.path')
     fresh = '' if args.force else '''
         AND NOT EXISTS (SELECT 1 FROM face_authenticity fa WHERE fa.face_id=faces.id)'''
-    return db.execute('''
+    rows = db.execute('''
         SELECT faces.id, faces.path, faces.box, faces.frame_time FROM faces
         LEFT JOIN face_people ON face_people.face_id=faces.id
         WHERE face_people.person_id IS NULL ''' + fresh + where
         + ' ORDER BY faces.id LIMIT ?', (*values, args.limit)).fetchall()
+    return video_media.only(args.kinds, rows, 1)
 
 
 def wide_crop(path, box_json, frame_time, margin=0.4):
@@ -140,6 +141,8 @@ def main():
     parser.add_argument('--stop-file', type=Path)
     parser.add_argument('--root', action='append', type=Path, default=[])
     parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
+                        help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--force', action='store_true',
                         help='Посчитать заново, даже если уже есть результат')
     args = parser.parse_args()

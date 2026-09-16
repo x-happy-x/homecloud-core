@@ -242,12 +242,13 @@ def scoped_rows(db, args):
       photo_adult_analysis.modified != photos.modified OR photo_adult_analysis.status != 'ok'
       OR photo_adult_analysis.detector_model IS NOT ?)'''
     extra = () if args.force else (DETECTOR_MODEL,)
-    return db.execute('''SELECT photos.path,photos.size,photos.modified FROM photos
+    rows = db.execute('''SELECT photos.path,photos.size,photos.modified FROM photos
       LEFT JOIN photo_adult_analysis USING(path)
       WHERE photos.status='ok'
         AND COALESCE(photos.blocked,0)=0 ''' + scope +
       freshness + ' ORDER BY photos.path LIMIT ?',
       (*values, *extra, args.limit)).fetchall()
+    return video_media.only(args.kinds, rows)
 
 
 def recheck(args):
@@ -287,6 +288,8 @@ def main():
     parser.add_argument('--limit', type=int, default=100)
     parser.add_argument('--root', action='append', type=Path, default=[])
     parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
+                        help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--progress-file', type=Path)
     parser.add_argument('--stop-file', type=Path)
     parser.add_argument('--threshold', type=float, default=.55)
