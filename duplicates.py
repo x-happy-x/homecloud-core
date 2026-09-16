@@ -216,7 +216,7 @@ def forget(db, paths):
 SMALL_FILE = 100 * 1024
 
 
-def index(found, shapes):
+def index(found, shapes, folder=""):
     """Группы с решением «что оставить», весом лишнего и общей сводкой.
 
     shapes — {путь: (size, width, height)}. Оставляем самый крупный кадр, при
@@ -232,13 +232,13 @@ def index(found, shapes):
             size, width, height = shapes.get(path) or (0, 0, 0)
             return ((width or 0) * (height or 0), size or 0, -len(path))
 
-        keep = max(paths, key=rank)
+        keepers = [path for path in paths if parent(path) == folder] if folder else paths
+        keep = max(keepers, key=rank)
         sizes = {path: (shapes.get(path) or (0, 0, 0))[0] or 0 for path in paths}
         extra = sum(sizes.values()) - sizes[keep]
         for path in paths:
-            if path != keep:
-                folder = str(Path(path).parent)
-                folders[folder] = folders.get(folder, 0) + 1
+            folder_name = parent(path)
+            folders[folder_name] = folders.get(folder_name, 0) + 1
         groups.append({
             'key': group['key'], 'kind': group['kind'], 'keep': keep,
             'paths': [keep, *(path for path in paths if path != keep)],
@@ -264,15 +264,14 @@ def parent(path):
 
 
 def in_folder(group, folder):
-    """Лишние копии группы, лежащие прямо в этой папке, без вложенных."""
-    return [path for path in group['paths'][1:] if parent(path) == folder]
+    """Файлы группы прямо в этой папке, включая оставляемый, без вложенных."""
+    return [path for path in group['paths'] if parent(path) == folder]
 
 
 def select(groups, kind='all', sort='size', hide_small=False, folder=''):
     """Фильтр и порядок групп для выдачи.
 
-    folder оставляет группы, у которых лишняя копия лежит прямо в этой папке:
-    те самые, что сводка посчитала в «где больше всего лишних копий».
+    folder оставляет группы с любым файлом прямо в этой папке.
     """
     chosen = [group for group in groups
               if (kind not in ('exact', 'similar') or group['kind'] == kind)

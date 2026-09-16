@@ -1911,10 +1911,10 @@ class App:
 
     DUP_TTL = 60
 
-    def _duplicate_index(self, similar, viewer, admin):
+    def _duplicate_index(self, similar, viewer, admin, folder=""):
         """Все группы копий с решением «что оставить» и сводка по ним."""
         scan = self.duplicates.status()
-        key = (bool(similar), '*' if admin else viewer, scan.get('started_at'), scan.get('status'))
+        key = (bool(similar), '*' if admin else viewer, scan.get('started_at'), scan.get('status'), folder)
         now = time.monotonic()
         hit = self.dup_cache.get(key)
         if hit and now - hit[0] < self.DUP_TTL:
@@ -1927,7 +1927,15 @@ class App:
             found, _ = duplicates.groups(self.store.db, similar=similar, limit=10 ** 9, skip=skip)
             shapes = {row[0]: row[1:] for row in self.store.db.execute(
                 'SELECT path,size,width,height FROM photo_hashes')}
-        groups, summary = duplicates.index(found, shapes)
+            if folder:
+                hashes = list(self.store.db.execute('SELECT path,sha1,dhash FROM photo_hashes'))
+                scan['hashed'] = sum(sha1 is not None for path, sha1, dhash in hashes
+                                     if duplicates.parent(path) == folder)
+                scan['pictured'] = sum(dhash is not None for path, sha1, dhash in hashes
+                                       if duplicates.parent(path) == folder)
+        if folder:
+            found = [group for group in found if duplicates.in_folder(group, folder)]
+        groups, summary = duplicates.index(found, shapes, folder=folder)
         summary['hashed'] = scan.get('hashed', 0)
         summary['pictured'] = scan.get('pictured', 0)
         self.dup_cache.clear()
@@ -1936,25 +1944,16 @@ class App:
 
     def duplicate_groups(self, similar=False, limit=60, offset=0, viewer='', admin=False,
                          kind='all', sort='size', hide_small=False, folder=''):
-        """Страница групп копий с карточками снимков и сводкой по всем группам.
-
-        Когда задана папка, чистим только её копии: остальные файлы группы
-        лежат в других местах и трогать их никто не просил. Поэтому в ответе
-        рядом с полной группой едет folder_paths — что именно удалится, — и
-        карточки показываем для них, а не для первых путей подряд.
-        """
-        groups, summary = self._duplicate_index(similar, viewer, admin)
-        chosen = duplicates.select(groups, kind, sort, hide_small, folder)
+        """Страница групп; выбранная папка задаёт сохраняемую копию и сводку."""
+        groups, summary = self._duplicate_index(similar, viewer, admin, folder)
+        chosen = duplicates.select(groups, kind, sort, hide_small)
         page = chosen[offset:offset + limit]
-        scope = {group['key']: duplicates.in_folder(group, folder) for group in page} if folder else {}
         # Карточки готовим только для видимой части группы: копий одной
         # иконки бывают сотни, а показываем мы дюжину.
-        shown = [path for group in page for path in self._dup_cards(group, scope)]
-        # Вес лишнего в папке считаем по всем её копиям, не только по показанным.
-        sized = set(shown).union(*scope.values()) if scope else set(shown)
+        shown = [path for group in page for path in group['paths'][:self.CARDS]]
         with self.lock:
             shapes = {}
-            wanted = sorted(sized)
+            wanted = sorted(set(shown))
             for start in range(0, len(wanted), 400):
                 batch = wanted[start:start + 400]
                 marks = ','.join('?' * len(batch))
@@ -1965,7 +1964,7 @@ class App:
         result = []
         for group in page:
             items = []
-            for path in self._dup_cards(group, scope):
+            for path in group['paths'][:self.CARDS]:
                 card = cards.get(path)
                 if card is None:
                     continue
@@ -1974,20 +1973,9 @@ class App:
                               'width': width or 0, 'height': height or 0})
             if not items:
                 continue
-            extra = {}
-            if folder:
-                paths = scope[group['key']]
-                extra = {'folder_paths': paths,
-                         'folder_extra': sum((shapes.get(path) or (0,))[0] or 0 for path in paths)}
-            result.append({**group, **extra, 'photos': items})
+            result.append({**group, 'photos': items})
         return {'groups': result, 'total': len(chosen), 'summary': summary,
                 'offset': offset, 'limit': limit}
-
-    def _dup_cards(self, group, scope):
-        """Какие пути группы показать карточками: совет сервера и то, что удалим."""
-        if not scope:
-            return group['paths'][:self.CARDS]
-        return [group['keep'], *scope[group['key']][:self.CARDS - 1]]
 
     def hydrate_payloads(self, paths):
         """Карточки снимков для готового списка путей, одним запросом на порцию."""
