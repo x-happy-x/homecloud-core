@@ -35,6 +35,7 @@ import pathrules
 import privacy
 import reverse_search
 import router_learning
+import router_taggers
 import settings as catalog_settings
 import speaker_diarization
 import speech_videos
@@ -354,6 +355,7 @@ class RouterController:
         # Same venv as vision_python in device_job.py.
         self.python = self.root / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
         self.progress_file = self.catalog / 'router-progress.json'
+        self.stop_file = self.catalog / 'router-stop.request'
         self.process = None
         self.lock = threading.RLock()
 
@@ -377,23 +379,49 @@ class RouterController:
                     self.process = None
             return payload
 
-    def start(self, action):
-        if action not in {'bootstrap', 'train'}:
+    def start(self, action, options=None):
+        if action not in {'bootstrap', 'train', 'tag'}:
             raise ValueError('Неизвестная операция роутера')
         with self.lock:
             if self.status().get('active'):
                 raise ValueError('Роутер уже занят')
+            python, command = self.python, [str(self.root / 'router_learning.py'), action]
+            if action == 'tag':
+                # Разметчики RAM++ и Qwen смотрят на сами снимки; у RAM++ своё окружение.
+                options = options or {}
+                engine = str(options.get('engine', ''))
+                if engine not in router_taggers.ENGINES:
+                    raise ValueError('Неизвестный разметчик')
+                scope = 'reviewed' if options.get('scope') == 'reviewed' else 'queue'
+                count = max(1, min(int(options.get('count') or 20), 5000))
+                python = self.root / 'work' / router_taggers.ENGINES[engine]['venv'] / 'Scripts' / 'python.exe'
+                if not python.is_file():
+                    raise ValueError(f'Нет окружения {python.parent.parent.name}')
+                command = [str(self.root / 'router_taggers.py'), engine, '--scope', scope,
+                           '--count', str(count), '--stop', str(self.stop_file)]
+                if options.get('accept') and scope == 'queue':
+                    command.append('--accept')
+                if options.get('hide_adult'):
+                    command.append('--hide-adult')
             self.progress_file.unlink(missing_ok=True)
+            self.stop_file.unlink(missing_ok=True)
             env = os.environ.copy()
             env.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_DISABLE_XET='1',
                        HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', PYTHONUTF8='1')
             flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             self.process = subprocess.Popen(
-                [str(self.python), str(self.root / 'router_learning.py'), action,
+                [str(python), *command,
                  '--catalog', str(self.catalog), '--progress', str(self.progress_file)],
                 cwd=self.root, env=env, creationflags=flags,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
+            return self.status()
+
+    def stop(self):
+        """Разметчик проверяет файл-флаг между снимками; обучение и пересчёт короткие."""
+        with self.lock:
+            if self.status().get('active'):
+                self.stop_file.write_text('stop', encoding='utf-8')
             return self.status()
 
 
@@ -2233,6 +2261,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response(self.app.router.status())
             if parsed.path == '/api/router/summary':
                 return self.json_response(router_learning.summary(self.app.catalog_folder))
+            if parsed.path == '/api/router/taggers':
+                return self.json_response({'taggers': router_taggers.overview(
+                    self.app.catalog_folder, Path(__file__).resolve().parent)})
             if parsed.path == '/api/router/review':
                 query = parse_qs(parsed.query)
                 queue = router_learning.review_queue(
@@ -2244,6 +2275,7 @@ class Handler(BaseHTTPRequestHandler):
                     {**cards[item['path']], 'router_scores': item['scores'],
                      'router_suggested': item['suggested'],
                      'router_trained': item['trained'],
+                     'router_alternatives': item['alternatives'],
                      'router_uncertainty': item['uncertainty']}
                     for item in queue if item['path'] in cards]})
             if parsed.path == '/api/router/batches':
@@ -2494,6 +2526,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response({'ok': True, 'job': self.app.router.start('bootstrap')})
             if path == '/api/router/train':
                 return self.json_response({'ok': True, 'job': self.app.router.start('train')})
+            if path == '/api/router/tag':
+                return self.json_response({'ok': True, 'job': self.app.router.start('tag', {
+                    'engine': body.get('engine'), 'scope': body.get('scope'),
+                    'count': body.get('count'), 'accept': bool(body.get('accept')),
+                    'hide_adult': body.get('adult') == 'hide'})})
+            if path == '/api/router/stop':
+                return self.json_response({'ok': True, 'job': self.app.router.stop()})
             if path == '/api/router/label':
                 viewer, _ = self.viewer
                 labels = router_learning.save_review(

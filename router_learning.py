@@ -178,6 +178,8 @@ def pending_batch_paths(catalog):
 
 
 BATCH_SIZES = (1, 3, 5, 10, 15, 20)
+# Разметчики из router_taggers.py: смотрят на сами снимки, а не на визуальный индекс.
+ALTERNATIVE_SOURCES = ('ram_plus', 'qwen', 'lmstudio')
 
 
 def batch_size(value):
@@ -345,6 +347,9 @@ def summary(catalog):
             "SELECT COUNT(*) FROM router_reviews WHERE source='propagated'").fetchone()[0]
         ai_reviewed = db.execute(
             "SELECT COUNT(*) FROM router_reviews WHERE source='ai_batch'").fetchone()[0]
+        local_reviewed = db.execute(
+            'SELECT COUNT(*) FROM router_reviews WHERE source IN (%s)'
+            % ','.join('?' * len(ALTERNATIVE_SOURCES)), ALTERNATIVE_SOURCES).fetchone()[0]
         pending_batches = db.execute(
             "SELECT COUNT(*) FROM router_batches WHERE status='exported'").fetchone()[0]
         skipped = db.execute('SELECT COUNT(*) FROM router_skips').fetchone()[0]
@@ -362,7 +367,8 @@ def summary(catalog):
                 'active_version': version if source == 'trained' else '',
                 'embedded': embedded, 'predicted': predicted, 'reviewed': reviewed,
                 'human_reviewed': human, 'propagated': propagated,
-                'ai_reviewed': ai_reviewed, 'pending_batches': pending_batches,
+                'ai_reviewed': ai_reviewed, 'local_reviewed': local_reviewed,
+                'pending_batches': pending_batches,
                 'skipped': skipped, 'batch_sizes': list(BATCH_SIZES),
                 'pending': max(0, predicted - reviewed - skipped), 'labels': label_payload(),
                 'models': models, 'auto_train': options['router_auto_train'],
@@ -474,12 +480,29 @@ def review_queue(catalog, limit=24, hide_adult=False):
                     f'WHERE path IN ({marks}) AND source=? AND model_version=?',
                     [*by_path, source, version]):
                 by_path[path][label] = round(float(score), 4)
+        # Что сказали RAM++ и Qwen, если уже смотрели эти снимки: метки от .5 по убыванию.
+        alternatives = {path: {} for path in by_path}
+        if by_path:
+            marks = ','.join('?' * len(by_path))
+            engines = ','.join('?' * len(ALTERNATIVE_SOURCES))
+            for path, engine, label, score in db.execute(
+                    'SELECT path,source,label,MAX(score) FROM router_predictions '
+                    'INDEXED BY sqlite_autoindex_router_predictions_1 '
+                    f'WHERE path IN ({marks}) AND source IN ({engines}) GROUP BY path,source,label',
+                    [*by_path, *ALTERNATIVE_SOURCES]):
+                labels = alternatives[path].setdefault(engine, [])
+                if score >= .5:
+                    labels.append((score, label))
+            for values in alternatives.values():
+                for engine, labels in values.items():
+                    values[engine] = [label for _, label in sorted(labels, reverse=True)]
         result = []
         for path, uncertainty in rows:
             scores = by_path[path]
             result.append({'path': path, 'scores': scores,
                            'suggested': suggested_labels(scores, source == 'trained'),
                            'trained': source == 'trained',
+                           'alternatives': alternatives[path],
                            'uncertainty': round(float(uncertainty), 4)})
         return result
     finally:

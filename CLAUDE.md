@@ -44,7 +44,8 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 - **подборки:** `albums`, `album_photos`, `people_albums`,
   `people_album_members`, `hidden_photos`
 - **обучение:** `router_models`, `router_predictions`, `router_reviews`,
-  `router_training_labels`, `router_batches`, `router_batch_items`
+  `router_training_labels`, `router_batches`, `router_batch_items`,
+  `router_skips`
 - **настройки:** `settings`
 
 Ключ группы в разделе «Люди» — строка одного из четырёх видов:
@@ -62,6 +63,7 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 | Визуальный индекс | `google/siglip2-base-patch16-224` (по умолчанию), либо `siglip2-base-patch16-256`, либо `jinaai/jina-clip-v2` — выбирается в настройках | `work/vision-venv` |
 | Рейтинг 18+ | `SmilingWolf/wd-eva02-large-tagger-v3` + NudeNet (`NudeNet-320n-exif`) для областей | `work/vision-venv` |
 | Описания | `Qwen/Qwen3-VL-2B-Instruct` локально либо LM Studio по адресу из настроек | `work/vision-venv` |
+| Разметчики обучения | RAM++ `ram_plus_swin_large_14m` (веса в `C:\cv-models\ram-plus`, ставит `setup-ram.ps1`); Qwen3-VL-2B и LM Studio — те же, что для описаний | `work/ram-venv`, `work/vision-venv` |
 | Рисованные лица | `deepghs/anime_real_cls`, вариант `mobilenetv3_v1.4_dist` (пакет `dghs-imgutils`) | `work/imgutils-venv` |
 | OCR | PaddleOCR, `lang='ru'`, **на процессоре** | `C:\cv-ocr` |
 | Речь | Whisper `large-v3` через faster-whisper, `float16` на CUDA; звук достаёт PyAV из комплекта | `work/audio-venv` |
@@ -71,15 +73,32 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 `device_job.py` сам выбирает интерпретатор под этап — правки путей искать
 там (строки со `*_python`).
 
-**Окружений пять, и это не случайность.** `dghs-imgutils` тянет numpy<2 и
+**Окружений шесть, и это не случайность.** `dghs-imgutils` тянет numpy<2 и
 `opencv-contrib-python`, которые ломают `cv2` в любом окружении, где уже стоит
 `opencv-python-headless` — конфликт на уровне файлов, не версий. Никогда не
 ставить его в общее окружение. PaddleOCR живёт отдельно по той же причине.
+RAM++ требует transformers 4.25 и timm 0.4.12 — у него `work/ram-venv`, а
+torch он берёт из vision-venv через `zz-vision-venv.pth` (свои пакеты стоят в
+пути поиска раньше).
 
 Рейтинг 18+ ставится **по согласию двух моделей**: NudeNet даёт области,
 WD-tagger — рейтинг и теги. Текст и интерфейсы отсекаются по тегам,
 `sensitive` не замыливается. У роликов берётся несколько кадров по всей длине
 и остаётся худший: одного кадра из начала мало.
+
+## Обучение: кто ставит метки
+
+Основной источник — визуальный индекс: zero-shot по текстовым описаниям меток
+или своя обученная версия (`router_learning.py`). Рядом, **не заменяя его**,
+работают разметчики из `router_taggers.py` — RAM++, Qwen3-VL-2B и LM Studio.
+Они смотрят на сами снимки и пишут в `router_predictions` под своим `source`;
+в очереди разметки это отдельные строки подсказок (`router_alternatives`), а с
+флагом `accept` ответ сразу ложится разметкой с `source` = имя разметчика.
+Задание идёт тем же `RouterController`, что обучение: одно на видеокарту.
+
+Качество каждого считается против ручной разметки (`source='human'`), только
+по меткам, которые разметчик умеет ставить. На 17 снимках: zero-shot — точность
+14%, полнота 68%; RAM++ — 83% и 36%; Qwen3-VL-2B — 36% и 53%.
 
 ## Как устроено сканирование
 
