@@ -1109,8 +1109,9 @@ class App:
                 'SELECT stored FROM hidden_photos WHERE path=?', (str(path),)).fetchone()
         return Path(row[0]) if row else Path(path)
 
-    def router_batch_archive(self, hide_adult=False):
+    def router_batch_archive(self, hide_adult=False, count=10):
         """Build a private offline review pack without exposing original paths."""
+        count = router_learning.batch_size(count)
         reserved = router_learning.pending_batch_paths(self.catalog_folder)
         candidates = router_learning.review_queue(
             self.catalog_folder, 100, hide_adult=hide_adult)
@@ -1138,10 +1139,10 @@ class App:
             except (OSError, ValueError) as exc:
                 print(f'Router batch skipped {raw_path}: {exc}', file=sys.stderr, flush=True)
                 continue
-            if len(encoded) == 10:
+            if len(encoded) == count:
                 break
         batch = router_learning.create_batch(
-            self.catalog_folder, [path for path, _ in encoded])
+            self.catalog_folder, [path for path, _ in encoded], count)
         pictures = dict(encoded)
         public_items = [{'file': item['file']} for item in batch['items']]
         template = {'batch_id': batch['batch_id'],
@@ -2220,12 +2221,24 @@ class Handler(BaseHTTPRequestHandler):
                     [item['path'] for item in queue])}
                 return self.json_response({'photos': [
                     {**cards[item['path']], 'router_scores': item['scores'],
+                     'router_suggested': item['suggested'],
+                     'router_trained': item['trained'],
                      'router_uncertainty': item['uncertainty']}
                     for item in queue if item['path'] in cards]})
+            if parsed.path == '/api/router/batches':
+                batches = router_learning.pending_batches(self.app.catalog_folder)
+                paths = [item['path'] for batch in batches for item in batch['items']]
+                cards = {card['path']: card for card in self.app.hydrate_payloads(paths)}
+                for batch in batches:
+                    for item in batch['items']:
+                        card = cards.get(item['path'])
+                        item['photo'] = card and {key: card[key] for key in (
+                            'path', 'preview', 'filename', 'kind', 'adult_rating') if key in card}
+                return self.json_response({'batches': batches})
             if parsed.path == '/api/router/export':
                 query = parse_qs(parsed.query)
                 body, filename = self.app.router_batch_archive(
-                    query.get('adult', [''])[0] == 'hide')
+                    query.get('adult', [''])[0] == 'hide', query.get('count', ['10'])[0])
                 return self.download_response(body, filename, 'application/zip')
             if parsed.path == '/api/device':
                 return self.json_response(self.app.device.info())
@@ -2490,6 +2503,16 @@ class Handler(BaseHTTPRequestHandler):
                     auto_started = True
                 return self.json_response({'ok': True, **result,
                                            'auto_started': auto_started})
+            if path == '/api/router/skip':
+                viewer, _ = self.viewer
+                router_learning.skip(self.app.catalog_folder, body.get('path', ''), viewer)
+                return self.json_response({'ok': True})
+            if path == '/api/router/skips/clear':
+                return self.json_response({
+                    'ok': True, 'restored': router_learning.clear_skips(self.app.catalog_folder)})
+            if path == '/api/router/batch/cancel':
+                router_learning.cancel_batch(self.app.catalog_folder, body.get('batch_id', ''))
+                return self.json_response({'ok': True})
             if path == '/api/router/activate':
                 router_learning.activate(self.app.catalog_folder, body.get('version', ''))
                 return self.json_response({'ok': True})

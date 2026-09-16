@@ -110,6 +110,10 @@ CREATE TABLE IF NOT EXISTS router_batch_items (
   PRIMARY KEY(batch_id,item_name), UNIQUE(batch_id,path)
 );
 CREATE INDEX IF NOT EXISTS router_batches_status ON router_batches(status,created_at);
+CREATE TABLE IF NOT EXISTS router_skips (
+  path TEXT PRIMARY KEY REFERENCES photos(path) ON DELETE CASCADE,
+  skipped_at TEXT NOT NULL, reviewer TEXT NOT NULL DEFAULT ''
+);
 '''
 
 
@@ -173,10 +177,22 @@ def pending_batch_paths(catalog):
         db.close()
 
 
-def create_batch(catalog, paths):
+BATCH_SIZES = (1, 3, 5, 10, 15, 20)
+
+
+def batch_size(value):
+    """Размер пакета из разрешённых; неизвестное — десять, как раньше."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return 10
+    return value if value in BATCH_SIZES else 10
+
+
+def create_batch(catalog, paths, limit=10):
     if not paths:
         raise ValueError('В очереди нет фотографий для нового пакета')
-    paths = list(dict.fromkeys(str(path) for path in paths))[:10]
+    paths = list(dict.fromkeys(str(path) for path in paths))[:batch_size(limit)]
     db = connect(catalog)
     try:
         model = catalog_settings.read(db)['visual_model']
@@ -195,7 +211,8 @@ def create_batch(catalog, paths):
 
 def batch_prompt(batch_id, item_names):
     files = ', '.join(item_names)
-    return f'''Проверь все 10 или меньше изображений из этого архива: {files}.
+    count = len(item_names)
+    return f'''Проверь все изображения из этого архива ({count} шт.): {files}.
 
 Цель: присвоить каждому файлу все визуально подтверждённые категории из categories.json.
 
@@ -218,7 +235,24 @@ def batch_prompt(batch_id, item_names):
 '''.strip() + '\n'
 
 
+def parse_answer(text):
+    """Ответ нейросети как текст: снимаем ```json-обёртку и лишнее вокруг объекта."""
+    text = str(text or '').strip()
+    if text.startswith('```'):
+        text = text.split('\n', 1)[1] if '\n' in text else ''
+        text = text.rsplit('```', 1)[0]
+    start, end = text.find('{'), text.rfind('}')
+    if start < 0 or end <= start:
+        raise ValueError('В ответе не найден JSON-объект')
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'Ответ не разобрался как JSON: {exc.msg} (строка {exc.lineno})') from exc
+
+
 def import_batch(catalog, payload, reviewer=''):
+    if isinstance(payload, dict) and isinstance(payload.get('text'), str):
+        payload = parse_answer(payload['text'])
     if not isinstance(payload, dict):
         raise ValueError('Ответ должен быть JSON-объектом')
     batch_id = str(payload.get('batch_id', '')).strip()
@@ -245,6 +279,9 @@ def import_batch(catalog, payload, reviewer=''):
                 raise ValueError(f'Файл {name} указан дважды')
             if name not in expected or not isinstance(labels, list):
                 raise ValueError(f'Неверный файл или labels: {name}')
+            # Нейросеть иногда отвечает русскими названиями вместо id.
+            titles = {value[0].casefold(): key for key, value in LABELS.items()}
+            labels = [titles.get(str(label).casefold(), str(label)) for label in labels]
             unknown = sorted(set(map(str, labels)) - set(LABELS))
             if unknown:
                 raise ValueError(f'Неизвестные категории для {name}: {", ".join(unknown)}')
@@ -310,6 +347,7 @@ def summary(catalog):
             "SELECT COUNT(*) FROM router_reviews WHERE source='ai_batch'").fetchone()[0]
         pending_batches = db.execute(
             "SELECT COUNT(*) FROM router_batches WHERE status='exported'").fetchone()[0]
+        skipped = db.execute('SELECT COUNT(*) FROM router_skips').fetchone()[0]
         models = [{
             'version': row[0], 'embedding_model': row[1], 'status': row[2],
             'trained_at': row[3], 'dataset_size': row[4],
@@ -325,10 +363,79 @@ def summary(catalog):
                 'embedded': embedded, 'predicted': predicted, 'reviewed': reviewed,
                 'human_reviewed': human, 'propagated': propagated,
                 'ai_reviewed': ai_reviewed, 'pending_batches': pending_batches,
-                'pending': max(0, predicted - reviewed), 'labels': label_payload(),
+                'skipped': skipped, 'batch_sizes': list(BATCH_SIZES),
+                'pending': max(0, predicted - reviewed - skipped), 'labels': label_payload(),
                 'models': models, 'auto_train': options['router_auto_train'],
                 'auto_train_every': options['router_auto_train_every'],
                 'new_since_training': max(0, reviewed - last_size)}
+    finally:
+        db.close()
+
+
+def suggested_labels(scores, trained=False, limit=4):
+    """Метки, которые стоит предложить человеку.
+
+    Своя обученная версия откалибрована — берём всё, что выше половины. Общая
+    zero-shot модель ошибается при любом пороге (на проверенных снимках порог
+    0.6 угадывал 17% меток, а подсказывал по десятку на снимок), поэтому от
+    неё — только несколько самых уверенных вариантов, и их не отмечаем заранее.
+    """
+    if trained:
+        picked = sorted(((score, label) for label, score in scores.items() if score >= .5), reverse=True)
+    else:
+        picked = sorted(((score, label) for label, score in scores.items() if score >= .55), reverse=True)
+    return [label for _, label in picked[:limit if not trained else 8]]
+
+
+def skip(catalog, path, reviewer=''):
+    db = connect(catalog)
+    try:
+        with db:
+            db.execute('INSERT INTO router_skips(path,skipped_at,reviewer) VALUES(?,?,?) '
+                       'ON CONFLICT(path) DO UPDATE SET skipped_at=excluded.skipped_at',
+                       (str(path), now(), reviewer[:120]))
+    finally:
+        db.close()
+
+
+def clear_skips(catalog):
+    db = connect(catalog)
+    try:
+        with db:
+            return db.execute('DELETE FROM router_skips').rowcount
+    finally:
+        db.close()
+
+
+def pending_batches(catalog):
+    """Выданные и ещё не загруженные пакеты: кому что отдали и какой промпт."""
+    db = connect(catalog)
+    try:
+        db.execute("UPDATE router_batches SET status='expired' WHERE status='exported' "
+                   "AND datetime(created_at) < datetime('now','-7 days')")
+        db.commit()
+        result = []
+        for batch_id, created_at in db.execute(
+                "SELECT id,created_at FROM router_batches WHERE status='exported' "
+                'ORDER BY created_at DESC').fetchall():
+            items = [{'file': name, 'path': path} for name, path in db.execute(
+                'SELECT item_name,path FROM router_batch_items WHERE batch_id=? ORDER BY item_name',
+                (batch_id,))]
+            result.append({'batch_id': batch_id, 'created_at': created_at, 'items': items,
+                           'prompt': batch_prompt(batch_id, [item['file'] for item in items])})
+        return result
+    finally:
+        db.close()
+
+
+def cancel_batch(catalog, batch_id):
+    db = connect(catalog)
+    try:
+        with db:
+            changed = db.execute("UPDATE router_batches SET status='cancelled' "
+                                 "WHERE id=? AND status='exported'", (str(batch_id),)).rowcount
+        if not changed:
+            raise ValueError('Пакет не найден или уже загружен')
     finally:
         db.close()
 
@@ -348,15 +455,31 @@ def review_queue(catalog, limit=24, hide_adult=False):
             LEFT JOIN router_reviews r ON r.path=p.path
             WHERE p.source=? AND p.model_version=? AND r.path IS NULL
               AND f.status='ok' AND COALESCE(f.blocked,0)=0
-              AND p.path NOT IN (SELECT path FROM hidden_photos)''' + adult_clause + '''
+              AND p.path NOT IN (SELECT path FROM hidden_photos)
+              AND p.path NOT IN (SELECT path FROM router_skips)
+              AND p.path NOT IN (SELECT i.path FROM router_batch_items i
+                                 JOIN router_batches b ON b.id=i.batch_id
+                                 WHERE b.status='exported')''' + adult_clause + '''
             GROUP BY p.path ORDER BY uncertainty ASC,p.path LIMIT ?''',
             (source, version, max(1, min(int(limit), 100)))).fetchall()
+        # Оценки всех снимков — одним запросом по первичному ключу. По запросу на
+        # снимок планировщик брал индекс по источнику и перебирал весь каталог:
+        # пять секунд на тридцать снимков.
+        by_path = {path: {} for path, _ in rows}
+        if by_path:
+            marks = ','.join('?' * len(by_path))
+            for path, label, score in db.execute(
+                    'SELECT path,label,score FROM router_predictions '
+                    'INDEXED BY sqlite_autoindex_router_predictions_1 '
+                    f'WHERE path IN ({marks}) AND source=? AND model_version=?',
+                    [*by_path, source, version]):
+                by_path[path][label] = round(float(score), 4)
         result = []
         for path, uncertainty in rows:
-            scores = {row[0]: round(float(row[1]), 4) for row in db.execute(
-                'SELECT label,score FROM router_predictions '
-                'WHERE path=? AND source=? AND model_version=?', (path, source, version))}
+            scores = by_path[path]
             result.append({'path': path, 'scores': scores,
+                           'suggested': suggested_labels(scores, source == 'trained'),
+                           'trained': source == 'trained',
                            'uncertainty': round(float(uncertainty), 4)})
         return result
     finally:
