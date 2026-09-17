@@ -30,8 +30,13 @@ import albums
 import people_albums
 import catalog_index
 import duplicates
+import face_quality
+import face_stacks
+import highlight_generator
 import job_features
+import media_metadata
 import pathrules
+import photo_curation
 import privacy
 import reverse_search
 import router_learning
@@ -603,6 +608,9 @@ class DeviceController:
                            and (Path(r'C:\cv-models\huggingface').is_dir()
                                 or (self.root / 'hf-token.txt').is_file())),
                 'authenticity': imgutils.is_file(),
+                # Оценка и подборки идут в основном окружении по готовым данным.
+                'curation': True,
+                'highlights': True,
             },
         }
 
@@ -916,7 +924,14 @@ class ReclusterController:
         db = None
         try:
             db = open_catalog_db(self.app.store.folder, check_same_thread=False)
-            rows = db.execute('SELECT id,embedding FROM faces ORDER BY id').fetchall()
+            options = catalog_settings.read(db)
+            # Мыльные лица в сборку не берём: они склеивают разных людей.
+            # Оценки уже посчитаны — их досчитывает опрос состояния.
+            blurry = face_quality.blurry_ids(
+                db, float(options['face_blur_threshold']), float(options['face_min_size']))
+            rows = [row for row in db.execute('SELECT id,embedding FROM faces ORDER BY id')
+                    if row[0] not in blurry]
+            skipped = sorted(blurry)
             total = len(rows)
             # Старые группы не трогаем, пока не готовы полностью новые: если
             # остановить пересборку на любом из первых трёх шагов, каталог
@@ -948,7 +963,7 @@ class ReclusterController:
             if vectors and len(vectors) >= min_cluster_size:
                 matrix = np.stack(vectors)
                 labels, probabilities = cluster_embeddings(
-                    matrix, algorithm='hdbscan', min_cluster_size=min_cluster_size)
+                    matrix, algorithm='average', min_cluster_size=min_cluster_size)
             else:
                 labels = [-1] * len(ids)
                 probabilities = [0.0] * len(ids)
@@ -963,9 +978,14 @@ class ReclusterController:
             stopped_midway = False
             cleared = False
             chunk = 2000
+            ids = list(ids) + skipped
+            labels = list(labels) + [-1] * len(skipped)
+            probabilities = list(probabilities) + [0.0] * len(skipped)
+            methods = ['average'] * (len(ids) - len(skipped)) + ['blurry'] * len(skipped)
             for offset in range(0, len(ids), chunk):
                 batch = list(zip(ids[offset:offset + chunk], labels[offset:offset + chunk],
-                                 probabilities[offset:offset + chunk]))
+                                 probabilities[offset:offset + chunk],
+                                 methods[offset:offset + chunk]))
                 with db:
                     if not cleared:
                         # Старое стирается в той же транзакции, что и первая
@@ -977,8 +997,8 @@ class ReclusterController:
                         'VALUES(?,?,?,?,?) ON CONFLICT(face_id) DO UPDATE SET label=excluded.label,'
                         'probability=excluded.probability,method=excluded.method,'
                         'computed_at=excluded.computed_at',
-                        [(int(face_id), int(label), float(probability), 'hdbscan', now)
-                         for face_id, label, probability in batch])
+                        [(int(face_id), int(label), float(probability), method, now)
+                         for face_id, label, probability, method in batch])
                 self._set(done=min(offset + chunk, len(ids)), total=len(ids))
                 if self._should_stop():
                     stopped_midway = True
@@ -1012,18 +1032,20 @@ class ReclusterController:
         """
         db = None
         try:
-            options = catalog_settings.load(self.app.catalog)
+            options = catalog_settings.load(self.app.catalog_folder)
             smallest = int(options.get('noise_cluster_size', 3))
             db = open_catalog_db(self.app.store.folder, check_same_thread=False)
             self._set(step='prepare', step_index=1, message='Собираю остаток')
-            rows = db.execute('''
+            blurry = face_quality.blurry_ids(
+                db, float(options['face_blur_threshold']), float(options['face_min_size']))
+            rows = [row for row in db.execute('''
                 SELECT faces.id, faces.embedding FROM faces
                 JOIN face_clusters ON face_clusters.face_id = faces.id
                 LEFT JOIN face_people ON face_people.face_id = faces.id
                 LEFT JOIN face_exclusions ON face_exclusions.face_id = faces.id
                 WHERE face_clusters.label = -1 AND face_people.face_id IS NULL
                   AND face_exclusions.face_id IS NULL
-                ORDER BY faces.id''').fetchall()
+                ORDER BY faces.id''') if row[0] not in blurry]
             total = len(rows)
             self._set(done=0, total=total, faces_total=total)
             if total < smallest:
@@ -1050,7 +1072,7 @@ class ReclusterController:
             self._set(step='cluster', step_index=3, done=0, total=1,
                       step_started_at=time.time(), message='Ищу группы в остатке')
             labels, probabilities = cluster_embeddings(
-                np.stack(vectors), algorithm='hdbscan', min_cluster_size=smallest)
+                np.stack(vectors), algorithm='average', min_cluster_size=smallest)
             self._set(done=1, total=1)
             if self._should_stop():
                 self._set(status='stopped', message='Остановлено — ничего не тронуто')
@@ -1072,7 +1094,7 @@ class ReclusterController:
                     db.executemany(
                         'UPDATE face_clusters SET label=?,probability=?,method=?,computed_at=? '
                         'WHERE face_id=? AND label=-1',
-                        [(label, probability, 'hdbscan-leftovers', now, face_id)
+                        [(label, probability, 'average-leftovers', now, face_id)
                          for face_id, label, probability in batch])
                 self._set(done=min(start + 2000, len(found)))
                 if self._should_stop():
@@ -1095,6 +1117,92 @@ class ReclusterController:
                     pass
 
 
+class HighlightService:
+    """Пересборка автоматических подборок: отдельный поток и своё соединение.
+
+    Сама сборка идёт по SQLite и занимает секунды, но с `curate` сначала
+    досчитываются оценки снимков — это чтение файлов, и на большом каталоге
+    надолго. Поэтому, как у дубликатов и пересборки групп, ни поток запроса,
+    ни общее соединение `App.store.db` здесь не используются. Старые подборки
+    заменяются одной транзакцией в самом конце: остановка или ошибка их не
+    трогают.
+    """
+
+    def __init__(self, catalog):
+        self.catalog = Path(catalog).resolve()
+        self.lock = threading.Lock()
+        self.thread = None
+        self.stopping = False
+        self.state = {'status': 'idle', 'step': '', 'done': 0, 'total': 0, 'current': '',
+                      'kinds': [], 'curate': False, 'result': {}, 'error': '',
+                      'started_at': 0, 'finished_at': 0}
+
+    def status(self):
+        with self.lock:
+            return dict(self.state)
+
+    def start(self, kinds=None, curate=False, force=False, allow_unchecked_adult=None,
+              today=None):
+        kinds = list(kinds or highlight_generator.KINDS)
+        unknown = [kind for kind in kinds if kind not in highlight_generator.KINDS]
+        if unknown:
+            raise ValueError('Неизвестный вид подборки: ' + ', '.join(map(str, unknown)))
+        if today:
+            today = datetime.strptime(str(today), '%Y-%m-%d').date()
+        if allow_unchecked_adult is None:
+            allow_unchecked_adult = not catalog_settings.load(
+                self.catalog)['highlights_require_adult_check']
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return dict(self.state)
+            self.stopping = False
+            self.state = {'status': 'running', 'step': 'curation' if curate else 'highlights',
+                          'done': 0, 'total': 0, 'current': '', 'kinds': kinds,
+                          'curate': bool(curate), 'result': {}, 'error': '',
+                          'started_at': time.time(), 'finished_at': 0}
+            self.thread = threading.Thread(
+                target=self._run, args=(kinds, bool(curate), bool(force),
+                                        bool(allow_unchecked_adult), today), daemon=True)
+            self.thread.start()
+            return dict(self.state)
+
+    def stop(self):
+        with self.lock:
+            if not (self.thread and self.thread.is_alive()):
+                raise ValueError('Пересборка подборок сейчас не выполняется')
+            self.stopping = True
+            return dict(self.state)
+
+    def _set(self, **values):
+        with self.lock:
+            self.state.update(values)
+
+    def _run(self, kinds, curate, force, allow_unchecked_adult, today):
+        result = {}
+        try:
+            if curate:
+                result['curation'] = photo_curation.curate(
+                    self.catalog, force=force, stop=lambda: self.stopping,
+                    progress=lambda **values: self._set(
+                        done=values.get('completed', 0), total=values.get('total', 0),
+                        current=values.get('current', '')),
+                    log=lambda message: None)
+                if self.stopping:
+                    self._set(status='stopped', result=result, current='',
+                              finished_at=time.time())
+                    return
+            self._set(step='highlights', done=0, total=1, current='')
+            result['highlights'] = highlight_generator.regenerate(
+                self.catalog, kinds, today,
+                {'require_adult_check': not allow_unchecked_adult}, stop=lambda: self.stopping)
+            stopped = self.stopping or result['highlights'].get('stopped')
+            self._set(status='stopped' if stopped else 'completed', done=1, total=1,
+                      result=result, current='', finished_at=time.time())
+        except Exception as exc:
+            print(f'Highlights failed: {exc}', file=sys.stderr, flush=True)
+            self._set(status='error', error=str(exc), result=result, finished_at=time.time())
+
+
 class App:
     def __init__(self, data, min_cluster_size=8, token=None,
                  device_id=None, device_name=None, max_faces=0):
@@ -1110,9 +1218,11 @@ class App:
         router_learning.connect(data).close()
         speaker_diarization.connect(data).close()
         speech_videos.connect(data).close()
+        highlight_generator.connect(data).close()
         self.folders = albums.Folders(self.store.db)
         self.duplicates = DuplicateService(data)
         self.recluster_job = ReclusterController(self)
+        self.highlights = HighlightService(data)
         self.catalog_folder = Path(data).resolve()
         self.scanner = ScanController()
         self.analyzer = AnalysisController()
@@ -1239,20 +1349,96 @@ class App:
             'hidden': group['key'] in (hidden_keys or ()),
         }
         if include_faces:
-            payload['faces'] = [self.face_payload(face_id) for face_id in face_ids]
+            payload['faces'] = self.faces_payload(face_ids)
+            payload['stacks'] = len({face['stack'] for face in payload['faces']})
         return payload
 
-    def face_payload(self, face_id):
+    def face_payload(self, face_id, details=None):
         row = self.store.by_id[face_id]
         moment = row[4] if len(row) > 4 else None
+        extra = (details or {}).get(face_id, {})
         return {
             'id': face_id, 'filename': Path(row[1]).name, 'path': row[1],
             'kind': 'video' if video_media.is_video(row[1]) else 'photo',
             'frame_time': moment,
+            # Промежуток трека: просмотрщик открывает ролик с его начала.
+            'track_start': extra.get('track_start'),
+            'track_stop': extra.get('track_stop'),
+            'blur': extra.get('blur'),
             'thumbnail': f'/media/thumb/{face_id}',
             'original': f'/media/original/{face_id}',
             'confidence': self.store.auto_confidence.get(face_id, 0),
+            'stack': extra.get('stack', face_id),
+            'stack_size': extra.get('stack_size', 1),
         }
+
+    def face_details(self, face_ids):
+        """Трек, резкость, время съёмки и хеш снимка — одним заходом на все лица."""
+        details = {}
+        for offset in range(0, len(face_ids), 900):
+            batch = face_ids[offset:offset + 900]
+            marks = ','.join('?' * len(batch))
+            for (face_id, path, track_start, track_stop, blur, taken, modified,
+                 curated_hash, plain_hash) in self.store.db.execute(
+                    'SELECT faces.id,faces.path,faces.track_start,faces.track_stop,'
+                    'face_quality.blur,photo_curation.taken_ts,photos.modified,'
+                    'photo_curation.dhash,photo_hashes.dhash FROM faces '
+                    'LEFT JOIN face_quality ON face_quality.face_id=faces.id '
+                    'LEFT JOIN photo_curation ON photo_curation.path=faces.path '
+                    'LEFT JOIN photo_hashes ON photo_hashes.path=faces.path '
+                    'LEFT JOIN photos ON photos.path=faces.path '
+                    f'WHERE faces.id IN ({marks})', batch):
+                if taken is None and modified:
+                    taken = modified / 1e9
+                details[face_id] = {
+                    'path': path, 'track_start': track_start, 'track_stop': track_stop,
+                    'blur': blur, 'taken': taken, 'dhash': curated_hash or plain_hash}
+        return details
+
+    def faces_payload(self, face_ids):
+        """Лица карточки группы вместе со стопками похожих кадров."""
+        face_ids = [face_id for face_id in face_ids if face_id in self.store.by_id]
+        details = self.face_details(face_ids)
+        try:
+            matrix, order = self.store.vectors(face_ids) if face_ids else (None, [])
+            vectors = {face_id: matrix[index] for index, face_id in enumerate(order)}
+        except ValueError:
+            vectors = {}
+        described = []
+        for face_id in face_ids:
+            info = details.get(face_id, {})
+            path = self.store.by_id[face_id][1]
+            described.append({
+                'id': face_id, 'path': path, 'folder': str(Path(path).parent),
+                'kind': 'video' if video_media.is_video(path) else 'photo',
+                'taken': info.get('taken'), 'dhash': info.get('dhash'),
+                'vector': vectors.get(face_id), 'blur': info.get('blur')})
+        stacks = face_stacks.stack_faces(described)
+        sizes = {}
+        for top in stacks.values():
+            sizes[top] = sizes.get(top, 0) + 1
+        for face_id, top in stacks.items():
+            details.setdefault(face_id, {}).update(stack=top, stack_size=sizes[top])
+        return [self.face_payload(face_id, details) for face_id in face_ids]
+
+    def person_candidates(self, key, viewer='', admin=False, hide_adult=False, limit=120):
+        """Безымянные лица, похожие на названного человека, — для подтверждения."""
+        if not key.startswith('person:'):
+            raise ValueError('Подсказки бывают только у названного человека')
+        try:
+            person_id = int(key.split(':', 1)[1])
+        except ValueError:
+            raise ValueError('Неверный ключ человека') from None
+        masked = self.masked_faces(viewer, admin, hide_adult)
+        with self.lock:
+            found = [item for item in self.store.person_candidates(person_id, limit=limit)
+                     if item['face_id'] not in masked]
+            faces = self.faces_payload([item['face_id'] for item in found])
+            scores = {item['face_id']: item for item in found}
+            for face in faces:
+                face['score'] = scores[face['id']]['score']
+                face['group'] = scores[face['id']]['group']
+            return {'key': key, 'faces': faces}
 
     def state(self, viewer='', admin=False, hide_adult=False):
         masked = self.masked_faces(viewer, admin, hide_adult)
@@ -1977,6 +2163,71 @@ class App:
         return {'groups': result, 'total': len(chosen), 'summary': summary,
                 'offset': offset, 'limit': limit}
 
+    def visible_paths(self, paths, viewer='', admin=False, hide_adult=False):
+        """Какие из путей этому зрителю можно показать в обычной галерее."""
+        clause, arguments = privacy.where(viewer, admin, False)
+        where = " WHERE photos.status='ok'" + clause + pathrules.sql()
+        if hide_adult:
+            where += (" AND (photo_adult_analysis.rating IS NULL OR photo_adult_analysis.rating"
+                      " IN ('safe','unknown','sensitive'))")
+        visible = set()
+        wanted = list(dict.fromkeys(paths))
+        with self.lock:
+            for offset in range(0, len(wanted), 400):
+                batch = wanted[offset:offset + 400]
+                marks = ','.join('?' * len(batch))
+                visible.update(row[0] for row in self.store.db.execute(
+                    'SELECT photos.path FROM photos LEFT JOIN photo_adult_analysis '
+                    'ON photo_adult_analysis.path=photos.path'
+                    f'{where} AND photos.path IN ({marks})', [*arguments, *batch]))
+        return visible
+
+    def highlight_list(self, kind='', limit=50, offset=0, order='recent', viewer='', admin=False,
+                       hide_adult=False):
+        """Подборки с обложкой. Спрятанное и исключённое из них выпадает при выдаче."""
+        limit = min(max(int(limit or 0), 1), 200)
+        offset = max(int(offset or 0), 0)
+        with self.lock:
+            groups, total = highlight_generator.list_groups(
+                self.store.db, kind, limit, offset, order)
+            members = {group['id']: [row[0] for row in self.store.db.execute(
+                'SELECT path FROM highlight_photos WHERE group_id=? ORDER BY pick',
+                (group['id'],))] for group in groups}
+        visible = self.visible_paths([path for paths in members.values() for path in paths],
+                                     viewer, admin, hide_adult)
+        result = []
+        for group in groups:
+            shown = [path for path in members[group['id']] if path in visible]
+            if not shown:
+                continue
+            cover = group['cover_path'] if group['cover_path'] in visible else shown[0]
+            result.append({**group, 'photo_count': len(shown), 'cover_path': cover})
+        cards = {card['path']: card for card in self.hydrate_payloads(
+            sorted({group['cover_path'] for group in result}))}
+        for group in result:
+            group['cover'] = cards.get(group['cover_path'])
+        return {'groups': result, 'total': total, 'offset': offset, 'limit': limit,
+                'job': self.highlights.status()}
+
+    def highlight_detail(self, ident, viewer='', admin=False, hide_adult=False):
+        """Подборка по id или ключу: карточки снимков и почему каждый выбран."""
+        with self.lock:
+            group = highlight_generator.get_group(self.store.db, ident)
+        if group is None:
+            raise ValueError('Подборка не найдена')
+        visible = self.visible_paths([photo['path'] for photo in group['photos']],
+                                     viewer, admin, hide_adult)
+        photos = [photo for photo in group['photos'] if photo['path'] in visible]
+        cards = {card['path']: card for card in self.hydrate_payloads(
+            [photo['path'] for photo in photos])}
+        group['photos'] = [{**cards[photo['path']], 'highlight': {
+            'position': photo['position'], 'score': photo['score'], 'pick': photo['pick'],
+            'reasons': photo['reasons']}} for photo in photos if photo['path'] in cards]
+        group['photo_count'] = len(group['photos'])
+        if group['cover_path'] not in visible and group['photos']:
+            group['cover_path'] = group['photos'][0]['path']
+        return {'group': group}
+
     def hydrate_payloads(self, paths):
         """Карточки снимков для готового списка путей, одним запросом на порцию."""
         cards = []
@@ -2309,6 +2560,13 @@ class Handler(BaseHTTPRequestHandler):
                     query.get('key', [''])[0], int(query.get('limit', ['10'])[0])))
             if parsed.path == '/api/suggestions':
                 return self.json_response(self.app.face_suggestions())
+            if parsed.path == '/api/person-candidates':
+                query = parse_qs(parsed.query)
+                viewer, admin = self.viewer
+                return self.json_response(self.app.person_candidates(
+                    query.get('key', [''])[0], viewer, admin,
+                    query.get('adult', [''])[0] == 'hide',
+                    int(query.get('limit', ['120'])[0])))
             if parsed.path == '/api/similar-pairs':
                 query = parse_qs(parsed.query)
                 return self.json_response(self.app.similar_pairs(
@@ -2328,6 +2586,24 @@ class Handler(BaseHTTPRequestHandler):
                         'folders': self.app.folders.children(path)})
             if parsed.path == '/api/recluster/status':
                 return self.json_response(self.app.recluster_job.status())
+            if parsed.path == '/api/highlights':
+                query = parse_qs(parsed.query)
+                viewer, admin = self.viewer
+                return self.json_response(self.app.highlight_list(
+                    kind=query.get('kind', [''])[0],
+                    limit=int(query.get('limit', ['50'])[0] or 50),
+                    offset=int(query.get('offset', ['0'])[0] or 0),
+                    order=query.get('order', ['recent'])[0],
+                    viewer=viewer, admin=admin,
+                    hide_adult=query.get('adult', [''])[0] == 'hide'))
+            if parsed.path == '/api/highlights/status':
+                return self.json_response(self.app.highlights.status())
+            if parsed.path.startswith('/api/highlights/'):
+                query = parse_qs(parsed.query)
+                viewer, admin = self.viewer
+                return self.json_response(self.app.highlight_detail(
+                    unquote(parsed.path[len('/api/highlights/'):]), viewer=viewer, admin=admin,
+                    hide_adult=query.get('adult', [''])[0] == 'hide'))
             if parsed.path == '/api/duplicates/status':
                 return self.json_response(self.app.duplicates.status())
             if parsed.path == '/api/duplicates':
@@ -2400,6 +2676,21 @@ class Handler(BaseHTTPRequestHandler):
                 if not photos:
                     return self.error_json(404, 'Фотография не найдена')
                 return self.json_response({'photo': photos[0]})
+            if parsed.path == '/api/photo/metadata':
+                # EXIF и параметры потока — только тем, кому виден сам снимок.
+                query = parse_qs(parsed.query)
+                path = query.get('path', [''])[0]
+                viewer, admin = self.viewer
+                photos, _ = self.app.photo_payloads(
+                    exact_path=path, viewer=viewer, admin=admin,
+                    hidden=query.get('hidden', ['0'])[0] == '1')
+                if not photos:
+                    return self.error_json(404, 'Фотография не найдена')
+                try:
+                    metadata = media_metadata.read(self.app.file_for(path))
+                except OSError as exc:
+                    return self.error_json(404, str(exc) or 'Файл не открылся')
+                return self.json_response({'path': path, **metadata})
             if parsed.path == '/api/speech':
                 query = parse_qs(parsed.query)
                 raw_path = query.get('path', [''])[0]
@@ -2647,6 +2938,17 @@ class Handler(BaseHTTPRequestHandler):
                     body.get('scope', 'all'))})
             if path == '/api/recluster/stop':
                 return self.json_response({'ok': True, 'job': self.app.recluster_job.stop()})
+            if path == '/api/highlights/regenerate':
+                kinds = body.get('kinds')
+                if kinds is not None and not isinstance(kinds, list):
+                    raise ValueError('kinds — список видов подборок')
+                return self.json_response({'ok': True, 'job': self.app.highlights.start(
+                    kinds=kinds, curate=bool(body.get('curate')), force=bool(body.get('force')),
+                    allow_unchecked_adult=(None if body.get('allow_unchecked_adult') is None
+                                           else bool(body.get('allow_unchecked_adult'))),
+                    today=body.get('today'))})
+            if path == '/api/highlights/stop':
+                return self.json_response({'ok': True, 'job': self.app.highlights.stop()})
             if path == '/api/duplicates/scan':
                 return self.json_response({'ok': True, 'job': self.app.duplicates.start(
                     bool(body.get('similar')))})

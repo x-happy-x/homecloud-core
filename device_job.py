@@ -39,7 +39,10 @@ def read_json(path):
         return {}
 
 
-ANALYSIS_FEATURES = ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', 'authenticity')
+ANALYSIS_FEATURES = ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', 'authenticity',
+                     'curation')
+# Подборки собираются по всему каталогу из готовых оценок — описи не требуют.
+CATALOG_FEATURES = ('highlights',)
 
 
 def planned_phases(features):
@@ -52,7 +55,8 @@ def planned_phases(features):
         plan.append('faces')
     if any(features.get(name) for name in ('visual', 'ocr', 'caption')):
         plan.append('visual')
-    plan.extend(name for name in ('ocr', 'adult', 'caption', 'speech', 'authenticity', 'diarize')
+    plan.extend(name for name in ('ocr', 'adult', 'caption', 'speech', 'authenticity', 'diarize',
+                                  'curation', 'highlights')
                 if features.get(name))
     return plan
 
@@ -266,8 +270,7 @@ def run(args):
             publish(args, 'stopped', 'inventory', inventory=summary)
             return
         if not any(args.features.get(name) for name in
-                   ('faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize',
-                    'authenticity')):
+                   ('faces', *ANALYSIS_FEATURES, *CATALOG_FEATURES)):
             publish(args, 'completed', 'complete', completed=summary.get('total', 0),
                     total=summary.get('total', 0),
                     finished_at=datetime.now(timezone.utc).isoformat(),
@@ -312,8 +315,7 @@ def run(args):
             if args.stop_file.exists():
                 publish(args, 'stopped', 'faces')
                 return
-    elif any(args.features.get(name) for name in
-             ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', 'authenticity')):
+    elif any(args.features.get(name) for name in ANALYSIS_FEATURES):
         if inventory(args).get('stopped'):
             publish(args, 'stopped', 'inventory')
             return
@@ -412,6 +414,42 @@ def run(args):
                   *force, *root_args], 'diarize')
     if args.stop_file.exists():
         publish(args, 'stopped', 'diarize')
+        return
+
+    # Оценка снимков для подборок — после всех этапов, чьи результаты она
+    # читает: визуального индекса, 18+, лиц и проверки рисованных лиц.
+    if args.features.get('curation'):
+        options = catalog_settings.load(args.catalog)
+        prompts_log = args.progress_file.with_name('device-stage-curation-prompts.log')
+        if vision_python.is_file():
+            # Векторы текстовых описаний «удачного кадра» считаются один раз на
+            # модель в окружении визуального индекса; если они уже есть, скрипт
+            # выходит, не загружая модель. Ошибка здесь не роняет этап: без
+            # описаний оценка обойдётся одной технической частью.
+            publish(args, 'running', 'curation', total=0, completed=0)
+            prompts_env = {**os.environ, 'HF_HOME': r'C:\cv-models\huggingface',
+                           'HF_HUB_OFFLINE': '1', 'PYTHONUTF8': '1'}
+            with prompts_log.open('w', encoding='utf-8', errors='replace') as sink:
+                subprocess.run([str(vision_python), str(here / 'photo_curation.py'), 'prompts',
+                                '--catalog', str(args.catalog), '--model', options['visual_model'],
+                                '--indexed'],
+                               cwd=here, env=prompts_env, stdout=sink, stderr=subprocess.STDOUT)
+        run_child(args, [str(face_python), str(here / 'photo_curation.py'), 'curate',
+                  '--catalog', str(args.catalog),
+                  '--progress-file', str(stage), '--stop-file', str(args.stop_file),
+                  *force, *root_args], 'curation')
+    if args.stop_file.exists():
+        publish(args, 'stopped', 'curation')
+        return
+
+    # Подборки строятся по всему каталогу из готовых оценок: без файлов и моделей.
+    if args.features.get('highlights'):
+        run_child(args, [str(face_python), str(here / 'highlight_generator.py'), 'generate',
+                  '--catalog', str(args.catalog),
+                  '--progress-file', str(stage), '--stop-file', str(args.stop_file),
+                  *force], 'highlights')
+    if args.stop_file.exists():
+        publish(args, 'stopped', 'highlights')
         return
 
     publish(args, 'completed', 'complete', completed=1, total=1,

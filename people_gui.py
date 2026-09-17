@@ -16,12 +16,18 @@ from PySide6.QtWidgets import (
 )
 
 from authenticity_photos import ANIME_THRESHOLD
+import face_quality
 from prototype import cluster_embeddings, database
+import settings as catalog_settings
 
 
 class CatalogStore:
+    # Порог притяжения нового лица к готовой группе. Проверено на каталоге:
+    # 30% лиц отложили, группы собрали из остальных, отложенные притянули —
+    # при 0.60 притянулось 595 лиц из 1592 с двумя ошибками, при прежних 0.66
+    # только 509 с одной.
     def __init__(self, folder, min_cluster_size=8, thread_safe=False, max_faces=0,
-                 chunk=4000, assign_threshold=0.66):
+                 chunk=4000, assign_threshold=0.60):
         self.folder = Path(folder).resolve()
         self.db = database(self.folder, check_same_thread=not thread_safe)
         self.db.executescript('''
@@ -69,6 +75,7 @@ class CatalogStore:
               model TEXT NOT NULL, analyzed_at TEXT NOT NULL
             )''')
         self.db.commit()
+        face_quality.ensure_schema(self.db)
         self.min_cluster_size = min_cluster_size
         self.chunk = max(200, chunk)
         self.assign_threshold = assign_threshold
@@ -115,9 +122,12 @@ class CatalogStore:
     def _centroids(self):
         """Средний вектор каждой группы — к нему притягиваются новые лица."""
         sums, counts = {}, {}
-        for label, blob in self.db.execute(
-                'SELECT face_clusters.label,faces.embedding FROM face_clusters '
+        blurry = self.blurry()
+        for face_id, label, blob in self.db.execute(
+                'SELECT faces.id,face_clusters.label,faces.embedding FROM face_clusters '
                 'JOIN faces ON faces.id=face_clusters.face_id WHERE face_clusters.label>=0'):
+            if face_id in blurry:
+                continue
             vector = np.frombuffer(blob, dtype='<f4').astype('<f4')
             vector = vector / max(float(np.linalg.norm(vector)), 1e-12)
             if label in sums:
@@ -139,23 +149,59 @@ class CatalogStore:
                 [(face_id, int(label), float(probability), method, now)
                  for face_id, (label, probability, method) in assigned.items()])
 
+    def quality_options(self):
+        """Порог мыла и минимальный размер лица — из настроек каталога."""
+        # Не через settings.read: тот на каждом вызове создаёт схему и делает
+        # commit, а здесь — каждый опрос состояния, в том числе посреди работы.
+        values = {'face_blur_threshold': face_quality.BLUR_THRESHOLD,
+                  'face_min_size': face_quality.MIN_SIZE}
+        try:
+            stored = self.db.execute(
+                "SELECT key,value FROM settings WHERE key IN "
+                "('face_blur_threshold','face_min_size')").fetchall()
+        except sqlite3.OperationalError:
+            stored = []
+        for key, raw in stored:
+            try:
+                values[key] = catalog_settings._cast(key, json.loads(raw))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                continue
+        return float(values['face_blur_threshold']), float(values['face_min_size'])
+
+    def measure_quality(self):
+        """Оценить резкость лиц, у которых её ещё нет. Только по миниатюрам."""
+        return face_quality.measure(self.db, self.folder)
+
+    def blurry(self):
+        """Мыльные лица: в группировку не идут и в карточках не показываются."""
+        threshold, min_size = self.quality_options()
+        return face_quality.blurry_ids(self.db, threshold, min_size)
+
     def ensure_labels(self):
         """Считаем метки только для новых лиц: старые уже лежат в каталоге."""
+        # Оценка резкости досчитывается и без новых меток: у каталога, собранного
+        # до её появления, метки есть у всех лиц, а оценок нет ни у одного.
+        self.measure_quality()
         pending = [row[0] for row in self.db.execute(
             'SELECT faces.id FROM faces LEFT JOIN face_clusters '
             'ON face_clusters.face_id=faces.id WHERE face_clusters.face_id IS NULL '
             'ORDER BY faces.id')]
         if not pending:
             return 0
+        blurry = self.blurry()
         sums, counts = self._centroids()
         highest = max(sums) if sums else -1
         done = 0
         for offset in range(0, len(pending), self.chunk):
             batch = pending[offset:offset + self.chunk]
-            vectors, batch = self._vectors(batch)
+            # Мыльное лицо тянет группы друг к другу — ему метка «не в группе».
+            assigned = {face_id: (-1, 0.0, 'blurry') for face_id in batch if face_id in blurry}
+            vectors, batch = self._vectors([face_id for face_id in batch
+                                            if face_id not in blurry])
             if not batch:
+                self._store_labels(assigned)
+                done += len(assigned)
                 continue
-            assigned = {}
             leftovers = list(range(len(batch)))
             if sums:
                 labels = sorted(sums)
@@ -174,15 +220,15 @@ class CatalogStore:
                         leftovers.append(index)
             if len(leftovers) >= self.min_cluster_size:
                 fresh, probabilities = cluster_embeddings(
-                    vectors[leftovers], algorithm='hdbscan',
+                    vectors[leftovers], algorithm='average',
                     min_cluster_size=self.min_cluster_size)
                 for position, index in enumerate(leftovers):
                     label = int(fresh[position])
                     if label < 0:
-                        assigned[batch[index]] = (-1, 0.0, 'hdbscan')
+                        assigned[batch[index]] = (-1, 0.0, 'average')
                         continue
                     label += highest + 1
-                    assigned[batch[index]] = (label, float(probabilities[position]), 'hdbscan')
+                    assigned[batch[index]] = (label, float(probabilities[position]), 'average')
                     if label in sums:
                         sums[label] += vectors[index]
                         counts[label] += 1
@@ -192,9 +238,9 @@ class CatalogStore:
                 highest = max(sums) if sums else highest
             else:
                 for index in leftovers:
-                    assigned[batch[index]] = (-1, 0.0, 'hdbscan')
+                    assigned[batch[index]] = (-1, 0.0, 'average')
             self._store_labels(assigned)
-            done += len(batch)
+            done += len(assigned)
         return done
 
     def refresh_labels(self):
@@ -216,12 +262,17 @@ class CatalogStore:
         return labels, confidence
 
     def groups(self):
+        excluded = {row[0] for row in self.db.execute('SELECT face_id FROM face_exclusions')}
+        # Мыло не показывается нигде, кроме своей группы на проверке: даже у
+        # названного человека такое лицо — каша в карточке, а не портрет.
+        # Имя у лица при этом остаётся, и поиск по человеку снимок находит.
+        blurry = self.blurry() - excluded
         assigned = defaultdict(list)
         for row in self.db.execute(
                 'SELECT face_people.face_id,people.id,people.name,people.bigfam_id FROM face_people '
                 'JOIN people ON people.id=face_people.person_id'):
-            assigned[(row[1], row[2], row[3])].append(row[0])
-        excluded = {row[0] for row in self.db.execute('SELECT face_id FROM face_exclusions')}
+            if row[0] not in blurry:
+                assigned[(row[1], row[2], row[3])].append(row[0])
         # Мультяшный или игровой персонаж, которого детектор принял за лицо —
         # не человек, группировать не о чем. Имя, если уже назначено кем-то
         # вручную, важнее любой автоматической догадки — до сюда не доходит.
@@ -230,7 +281,8 @@ class CatalogStore:
         assigned_ids = {face_id for members in assigned.values() for face_id in members}
         automatic = defaultdict(list)
         for face_id, label in self.auto_labels.items():
-            if face_id not in assigned_ids and face_id not in excluded and face_id not in anime:
+            if (face_id not in assigned_ids and face_id not in excluded and face_id not in anime
+                    and face_id not in blurry):
                 automatic[label].append(face_id)
 
         result = [
@@ -255,17 +307,39 @@ class CatalogStore:
         if automatic.get(-1):
             result.append({'key': 'noise', 'title': 'Не сгруппированы', 'name': '',
                            'face_ids': automatic[-1], 'kind': 'noise'})
+        shown_blurry = sorted(face_id for face_id in blurry if face_id in self.by_id)
+        if shown_blurry:
+            result.append({'key': 'blurry', 'title': 'Размытые лица', 'name': '',
+                           'face_ids': shown_blurry, 'kind': 'blurry'})
         if excluded:
             result.append({'key': 'excluded', 'title': 'Исключённые вручную', 'name': '',
                            'face_ids': sorted(excluded), 'kind': 'excluded'})
         pinned = dict(self.db.execute('SELECT group_key,face_id FROM group_avatars'))
+        quality = {face_id: (blur, size) for face_id, blur, size in self.db.execute(
+            'SELECT face_id,blur,size FROM face_quality')}
         for group in result:
             chosen = pinned.get(group['key'])
-            # выбранный кадр мог уехать в другую группу — тогда снова первое лицо
+            # выбранный кадр мог уехать в другую группу — тогда снова лучший портрет
             group['avatar_pinned'] = chosen in group['face_ids']
             group['avatar_face'] = (chosen if group['avatar_pinned']
-                                    else (group['face_ids'][0] if group['face_ids'] else None))
+                                    else self._portrait(group['face_ids'], quality))
         return result
+
+    def _portrait(self, face_ids, quality, candidates=30):
+        """Лицо для аватарки: резкое и крупное из самых уверенных в группе.
+
+        Раньше бралось просто первое по уверенности — а это нередко крошечное
+        лицо с заднего плана, которое в кружке на 400 точек превращалось в кашу.
+        """
+        best, best_score = None, -1.0
+        for face_id in face_ids[:candidates]:
+            blur, size = quality.get(face_id, (None, None))
+            sharp = 1.0 - (blur if blur is not None else 0.5)
+            scale = min(size or 60.0, 160.0) / 160.0
+            score = sharp * (0.4 + 0.6 * scale) * (0.5 + 0.5 * self.auto_confidence.get(face_id, 0.0))
+            if score > best_score:
+                best, best_score = face_id, score
+        return best
 
     def suggest_people(self, threshold=0.6):
         """Кого напоминает каждая автоматическая группа.
@@ -279,10 +353,7 @@ class CatalogStore:
 
         Ничего не записывает: это подсказка, а решение остаётся за человеком.
         """
-        named = {}
-        for face_id, person_id in self.db.execute(
-                'SELECT face_id,person_id FROM face_people'):
-            named[face_id] = person_id
+        named = self._named_bank()
         if not named:
             return []
         titles = {row[0]: (row[1], row[2]) for row in self.db.execute(
@@ -320,6 +391,57 @@ class CatalogStore:
                           'faces': len(rows)})
         found.sort(key=lambda item: -item['score'])
         return found
+
+    def _named_bank(self):
+        """Названные лица, по которым узнаются остальные: без мыла."""
+        blurry = self.blurry()
+        return {face_id: person_id for face_id, person_id in self.db.execute(
+            'SELECT face_id,person_id FROM face_people') if face_id not in blurry}
+
+    def person_candidates(self, person_id, threshold=0.5, margin=0.03, limit=120, top=3):
+        """Безымянные лица, похожие на этого человека, — по одному, не группой.
+
+        Группа целиком узнаётся подсказкой `suggest_people`, но почти половина
+        лиц ни в какую группу не попадает, а поиск по человеку находит только
+        названные. Здесь каждое безымянное лицо сравнивается с `top` самыми
+        похожими подписанными лицами каждого человека: среднее по нескольким
+        устойчивее одного случайного совпадения. Лицо предлагается, только
+        если этот человек у него лучший и опережает второго на `margin`.
+
+        Проверка на каталоге (30% подписанных лиц спрятаны как «безымянные»):
+        при пороге 0.5 узнано 221 из 279, ошибок две.
+        """
+        import numpy as np
+        named = self._named_bank()
+        mine = sorted(face_id for face_id, owner in named.items() if owner == person_id)
+        if not mine:
+            return []
+        groups = self.groups()
+        wanted = [face_id for group in groups if group['kind'] in {'auto', 'noise'}
+                  for face_id in group['face_ids']]
+        if not wanted:
+            return []
+        bank, bank_ids = self._vectors(sorted(named))
+        owners = np.array([named[face_id] for face_id in bank_ids])
+        matrix, order = self._vectors(wanted)
+        scores = matrix @ bank.T
+        people = sorted(set(owners.tolist()))
+        per_person = np.full((len(order), len(people)), -1.0)
+        for column, owner in enumerate(people):
+            block = scores[:, owners == owner]
+            depth = min(top, block.shape[1])
+            per_person[:, column] = np.sort(block, axis=1)[:, -depth:].mean(axis=1)
+        target = people.index(person_id)
+        mine_scores = per_person[:, target]
+        others = np.delete(per_person, target, axis=1)
+        rival = others.max(axis=1) if others.shape[1] else np.full(len(order), -1.0)
+        group_of = {face_id: group['key'] for group in groups
+                    if group['kind'] in {'auto', 'noise'} for face_id in group['face_ids']}
+        found = [(float(mine_scores[index]), face_id) for index, face_id in enumerate(order)
+                 if mine_scores[index] >= threshold and mine_scores[index] - rival[index] >= margin]
+        found.sort(reverse=True)
+        return [{'face_id': face_id, 'score': round(score, 3), 'group': group_of.get(face_id, '')}
+                for score, face_id in found[:limit]]
 
     def set_avatar(self, group_key, face_id):
         """Закрепить кадр как аватарку группы."""
@@ -384,6 +506,8 @@ class CatalogStore:
                 [(face_id, person_id) for face_id in face_ids])
             self.db.executemany('DELETE FROM face_exclusions WHERE face_id=?',
                                 [(face_id,) for face_id in face_ids])
+            # Мыльное лицо назвали — значит, человеку оно нужно; больше не прячем.
+            face_quality.keep(self.db, face_ids)
 
     def exclude(self, face_ids):
         face_ids = sorted(set(face_ids))

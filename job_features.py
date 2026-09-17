@@ -7,18 +7,29 @@
 """
 
 FEATURES = ('inventory', 'faces', 'visual', 'ocr', 'caption', 'adult', 'speech', 'diarize',
-            'authenticity')
+            'authenticity', 'curation', 'highlights')
 
 # Речь и разделение голосов существуют только для видео.
 VIDEO_ONLY = ('speech', 'diarize')
+
+# Оценка для подборок и сами подборки — только про снимки.
+PHOTO_ONLY = ('curation', 'highlights')
 
 # Опись обходит диск целиком и вида файлов не различает.
 KIND_FREE = ('inventory',)
 
 
-def _chosen(features, supported):
+def _chosen(features, supported, videos=False):
     """Набор одного вида с учётом зависимостей этапов."""
     chosen = {name: bool((features or {}).get(name)) for name in FEATURES}
+    if videos:
+        for name in PHOTO_ONLY:
+            chosen[name] = False
+    # Подборки собираются из оценок, а оценка читает визуальный индекс.
+    if chosen['highlights']:
+        chosen['curation'] = True
+    if chosen['curation']:
+        chosen['visual'] = True
     # OCR и описания строятся поверх визуального индекса, а описанию нужны ещё
     # рейтинг и уверенные теги из анализа 18+.
     if chosen['caption']:
@@ -36,7 +47,8 @@ def resolve(features, video_features, supported):
     интерфейса: он идёт и на снимки, и на ролики.
     """
     photos = _chosen(features, supported)
-    videos = _chosen(features if video_features is None else video_features, supported)
+    videos = _chosen(features if video_features is None else video_features, supported,
+                     videos=True)
     for name in VIDEO_ONLY:
         photos[name] = False
     for name in KIND_FREE:

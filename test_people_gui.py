@@ -19,7 +19,7 @@ def clump(degrees, count=3, spread=1.5):
 
 
 class PeopleGuiStoreTests(unittest.TestCase):
-    def make_store(self, folder, vectors=None):
+    def make_store(self, folder, vectors=None, labels=None):
         db = people_gui.database(Path(folder))
         if vectors is None:
             vectors = [
@@ -37,6 +37,12 @@ class PeopleGuiStoreTests(unittest.TestCase):
                 db.execute('INSERT INTO faces(path,box,embedding,thumbnail) VALUES(?,?,?,?)',
                            (path, '[0,0,100,100]', np.asarray(vector, dtype='<f4').tobytes(),
                             f'thumb-{index}.jpg'))
+                if labels is not None:
+                    # Готовые метки — как у каталога, где человек разъехался
+                    # по группам в разных проходах сборки.
+                    db.execute('INSERT INTO face_clusters(face_id,label,probability,method,'
+                               'computed_at) VALUES(last_insert_rowid(),?,1,?,?)',
+                               (labels[index], 'test', 'now'))
         db.close()
         return people_gui.CatalogStore(folder, min_cluster_size=2)
 
@@ -69,7 +75,10 @@ class PeopleGuiStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             # Две горстки в 25 градусах друг от друга — это похожесть 0.91,
             # то есть один человек; третья в 80 градусах — посторонний.
-            store = self.make_store(temp, clump(0) + clump(25) + clump(80))
+            # Метки заданы заранее: средняя связь такие горстки сразу склеила
+            # бы, а человек разъезжается по группам между проходами сборки.
+            store = self.make_store(temp, clump(0) + clump(25) + clump(80),
+                                    labels=[0, 0, 0, 1, 1, 1, 2, 2, 2])
             try:
                 automatic = [group for group in store.groups() if group['kind'] == 'auto']
                 self.assertEqual(len(automatic), 3)

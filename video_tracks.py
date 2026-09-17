@@ -10,13 +10,17 @@
 подхватывается по схожести эмбеддинга с уже накопленным. Трек закрывается,
 если продолжить его не получилось дольше `gap` секунд.
 
-Для каждого закрытого трека берутся `best` самых уверенных кадров — их
-эмбеддинги усредняются (устойчивее одного случайного кадра), а превью
-берётся с самого уверенного момента.
+Для каждого закрытого трека берутся `best` лучших кадров — их эмбеддинги
+усредняются (устойчивее одного случайного кадра), а превью берётся с лучшего
+момента. «Лучший» — уверенность детектора, помноженная на резкость лица
+(face_quality.py): смазанный в движении кадр детектор часто видит уверенно,
+но узнавать человека по нему плохо.
 """
 import heapq
 
 import numpy as np
+
+import face_quality
 
 
 def iou(first, second):
@@ -200,7 +204,8 @@ def find_tracks(path, models, step_seconds=0.5, gap_seconds=1.2, best_frames=8,
             # только маленькое превью, которое всё равно пойдёт в файл.
             crop = video_media.to_image(frame).crop(tuple(int(v) for v in box[:4]))
             crop.thumbnail((160, 160))
-            detections.append((box[:4].tolist(), embedding, float(box[4]), crop))
+            rank = float(box[4]) * face_quality.sharpness_weight(face_quality.face_blur(crop))
+            detections.append((box[:4].tolist(), embedding, rank, crop))
         tracks.extend(tracker.update(moment, detections))
     tracks.extend(tracker.close_all())
     return tracks

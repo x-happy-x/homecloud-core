@@ -35,7 +35,8 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 - **лица:** `faces` (рамка, эмбеддинг, миниатюра, `frame_time`,
   `track_start`/`track_stop` — у фотографий NULL), `face_clusters`,
   `face_people`, `people`, `face_exclusions`, `face_authenticity`,
-  `group_avatars`, `label_history`
+  `face_quality` (резкость миниатюры, размер, `keep`), `group_avatars`,
+  `label_history`
 - **анализ:** `photo_analysis` (тип, качество, OCR), `photo_embeddings`
   (визуальный индекс), `photo_adult_analysis`, `photo_hashes` (sha1 + dHash)
 - **видео и звук:** `video_speech`, `video_speech_segments`,
@@ -43,6 +44,10 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
   `video_speaker_faces`, `voice_prints`
 - **подборки:** `albums`, `album_photos`, `people_albums`,
   `people_album_members`, `hidden_photos`
+- **автоподборки:** `photo_curation` (оценка снимка: visual/technical/base,
+  отдельно personal, время съёмки, причины отказа), `curation_prompts`
+  (векторы описаний «удачного кадра» на модель), `highlight_groups`,
+  `highlight_photos` — отдельно от пользовательских альбомов
 - **обучение:** `router_models`, `router_predictions`, `router_reviews`,
   `router_training_labels`, `router_batches`, `router_batch_items`,
   `router_skips`
@@ -50,7 +55,7 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 
 Ключ группы в разделе «Люди» — строка одного из четырёх видов:
 `person:<id>` (названный человек), `auto:<label>` (автоматическая гроздь),
-`noise`, `excluded`. Ключи `auto:` стабильны между запусками.
+`noise`, `blurry` (мыльные лица), `excluded`. Ключи `auto:` стабильны между запусками.
 
 ## Модели
 
@@ -59,7 +64,7 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 | Этап | Модель | Окружение |
 |---|---|---|
 | Лица: детекция и эмбеддинг | InsightFace `buffalo_l` (SCRFD + ArcFace), ONNX Runtime на CUDA | `.venv` |
-| Группировка лиц | `sklearn.cluster.HDBSCAN`, `min_cluster_size=8`, метрика euclidean | `.venv` |
+| Группировка лиц | средняя связь `AgglomerativeClustering` (косинус, порог 0.70), `min_cluster_size=8`; мыльные лица (`face_quality.py`) в неё не идут | `.venv` |
 | Визуальный индекс | `google/siglip2-base-patch16-224` (по умолчанию), либо `siglip2-base-patch16-256`, либо `jinaai/jina-clip-v2` — выбирается в настройках | `work/vision-venv` |
 | Рейтинг 18+ | `SmilingWolf/wd-eva02-large-tagger-v3` + NudeNet (`NudeNet-320n-exif`) для областей | `work/vision-venv` |
 | Описания | `Qwen/Qwen3-VL-2B-Instruct` локально либо LM Studio по адресу из настроек | `work/vision-venv` |
@@ -69,6 +74,7 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 | Речь | Whisper `large-v3` через faster-whisper, `float16` на CUDA; звук достаёт PyAV из комплекта | `work/audio-venv` |
 | Разделение голосов | `pyannote/speaker-diarization-community-1` | `work/audio-venv` |
 | Дубликаты | без моделей: sha1 для точных копий, dHash для похожих | `.venv` |
+| Оценка для подборок и подборки | без новых моделей: готовые SigLIP-векторы, `blur_score`, лица, dHash; векторы описаний — один раз в vision-venv | `.venv` |
 
 `device_job.py` сам выбирает интерпретатор под этап — правки путей искать
 там (строки со `*_python`).
@@ -138,7 +144,7 @@ WD-tagger — рейтинг и теги. Текст и интерфейсы о�
 ```
 
 `web_server.py` — единственный HTTP-слой: `/api/*` (состояние каталога, люди,
-альбомы, сканирование, дубликаты, обучение, речь) и `/media/*` (`photo` с
+альбомы, сканирование, дубликаты, обучение, речь, автоподборки `/api/highlights`) и `/media/*` (`photo` с
 `size` и `blur`, `video` с Range, `face-crop/<id>`, `original`). Изменяющие
 запросы проверяют заголовок **`X-Local-Token`** — не `Authorization: Bearer`,
 тот только для GET. Ручные проверки POST должны слать оба.
@@ -146,6 +152,26 @@ WD-tagger — рейтинг и теги. Текст и интерфейсы о�
 Кто смотрит, бэкенд узнаёт из `X-HomeCloud-User` / `X-HomeCloud-Role`, которые
 ставит Node-сервер на VM; браузерные значения там затираются. Сам вход —
 не здесь: им занимается сервис `account` поверх LLDAP.
+
+## Точность лиц
+
+Любую правку группировки, порогов мыла и подсказок **сначала мерить** на
+копии каталога по подписанным вручную лицам (`face_people` — готовая разметка):
+сколько лиц легло в чужую группу и сколько подписанных вообще попало в группы.
+Цифры и что пробовали — README, «Мыльные лица и средняя связь». Каталог — не
+живой: делать снимок через `sqlite3 backup` и поднимать второй
+`web_server.py` на другом порту.
+
+## Автоподборки
+
+`photo_curation.py` → `highlight_generator.py`, этапы `curation` и
+`highlights` в конце `device_job.py`. Подборка — не `ORDER BY score`: серии
+схлопываются, дальше MMR с запретом той же сцены и штрафом за перебор события.
+Все коэффициенты — `PARAMS` в `highlight_generator.py`; калибровка визуальной
+оценки по моделям — `AESTHETIC_CALIBRATION` в `photo_curation.py`. Формулу
+поменял — подними `SCORE_VERSION` (переоценка без чтения файлов), разбор файла
+поменял — `FILE_VERSION`. Почему снимок попал или нет: `highlight_generator.py
+explain`. Подробности — README, раздел «Автоматические подборки».
 
 ## Правила, которые дорого нарушить
 

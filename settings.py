@@ -57,6 +57,11 @@ DEFAULTS = {
     # четырьмя лицами рядом с гроздью из четырёхсот выпадает. Второй проход
     # идёт по одному остатку, и там нужен размер группы поменьше.
     'noise_cluster_size': 3,
+    # Мыльные лица (face_quality.py): резкость миниатюры от 0 — резко до 1 —
+    # мыло. От порога и выше лицо не группируется и прячется в «Размытые».
+    # 1.0 — не прятать ничего. Лицо меньше face_min_size точек — тоже мыло.
+    'face_blur_threshold': 0.76,
+    'face_min_size': 20,
     # описание изображений: своя видеокарта (local) или уже запущенный LM Studio
     'caption_backend': 'local',
     'caption_model': 'Qwen/Qwen3-VL-2B-Instruct',
@@ -67,6 +72,8 @@ DEFAULTS = {
     'speech_language': 'auto',
     # чем подменяется язык, когда определению нельзя верить
     'speech_fallback_language': 'ru',
+    # автоматические подборки: снимок без пройденной проверки 18+ в них не идёт
+    'highlights_require_adult_check': True,
 }
 
 LIMITS = {
@@ -82,6 +89,8 @@ LIMITS = {
     'router_auto_train_every': (12, 1000),
     'face_suggest_threshold': (0.30, 0.95),
     'noise_cluster_size': (2, 8),
+    'face_blur_threshold': (0.5, 1.0),
+    'face_min_size': (0, 200),
 }
 
 CHOICES = {

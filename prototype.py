@@ -606,11 +606,70 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
     return len(taken), len(results) - len(taken), len(stale)
 
 
-def cluster_embeddings(matrix, algorithm='hdbscan', distance=0.35, min_cluster_size=8):
+# Средняя связь: две грозди сливаются, пока среднее косинусное расстояние
+# между всеми их лицами не больше порога. Подобрано на реальном каталоге
+# (915 подписанных лиц, 35 человек): HDBSCAN клал в чужие группы 102 лица из
+# 822 — в одной грозди сидели двое разных людей, — а средняя связь при
+# пороге 0.70 ошибается на 10 из 806 при почти том же покрытии. Цена —
+# человек чаще делится на несколько групп, но их объединяют подсказки и
+# «Похожие группы», а разлепить смешанную гроздь можно только руками.
+LINKAGE_DISTANCE = 0.70
+# Полная матрица расстояний растёт квадратом: 12 тысяч лиц — около 600 МБ.
+# Больше — сначала грубые грозди HDBSCAN, средняя связь уже внутри каждой.
+DENSE_LIMIT = 12000
+
+
+def average_linkage(matrix, min_cluster_size=8, distance=LINKAGE_DISTANCE,
+                    dense_limit=DENSE_LIMIT):
+    """Метки групп средней связью; уверенность — близость к центру группы."""
+    import numpy as np
+    from sklearn.cluster import AgglomerativeClustering, HDBSCAN
+    count = len(matrix)
+    labels = np.full(count, -1, dtype=int)
+    if count < 2:
+        return labels, np.zeros(count)
+
+    def split(rows):
+        if len(rows) < 2:
+            return np.zeros(len(rows), dtype=int)
+        return AgglomerativeClustering(
+            n_clusters=None, metric='cosine', linkage='average',
+            distance_threshold=distance).fit_predict(matrix[rows])
+
+    if count <= dense_limit:
+        chunks = [np.arange(count)]
+    else:
+        coarse = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=2,
+                         metric='euclidean').fit(matrix).labels_
+        chunks = [np.where(coarse == label)[0] for label in sorted(set(coarse) - {-1})]
+    following = 0
+    for rows in chunks:
+        if len(rows) > dense_limit:
+            # Даже грубая гроздь не влезает — оставляем её как есть.
+            local = np.zeros(len(rows), dtype=int)
+        else:
+            local = split(rows)
+        for label in set(local.tolist()):
+            members = rows[local == label]
+            if len(members) >= min_cluster_size:
+                labels[members] = following
+                following += 1
+    probabilities = np.zeros(count)
+    for label in range(following):
+        members = np.where(labels == label)[0]
+        centre = matrix[members].mean(axis=0)
+        centre = centre / max(float(np.linalg.norm(centre)), 1e-12)
+        probabilities[members] = np.clip(matrix[members] @ centre, 0.0, 1.0)
+    return labels, probabilities
+
+
+def cluster_embeddings(matrix, algorithm='average', distance=0.35, min_cluster_size=8):
     """Cluster normalized face vectors and return labels plus membership confidence."""
     import numpy as np
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     matrix = matrix / np.maximum(norms, 1e-12)
+    if algorithm == 'average':
+        return average_linkage(matrix, min_cluster_size=min_cluster_size)
     if algorithm == 'hdbscan':
         from sklearn.cluster import HDBSCAN
         estimator = HDBSCAN(
@@ -694,7 +753,7 @@ def main():
                              help='Stop safely when this file appears')
     gallery_parser = sub.add_parser('gallery')
     gallery_parser.add_argument('--data', type=Path, default=Path('data'))
-    gallery_parser.add_argument('--algorithm', choices=('hdbscan', 'dbscan'), default='hdbscan')
+    gallery_parser.add_argument('--algorithm', choices=('average', 'hdbscan', 'dbscan'), default='hdbscan')
     gallery_parser.add_argument('--distance', type=float, default=0.35)
     gallery_parser.add_argument('--min-cluster-size', type=int, default=8)
     args = parser.parse_args()
