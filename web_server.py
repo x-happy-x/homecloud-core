@@ -1431,8 +1431,9 @@ class App:
             raise ValueError('Неверный ключ человека') from None
         masked = self.masked_faces(viewer, admin, hide_adult)
         with self.lock:
+            hidden = people_albums.hidden_group_keys(self.store.db)
             found = [item for item in self.store.person_candidates(person_id, limit=limit)
-                     if item['face_id'] not in masked]
+                     if item['face_id'] not in masked and item['group'] not in hidden]
             faces = self.faces_payload([item['face_id'] for item in found])
             scores = {item['face_id']: item for item in found}
             for face in faces:
@@ -1452,11 +1453,14 @@ class App:
             groups = [self.without(group, masked) for group in self.store.groups()]
             groups = [group for group in groups if group['face_ids']]
             # Скрытый альбом — решение владельца картотеки, не приватность
-            # снимка: обычный зритель группу не видит вовсе, админ видит и
-            # управляет (group_payload помечает hidden, чтобы показать иначе).
+            # снимка: обычный зритель группу не видит вовсе. Админу группы
+            # приходят с пометкой hidden — но только чтобы открыть сам скрытый
+            # альбом: в общих списках, счётчиках, подсказках и выборе имени
+            # их нет ни у кого.
             hidden_keys = people_albums.hidden_group_keys(self.store.db)
             if not admin:
                 groups = [group for group in groups if group['key'] not in hidden_keys]
+            visible = [group for group in groups if group['key'] not in hidden_keys]
             albums_by_key = people_albums.group_albums(
                 self.store.db, [group['key'] for group in groups])
             album_tree = people_albums.tree(self.store.db)
@@ -1464,8 +1468,8 @@ class App:
                 # Обычный зритель не должен даже знать о существовании
                 # скрытого альбома, не то что о его составе.
                 album_tree = [item for item in album_tree if not item['effectively_hidden']]
-            named = [group for group in groups if group['kind'] == 'person']
-            shown = {face_id for group in groups for face_id in group['face_ids']}
+            named = [group for group in visible if group['kind'] == 'person']
+            shown = {face_id for group in visible for face_id in group['face_ids']}
             return {
                 'stats': {
                     'faces': len(shown),
@@ -1484,8 +1488,8 @@ class App:
                         + ('' if admin else ' WHERE owner=?'),
                         () if admin else (viewer or '',)).fetchone()[0],
                     'people': len(named),
-                    'groups': sum(group['kind'] == 'auto' for group in groups),
-                    'review': sum(len(group['face_ids']) for group in groups
+                    'groups': sum(group['kind'] == 'auto' for group in visible),
+                    'review': sum(len(group['face_ids']) for group in visible
                                   if group['kind'] in {'noise', 'excluded'}),
                 },
                 'groups': [self.group_payload(group, albums_by_key=albums_by_key,
@@ -1537,8 +1541,10 @@ class App:
 
     def similar_groups(self, key, limit=10, minimum=0.3):
         with self.lock:
+            hidden = people_albums.hidden_group_keys(self.store.db)
             groups = [group for group in self.store.groups()
-                      if group['kind'] in {'person', 'auto'}]
+                      if group['kind'] in {'person', 'auto'}
+                      and (group['key'] == key or group['key'] not in hidden)]
             target = next((group for group in groups if group['key'] == key), None)
             if target is None:
                 raise KeyError('Группа больше не существует')
@@ -1572,14 +1578,21 @@ class App:
                     'suggestions': []}
         with self.lock:
             found = self.store.suggest_people(float(options['face_suggest_threshold']))
+            # Ни безымянная группа, ни человек из скрытого альбома в догадках
+            # не всплывают: «похоже на …» выдало бы само имя.
+            hidden = people_albums.hidden_group_keys(self.store.db)
+            found = [item for item in found if item['key'] not in hidden
+                     and f"person:{item['person_id']}" not in hidden]
         return {'enabled': True, 'threshold': float(options['face_suggest_threshold']),
                 'suggestions': found}
 
     def similar_pairs(self, limit=20, minimum=0.38, named_only=False, smallest=2):
         """Самые похожие пары групп — кандидаты на объединение."""
         with self.lock:
+            hidden = people_albums.hidden_group_keys(self.store.db)
             groups = [group for group in self.store.groups()
                       if group['kind'] in {'person', 'auto'}
+                      and group['key'] not in hidden
                       and len(group['face_ids']) >= smallest
                       and (not named_only or group['kind'] == 'person')]
             centroids = self.centroids(self.store.groups())
