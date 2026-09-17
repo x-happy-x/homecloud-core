@@ -15,9 +15,10 @@ from PySide6.QtWidgets import (
     QMainWindow, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
+import albums
 from authenticity_photos import ANIME_THRESHOLD
 import face_quality
-from prototype import cluster_embeddings, database
+from prototype import cluster_embeddings, database, limited_linkage
 import settings as catalog_settings
 
 
@@ -51,9 +52,17 @@ class CatalogStore:
             CREATE TABLE IF NOT EXISTS label_history (
               id INTEGER PRIMARY KEY, created_at TEXT NOT NULL,
               description TEXT NOT NULL, before_json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS video_people_hints (
+              path TEXT PRIMARY KEY REFERENCES photos(path) ON DELETE CASCADE,
+              count INTEGER NOT NULL, created_at TEXT NOT NULL);
         ''')
         if 'bigfam_id' not in {row[1] for row in self.db.execute('PRAGMA table_info(people)')}:
             self.db.execute('ALTER TABLE people ADD COLUMN bigfam_id TEXT')
+            self.db.commit()
+        # Обычно колонку ставит опись (catalog_index.py), но исключение по папке
+        # нужно и там, где каталог собран в обход неё — например, в тестах.
+        if 'dir' not in {row[1] for row in self.db.execute('PRAGMA table_info(photos)')}:
+            self.db.execute('ALTER TABLE photos ADD COLUMN dir TEXT')
             self.db.commit()
         # Лицо из ролика помнит свою секунду; в каталоге без видео колонки ещё нет.
         face_columns = {row[1] for row in self.db.execute('PRAGMA table_info(faces)')}
@@ -522,6 +531,63 @@ class CatalogStore:
                 'INSERT INTO face_exclusions(face_id,created_at) VALUES(?,?) '
                 'ON CONFLICT(face_id) DO UPDATE SET created_at=excluded.created_at',
                 [(face_id, now) for face_id in face_ids])
+
+    def exclude_path(self, path, folder=False):
+        """Исключить разом все лица одного файла или всей папки (с вложенными)."""
+        if folder:
+            clause, params = albums.folder_clause(path)
+            rows = self.db.execute(
+                f'SELECT faces.id FROM faces JOIN photos ON photos.path=faces.path '
+                f'WHERE 1=1{clause}', params).fetchall()
+        else:
+            rows = self.db.execute('SELECT id FROM faces WHERE path=?', (path,)).fetchall()
+        face_ids = [row[0] for row in rows]
+        if face_ids:
+            self.exclude(face_ids)
+        return len(face_ids)
+
+    def video_people_hint(self, path):
+        row = self.db.execute(
+            'SELECT count FROM video_people_hints WHERE path=?', (path,)).fetchone()
+        return row[0] if row else None
+
+    def set_video_people_hint(self, path, count):
+        """Сколько людей на самом деле в ролике — чтобы не плодить лишние грозди.
+
+        Считаем заново только неназванные лица этого файла: названные и так
+        закреплены за человеком, а мыльные и исключённые в группировку не идут.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self.db:
+            if count and count > 0:
+                self.db.execute(
+                    'INSERT INTO video_people_hints(path,count,created_at) VALUES(?,?,?) '
+                    'ON CONFLICT(path) DO UPDATE SET count=excluded.count,'
+                    'created_at=excluded.created_at', (path, int(count), now))
+            else:
+                self.db.execute('DELETE FROM video_people_hints WHERE path=?', (path,))
+        if count and count > 0:
+            self.recluster_video(path, int(count))
+
+    def recluster_video(self, path, count):
+        blurry = self.blurry()
+        rows = self.db.execute(
+            'SELECT faces.id FROM faces '
+            'LEFT JOIN face_people ON face_people.face_id=faces.id '
+            'LEFT JOIN face_exclusions ON face_exclusions.face_id=faces.id '
+            'WHERE faces.path=? AND face_people.face_id IS NULL '
+            'AND face_exclusions.face_id IS NULL', (path,)).fetchall()
+        face_ids = [row[0] for row in rows if row[0] not in blurry]
+        if len(face_ids) < 2:
+            return 0
+        vectors, face_ids = self._vectors(face_ids)
+        labels, probabilities = limited_linkage(vectors, count)
+        highest = self.db.execute(
+            'SELECT COALESCE(MAX(label),-1) FROM face_clusters').fetchone()[0]
+        assigned = {face_id: (highest + 1 + int(label), float(probability), 'video-hint')
+                    for face_id, label, probability in zip(face_ids, labels, probabilities)}
+        self._store_labels(assigned)
+        return len(assigned)
 
     def undo(self):
         row = self.db.execute(

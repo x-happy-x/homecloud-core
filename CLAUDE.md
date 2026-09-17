@@ -36,7 +36,8 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
   `track_start`/`track_stop` — у фотографий NULL), `face_clusters`,
   `face_people`, `people`, `face_exclusions`, `face_authenticity`,
   `face_quality` (резкость миниатюры, размер, `keep`), `group_avatars`,
-  `label_history`
+  `label_history`, `video_people_hints` (сколько людей на самом деле в
+  ролике — сужает его лица до этого числа групп, см. `recluster_video`)
 - **анализ:** `photo_analysis` (тип, качество, OCR), `photo_embeddings`
   (визуальный индекс), `photo_adult_analysis`, `photo_hashes` (sha1 + dHash)
 - **видео и звук:** `video_speech`, `video_speech_segments`,

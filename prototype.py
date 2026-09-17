@@ -663,6 +663,33 @@ def average_linkage(matrix, min_cluster_size=8, distance=LINKAGE_DISTANCE,
     return labels, probabilities
 
 
+def limited_linkage(matrix, max_clusters):
+    """Средняя связь с потолком числа групп — для ролика с известным числом людей.
+
+    В отличие от average_linkage группы получаются всегда, даже из одного
+    лица, и их не больше max_clusters: AgglomerativeClustering сливает самые
+    близкие грозди, пока их не останется нужное количество.
+    """
+    import numpy as np
+    from sklearn.cluster import AgglomerativeClustering
+    count = len(matrix)
+    if count == 0:
+        return np.zeros(0, dtype=int), np.zeros(0)
+    clusters = max(1, min(max_clusters, count))
+    if clusters == 1:
+        labels = np.zeros(count, dtype=int)
+    else:
+        labels = AgglomerativeClustering(
+            n_clusters=clusters, metric='cosine', linkage='average').fit_predict(matrix)
+    probabilities = np.zeros(count)
+    for label in set(labels.tolist()):
+        members = np.where(labels == label)[0]
+        centre = matrix[members].mean(axis=0)
+        centre = centre / max(float(np.linalg.norm(centre)), 1e-12)
+        probabilities[members] = np.clip(matrix[members] @ centre, 0.0, 1.0)
+    return labels, probabilities
+
+
 def cluster_embeddings(matrix, algorithm='average', distance=0.35, min_cluster_size=8):
     """Cluster normalized face vectors and return labels plus membership confidence."""
     import numpy as np

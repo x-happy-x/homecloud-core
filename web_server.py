@@ -2590,6 +2590,12 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 return self.json_response(self.app.compare_groups(
                     query.get('a', [''])[0], query.get('b', [''])[0]))
+            if parsed.path == '/api/video-people':
+                query = parse_qs(parsed.query)
+                path = query.get('path', [''])[0]
+                with self.app.lock:
+                    count = self.app.store.video_people_hint(path)
+                return self.json_response({'path': path, 'count': count})
             if parsed.path == '/api/folders':
                 query = parse_qs(parsed.query)
                 path = query.get('path', [''])[0]
@@ -3057,6 +3063,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.app.store.clear_avatar(body.get('key', ''))
                 elif path == '/api/exclude':
                     self.app.store.exclude(body.get('face_ids', []))
+                elif path == '/api/exclude-path':
+                    self.app.store.exclude_path(body.get('path', ''), bool(body.get('folder')))
+                elif path == '/api/video-people':
+                    self.app.store.set_video_people_hint(body.get('path', ''), body.get('count'))
                 elif path == '/api/undo':
                     description = self.app.store.undo()
                     return self.json_response({'ok': True, 'description': description,
