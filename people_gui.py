@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 import albums
 from authenticity_photos import ANIME_THRESHOLD
 import face_quality
+import video_identities
 from prototype import cluster_embeddings, database, limited_linkage
 import settings as catalog_settings
 
@@ -190,11 +191,22 @@ class CatalogStore:
         """Считаем метки только для новых лиц: старые уже лежат в каталоге."""
         # Оценка резкости досчитывается и без новых меток: у каталога, собранного
         # до её появления, метки есть у всех лиц, а оценок нет ни у одного.
+        if self.db.execute('SELECT 1 FROM face_track_data WHERE active=1 LIMIT 1').fetchone():
+            # The scanner / ReclusterController owns the CPU work and its connection.
+            if not video_identities.needs_rebuild(self.db) and self.db.execute('SELECT 1 FROM faces f LEFT JOIN face_clusters c ON c.face_id=f.id WHERE c.face_id IS NULL LIMIT 1').fetchone():
+                with self.db:
+                    video_identities.mark_dirty(self.db)
+            return 0
         self.measure_quality()
         pending = [row[0] for row in self.db.execute(
             'SELECT faces.id FROM faces LEFT JOIN face_clusters '
             'ON face_clusters.face_id=faces.id WHERE face_clusters.face_id IS NULL '
             'ORDER BY faces.id')]
+        if not pending:
+            return 0
+        video_pending = {r[0] for r in self.db.execute(
+            'SELECT f.id FROM faces f WHERE f.track_start IS NOT NULL OR f.frame_time IS NOT NULL')}
+        pending = [i for i in pending if i not in video_pending]
         if not pending:
             return 0
         blurry = self.blurry()
@@ -479,8 +491,10 @@ class CatalogStore:
         excluded = {row[0] for row in self.db.execute(
             f'SELECT face_id FROM face_exclusions WHERE face_id IN ({",".join("?" * len(face_ids))})',
             face_ids)} if face_ids else set()
-        state = [{'face_id': face_id, 'person_id': people.get(face_id),
+        origins = {r[0]: r[1:] for r in self.db.execute('SELECT face_id,source,score,version FROM face_people')}
+        state = [{'face_id': face_id, 'origin': origins.get(face_id), 'person_id': people.get(face_id),
                   'excluded': face_id in excluded} for face_id in face_ids]
+        video_identities.mark_dirty(self.db)
         self.db.execute('INSERT INTO label_history(created_at,description,before_json) VALUES(?,?,?)',
                         (datetime.now(timezone.utc).isoformat(), description,
                          json.dumps(state, separators=(',', ':'))))
@@ -511,7 +525,7 @@ class CatalogStore:
             person_id = self.find_or_create_person(name, bigfam_id)
             self.db.executemany(
                 'INSERT INTO face_people(face_id,person_id) VALUES(?,?) '
-                'ON CONFLICT(face_id) DO UPDATE SET person_id=excluded.person_id',
+                "ON CONFLICT(face_id) DO UPDATE SET person_id=excluded.person_id,source='human',score=NULL,version=NULL",
                 [(face_id, person_id) for face_id in face_ids])
             self.db.executemany('DELETE FROM face_exclusions WHERE face_id=?',
                                 [(face_id,) for face_id in face_ids])
@@ -566,10 +580,15 @@ class CatalogStore:
                     'created_at=excluded.created_at', (path, int(count), now))
             else:
                 self.db.execute('DELETE FROM video_people_hints WHERE path=?', (path,))
+        with self.db:
+            video_identities.mark_dirty(self.db)
         if count and count > 0:
             self.recluster_video(path, int(count))
 
     def recluster_video(self, path, count):
+        if self.db.execute('SELECT 1 FROM faces WHERE path=? AND (track_start IS NOT NULL OR frame_time IS NOT NULL) LIMIT 1', (path,)).fetchone():
+            # Hint is advisory. The worker enforces similarity and cannot-link.
+            return 0
         blurry = self.blurry()
         rows = self.db.execute(
             'SELECT faces.id FROM faces '
@@ -596,13 +615,15 @@ class CatalogStore:
             return None
         states = json.loads(row[2])
         with self.db:
+            video_identities.mark_dirty(self.db)
             for state in states:
                 face_id = state['face_id']
                 self.db.execute('DELETE FROM face_people WHERE face_id=?', (face_id,))
                 self.db.execute('DELETE FROM face_exclusions WHERE face_id=?', (face_id,))
                 if state['person_id'] is not None:
-                    self.db.execute('INSERT INTO face_people(face_id,person_id) VALUES(?,?)',
-                                    (face_id, state['person_id']))
+                    origin = state.get('origin') or ['human', None, None]
+                    self.db.execute('INSERT INTO face_people(face_id,person_id,source,score,version) VALUES(?,?,?,?,?)',
+                                    (face_id, state['person_id'], *origin))
                 if state['excluded']:
                     self.db.execute('INSERT INTO face_exclusions(face_id,created_at) VALUES(?,?)',
                                     (face_id, datetime.now(timezone.utc).isoformat()))

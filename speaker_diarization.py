@@ -279,9 +279,10 @@ def update_voice_prints(db, links, speakers):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_people'").fetchone()
     if not has_people or not links:
         return
+    human_only = " AND source='human'" if 'source' in {r[1] for r in db.execute('PRAGMA table_info(face_people)')} else ''
     embeddings = {label: embedding for label, _, embedding in speakers}
     for speaker, (face_id, _) in links.items():
-        row = db.execute('SELECT person_id FROM face_people WHERE face_id=?',
+        row = db.execute('SELECT person_id FROM face_people WHERE face_id=?' + human_only,
                          (face_id,)).fetchone()
         if not row or speaker not in embeddings:
             continue

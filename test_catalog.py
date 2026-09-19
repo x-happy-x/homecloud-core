@@ -27,7 +27,7 @@ class CatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             db = prototype.database(Path(temp))
             with db:
-                db.execute('INSERT INTO photos VALUES(?,?,?,?,?,?)', ('photo.jpg', 1, 2, 'model', 'ok', None))
+                db.execute('INSERT INTO photos(path,size,modified,model,status,error) VALUES(?,?,?,?,?,?)', ('photo.jpg', 1, 2, 'model', 'ok', None))
                 db.execute('INSERT INTO faces(path,box,embedding,thumbnail) VALUES(?,?,?,?)', ('photo.jpg', '[]', b'old', 'old.jpg'))
             try:
                 with db:

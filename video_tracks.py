@@ -21,6 +21,7 @@ import heapq
 import numpy as np
 
 import face_quality
+import video_identities as identities
 
 
 def iou(first, second):
@@ -43,15 +44,25 @@ def cosine(first, second):
 class _Track:
     """Один трек в процессе накопления: хранит только `cap` лучших кадров."""
 
-    def __init__(self, moment, box, embedding, score, extra, cap=8):
+    def __init__(self, moment, box, embedding, score, extra, cap=8, options=None):
         self.start = self.stop = moment
         self.last_box = box
+        self.first_box = box
+        self.moments = []
+        self.samples = []
+        self.options = options or {}
         self.cap = cap
         self._top = []  # мин-куча: (score, счётчик, moment, box, embedding, extra)
         self._counter = 0
         self._push(moment, box, embedding, score, extra)
 
     def _push(self, moment, box, embedding, score, extra):
+        self.moments.append(round(moment, 6))
+        metadata = extra.get('quality', {}) if isinstance(extra, dict) else {}
+        sample = {**metadata, 'time': moment, 'box': box, 'embedding': embedding,
+                  'quality': metadata.get('quality', score),
+                  'reliable': metadata.get('reliable', False)}
+        self.samples = identities.representatives(self.samples + [sample], self.options)
         # Счётчик — только чтобы куча не пыталась сравнивать эмбеддинги между
         # собой при равном score; сам он в выборе кадра не участвует.
         entry = (score, self._counter, moment, box, embedding, extra)
@@ -83,17 +94,21 @@ class _Track:
             'start': self.start, 'stop': self.stop, 'frame_time': best[2],
             'box': best[3], 'embedding': embedding.astype('<f4'), 'extra': best[5],
             'frames': len(entries),
+            'observations': len(self.moments), 'moments': self.moments,
+            'first_box': self.first_box, 'last_box': self.last_box,
+            'representatives': self.samples,
         }
 
 
 class Tracker:
     """Копит открытые треки по кадрам и отдаёт закрытые, как только можно."""
 
-    def __init__(self, gap=1.2, iou_threshold=0.3, embedding_threshold=0.55, best=8):
+    def __init__(self, gap=1.2, iou_threshold=0.3, embedding_threshold=0.55, best=8, options=None):
         self.gap = gap
         self.iou_threshold = iou_threshold
         self.embedding_threshold = embedding_threshold
         self.best = best
+        self.options = {**identities.DEFAULTS, **(options or {})}
         self._open = []
 
     def update(self, moment, detections):
@@ -102,7 +117,8 @@ class Tracker:
                   if moment - track.stop > self.gap]
         available = [track for track in self._open if moment - track.stop <= self.gap]
 
-        remaining = list(detections)
+        remaining = [(box, identities.unit(vector), score, extra)
+                     for box, vector, score, extra in detections if identities.unit(vector) is not None]
         matched_tracks, matched_detections = set(), set()
 
         # Сначала — по пересечению рамок с прошлым кадром трека, это надёжнее.
@@ -113,6 +129,8 @@ class Tracker:
             reverse=True)
         for value, ti, di in pairs:
             if value < self.iou_threshold or ti in matched_tracks or di in matched_detections:
+                continue
+            if cosine(available[ti].anchor(), remaining[di][1]) < self.options['identity_tracking_threshold']:
                 continue
             matched_tracks.add(ti); matched_detections.add(di)
             box, embedding, score, extra = remaining[di]
@@ -136,7 +154,7 @@ class Tracker:
         # Всё, что осталось без трека, — начало нового.
         for di, (box, embedding, score, extra) in enumerate(remaining):
             if di not in matched_detections:
-                available.append(_Track(moment, box, embedding, score, extra, self.best))
+                available.append(_Track(moment, box, embedding, score, extra, self.best, self.options))
 
         self._open = available
         return closed
@@ -161,6 +179,8 @@ def sample_frames(path, step_seconds, stop_seconds=0.0, stop_check=None):
     fps = info['fps'] or 25.0
     step_frames = max(1, round(fps * step_seconds))
     last_wanted = int(fps * stop_seconds) if stop_seconds else info['frames']
+    if info['frames'] > 0 and last_wanted > 0:
+        last_wanted = min(last_wanted, info['frames'])
     capture = video_media._open(path)
     index = 0
     try:
@@ -172,9 +192,13 @@ def sample_frames(path, step_seconds, stop_seconds=0.0, stop_check=None):
             if index % step_frames == 0:
                 ok, frame = capture.read()
                 if not ok:
+                    if index == 0 or (last_wanted > 0 and index + step_frames < last_wanted):
+                        raise OSError('Video decoder stopped before the requested range completed')
                     return
                 yield index / fps, frame
             elif not capture.grab():
+                if last_wanted > 0 and index + step_frames < last_wanted:
+                    raise OSError('Video decoder stopped before the requested range completed')
                 return
             index += 1
     finally:
@@ -182,13 +206,15 @@ def sample_frames(path, step_seconds, stop_seconds=0.0, stop_check=None):
 
 
 def find_tracks(path, models, step_seconds=0.5, gap_seconds=1.2, best_frames=8,
-                stop_seconds=0.0, stop_check=None, min_score=0.6):
+                stop_seconds=0.0, stop_check=None, min_score=0.6, options=None, progress=None):
     """Треки лиц по всему ролику — детектор, трекер и сборка результатов вместе."""
     import video as video_media
     from insightface.app.common import Face
-    tracker = Tracker(gap=gap_seconds, embedding_threshold=0.55, best=best_frames)
+    tracker = Tracker(gap=gap_seconds, embedding_threshold=0.55, best=best_frames, options=options)
     tracks = []
     for moment, frame in sample_frames(path, step_seconds, stop_seconds, stop_check):
+        if progress:
+            progress(moment)
         detections = []
         boxes, landmarks = models['detection'].detect(frame)
         for number, box in enumerate(boxes):
@@ -197,15 +223,19 @@ def find_tracks(path, models, step_seconds=0.5, gap_seconds=1.2, best_frames=8,
             face = Face(bbox=box[:4], kps=landmarks[number], det_score=box[4])
             models['recognition'].get(frame, face)
             embedding = np.asarray(face.normed_embedding, dtype='<f4')
-            if not np.all(np.isfinite(embedding)):
+            if identities.unit(embedding) is None:
                 continue
             # Вырезаем и уменьшаем кадр сразу: трек держит до `best_frames`
             # штук в памяти, и полные кадры (особенно 4K) там неуместны —
             # только маленькое превью, которое всё равно пойдёт в файл.
             crop = video_media.to_image(frame).crop(tuple(int(v) for v in box[:4]))
             crop.thumbnail((160, 160))
-            rank = float(box[4]) * face_quality.sharpness_weight(face_quality.face_blur(crop))
-            detections.append((box[:4].tolist(), embedding, rank, crop))
+            blur = face_quality.face_blur(crop)
+            metadata = identities.quality(box[:4], float(box[4]), blur, landmarks[number], options)
+            rank = max(metadata['quality'], .001)
+            detections.append((box[:4].tolist(), embedding, rank, {'crop': crop, 'quality': metadata}))
         tracks.extend(tracker.update(moment, detections))
+    if stop_check and stop_check():
+        raise InterruptedError('Video analysis stopped; previous tracks retained')
     tracks.extend(tracker.close_all())
     return tracks

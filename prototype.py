@@ -17,6 +17,7 @@ import pathrules
 import settings as catalog_settings
 import video as video_media
 import video_tracks
+import video_identities
 
 PICTURES = {'.jpg', '.jpeg', '.png', '.webp'}
 SUPPORTED = PICTURES | video_media.SUPPORTED
@@ -69,6 +70,7 @@ def database(folder, check_same_thread=True):
         db.execute('ALTER TABLE faces ADD COLUMN track_start REAL')
         db.execute('ALTER TABLE faces ADD COLUMN track_stop REAL')
     db.commit()
+    video_identities.ensure_schema(db)
     return db
 
 
@@ -221,6 +223,7 @@ def scan(args):
 
     paths = []
     processed = ignored = skipped = errors = faces_found = videos_done = videos_total = 0
+    video_position = 0.0
 
     def is_excluded(path):
         resolved = path.resolve()
@@ -241,6 +244,7 @@ def scan(args):
             'processed': processed, 'ignored': ignored, 'skipped': skipped,
             'errors': errors, 'faces_found': faces_found, 'videos_done': videos_done,
             'videos_total': videos_total, 'video_track_step': options['video_track_step'],
+            'video_position': video_position,
             'pid': os.getpid(), 'started_at': started_at, 'updated_at': now,
         }
         temporary = progress_file.with_suffix(progress_file.suffix + '.tmp')
@@ -351,7 +355,10 @@ def scan(args):
     legacy.discard(signature)
     # У роликов своя подпись: поменяли параметры трекинга — пересчитываются
     # только они, фотографии остаются нетронутыми.
-    video_signature = stamp('video-tracks-v1', {
+    video_signature = stamp('video-tracks-v2', {
+        **{k: options[k] for k in ('identity_min_size', 'identity_min_confidence',
+            'identity_max_blur', 'identity_min_quality', 'identity_sample_spacing',
+            'identity_representatives', 'identity_tracking_threshold')},
         'step': options['video_track_step'], 'gap': options['video_track_gap'],
         'best': options['video_track_best'], 'min_side': min_side,
         'from': options['video_min_seconds'], 'to': options['video_max_seconds']})
@@ -369,6 +376,19 @@ def scan(args):
     thumbs = data / 'thumbnails'
     videos_total = sum(video_media.is_video(path) for path in paths)
     thumbs.mkdir(exist_ok=True)
+
+    def finish_faces():
+        if video_identities.needs_rebuild(db):
+            import face_quality
+            face_quality.ensure_schema(db)
+            face_quality.measure(db, data)
+            try:
+                video_identities.rebuild(db, options, stop_check=lambda: bool(stop_file and stop_file.exists()))
+            except InterruptedError:
+                publish('stopped', force=True)
+                return False
+        return True
+
     publish('running', force=True)
     for path in paths:
         filename = path.name
@@ -377,6 +397,8 @@ def scan(args):
             print('Stopped from Web UI. Re-run scan to continue.', file=sys.stderr)
             return
         if processed + ignored + errors >= args.limit:
+            if not finish_faces():
+                return
             print('Sample limit reached. Re-run to continue.')
             print(f'Processed={processed}, ignored={ignored}, skipped={skipped}, errors={errors}')
             publish('limited', str(path), force=True)
@@ -429,20 +451,24 @@ def scan(args):
                     return found
 
                 def mark(status, note=None, kind='photo', duration=None):
-                    with db:
-                        db.execute(
-                            'INSERT INTO photos(path,dir,size,modified,model,status,error,kind,duration) '
-                            'VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET '
-                            'dir=excluded.dir,size=excluded.size,modified=excluded.modified,'
-                            'model=excluded.model,status=excluded.status,error=excluded.error,'
-                            'kind=excluded.kind,duration=excluded.duration',
-                            (key, str(path.parent), stat.st_size, stat.st_mtime_ns,
-                             kind_signature, status, note, kind, duration))
-                        if status == 'ignored':
-                            db.execute('DELETE FROM faces WHERE path=?', (key,))
+                    db.execute(
+                        'INSERT INTO photos(path,dir,size,modified,model,status,error,kind,duration) '
+                        'VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET '
+                        'dir=excluded.dir,size=excluded.size,modified=excluded.modified,'
+                        'model=excluded.model,status=excluded.status,error=excluded.error,'
+                        'kind=excluded.kind,duration=excluded.duration',
+                        (key, str(path.parent), stat.st_size, stat.st_mtime_ns,
+                         kind_signature, status, note, kind, duration))
+                    if status == 'ignored':
+                        db.execute('DELETE FROM faces WHERE path=?', (key,))
 
                 results, duration, img = [], None, None
                 if is_video:
+                    video_position = 0.0
+                    def video_progress(moment):
+                        nonlocal video_position
+                        video_position = moment
+                        publish('running', str(path))
                     info = video_media.probe(path)
                     duration = info['duration'] or None
                     short = (options['video_min_seconds']
@@ -451,7 +477,8 @@ def scan(args):
                         catalog_settings.rejects(options, size=stat.st_size,
                                                  width=info['width'], height=info['height'])
                     if reason:
-                        mark('ignored', reason, 'video', duration)
+                        with db:
+                            mark('ignored', reason, 'video', duration)
                         ignored += 1
                         publish('running', str(path))
                         continue
@@ -460,18 +487,19 @@ def scan(args):
                         gap_seconds=options['video_track_gap'],
                         best_frames=options['video_track_best'],
                         stop_seconds=options['video_max_seconds'],
-                        stop_check=lambda: bool(stop_file and stop_file.exists()))
+                        stop_check=lambda: bool(stop_file and stop_file.exists()), options=options,
+                        progress=video_progress)
                     for number, track in enumerate(tracks):
                         token = hashlib.sha256(
                             f'{key}:{stat.st_mtime_ns}:{kind_signature}:{number}'.encode()
                         ).hexdigest()
                         thumbnail = f'thumbnails/{token}.jpg'
-                        track['extra'].save(data / thumbnail)
+                        track['extra']['crop'].save(data / thumbnail)
                         results.append((
                             key, json.dumps([round(value, 1) for value in track['box']]),
                             track['embedding'].tobytes(), thumbnail,
                             round(track['frame_time'], 3),
-                            round(track['start'], 3), round(track['stop'], 3)))
+                            round(track['start'], 3), round(track['stop'], 3), track))
                     print(f'  {filename}: треков {len(tracks)}', flush=True)
                 else:
                     with Image.open(path) as original:
@@ -481,7 +509,8 @@ def scan(args):
                     if min_side and min(img.size) < min_side:
                         reason = reason or 'сторона меньше минимальной'
                     if reason:
-                        mark('ignored', reason)
+                        with db:
+                            mark('ignored', reason)
                         ignored += 1
                         publish('running', str(path))
                         continue
@@ -489,8 +518,8 @@ def scan(args):
                 after = path.stat()
                 if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                     raise RuntimeError('File changed during processing; retry scan')
-                mark('ok', None, 'video' if is_video else 'photo', duration)
                 with db:
+                    mark('ok', None, 'video' if is_video else 'photo', duration)
                     merge_faces(db, key, results)
                 processed += 1
                 faces_found += len(results)
@@ -498,6 +527,9 @@ def scan(args):
                     videos_done += 1
                 print(f'{processed}: {filename}: {len(results)} faces', flush=True)
                 publish('running', str(path))
+        except InterruptedError:
+            publish('stopped', str(path), force=True)
+            return
         except Exception as exc:
             errors += 1
             print(f'ERROR: {path}: {exc}', file=sys.stderr, flush=True)
@@ -506,6 +538,8 @@ def scan(args):
                            (str(path), str(path.parent), stat.st_size if stat else None,
                             stat.st_mtime_ns if stat else None, signature, 'error', str(exc)))
             publish('running', str(path))
+    if not finish_faces():
+        return
     print(f'Processed={processed}, ignored={ignored}, skipped={skipped}, errors={errors}')
     publish('completed', force=True)
 
@@ -560,6 +594,7 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
             box = None
         embedding = np.frombuffer(raw_embedding, dtype='<f4') if raw_embedding else None
         previous.append((face_id, box, moment, track_start, track_stop, embedding))
+    video_identities.mark_dirty(db)
     taken = set()
     for item in results:
         path_key, box_json, embedding, thumbnail = item[:4]
@@ -568,6 +603,7 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
         track_stop = item[6] if len(item) > 6 else None
         box = [float(value) for value in json.loads(box_json)]
         best, best_score = None, 0.0
+        candidates = []
         if track_start is not None:
             vector = np.frombuffer(embedding, dtype='<f4')
             for face_id, _, _, old_start, old_stop, old_vector in previous:
@@ -576,6 +612,8 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
                     continue
                 denom = (np.linalg.norm(vector) * np.linalg.norm(old_vector)) or 1.0
                 score = float(np.dot(vector, old_vector) / denom)
+                if score >= track_embedding_threshold:
+                    candidates.append(score)
                 if score >= track_embedding_threshold and score > best_score:
                     best, best_score = face_id, score
         else:
@@ -588,19 +626,33 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
                 score = overlap(box, old_box)
                 if score >= threshold and score > best_score:
                     best, best_score = face_id, score
+        if track_start is not None and len(candidates) > 1:
+            candidates.sort(reverse=True)
+            if candidates[0] - candidates[1] < video_identities.DEFAULTS['identity_margin']:
+                best = None
         if best is None:
-            db.execute(
+            cursor = db.execute(
                 'INSERT INTO faces(path,box,embedding,thumbnail,frame_time,'
                 'track_start,track_stop) VALUES(?,?,?,?,?,?,?)',
                 (path_key, box_json, embedding, thumbnail, moment, track_start, track_stop))
+            if len(item) > 7:
+                video_identities.save_track(db, cursor.lastrowid, item[7])
             continue
         taken.add(best)
         db.execute('UPDATE faces SET box=?,embedding=?,thumbnail=?,frame_time=?,'
                   'track_start=?,track_stop=? WHERE id=?',
                    (box_json, embedding, thumbnail, moment, track_start, track_stop, best))
-        # Вектор изменился — метку кластера пересчитаем, имя остаётся.
-        db.execute('DELETE FROM face_clusters WHERE face_id=?', (best,))
-    stale = [(face_id,) for face_id, *_ in previous if face_id not in taken]
+        if len(item) > 7:
+            video_identities.save_track(db, best, item[7])
+        # Keep the previous label until the complete replacement is ready.
+        # identity_state.dirty invalidates the computation without losing keys.
+    protected = {row[0] for row in db.execute("SELECT face_id FROM face_people WHERE source='human'")}
+    protected |= {row[0] for row in db.execute('SELECT face_id FROM face_exclusions')}
+    stale = [(face_id,) for face_id, *_ in previous if face_id not in taken and face_id not in protected]
+    for face_id, *_ in previous:
+        if face_id not in taken and face_id in protected:
+            db.execute('INSERT INTO face_track_data(face_id,active,observations,moments,version) '
+                       "VALUES(?,0,0,'[]',?) ON CONFLICT(face_id) DO UPDATE SET active=0", (face_id, video_identities.VERSION))
     if stale:
         db.executemany('DELETE FROM faces WHERE id=?', stale)
     return len(taken), len(results) - len(taken), len(stale)

@@ -920,201 +920,36 @@ class ReclusterController:
             self.state['message'] = 'Останавливаю после текущего шага…'
             return {**self.state, 'steps': self.STEPS}
 
-    def _run(self):
+    def _run(self, scope='all'):
+        import video_identities
         db = None
         try:
-            db = open_catalog_db(self.app.store.folder, check_same_thread=False)
+            db = open_catalog_db(self.app.store.folder)
             options = catalog_settings.read(db)
-            # Мыльные лица в сборку не берём: они склеивают разных людей.
-            # Оценки уже посчитаны — их досчитывает опрос состояния.
-            blurry = face_quality.blurry_ids(
-                db, float(options['face_blur_threshold']), float(options['face_min_size']))
-            rows = [row for row in db.execute('SELECT id,embedding FROM faces ORDER BY id')
-                    if row[0] not in blurry]
-            skipped = sorted(blurry)
-            total = len(rows)
-            # Старые группы не трогаем, пока не готовы полностью новые: если
-            # остановить пересборку на любом из первых трёх шагов, каталог
-            # остаётся ровно таким, каким был — DELETE происходит одной
-            # транзакцией с первой же пачкой новых данных на шаге "Сохраняю".
-            self._set(step='prepare', step_index=1, done=0, total=total, faces_total=total,
-                      message='Готовлю данные')
-            if self._should_stop():
-                self._set(status='stopped', message='Остановлено — старые группы не тронуты')
-                return
-            self._set(step='vectors', step_index=2, done=0, total=total,
-                      step_started_at=time.time(), message='Загружаю векторы лиц')
-            ids, vectors = [], []
-            for face_id, blob in rows:
-                vector = np.frombuffer(blob, dtype='<f4').astype('<f4')
-                norm = float(np.linalg.norm(vector))
-                vectors.append(vector / max(norm, 1e-12))
-                ids.append(face_id)
-                if len(ids) % 2000 == 0:
-                    self._set(done=len(ids))
-            self._set(done=total, total=total)
-            if self._should_stop():
-                self._set(status='stopped', message='Остановлено — старые группы не тронуты')
-                return
-            self._set(step='cluster', step_index=3, done=0, total=1,
-                      step_started_at=time.time(),
-                      message='Кластеризую лица — самый долгий шаг, потерпите')
-            min_cluster_size = self.app.store.min_cluster_size
-            if vectors and len(vectors) >= min_cluster_size:
-                matrix = np.stack(vectors)
-                labels, probabilities = cluster_embeddings(
-                    matrix, algorithm='average', min_cluster_size=min_cluster_size)
-            else:
-                labels = [-1] * len(ids)
-                probabilities = [0.0] * len(ids)
-            self._set(done=1, total=1)
-            if self._should_stop():
-                self._set(status='stopped', message='Остановлено после кластеризации — '
-                                                     'старые группы не тронуты')
-                return
-            self._set(step='save', step_index=4, done=0, total=len(ids),
-                      step_started_at=time.time(), message='Сохраняю результат')
-            now = datetime.now(timezone.utc).isoformat()
-            stopped_midway = False
-            cleared = False
-            chunk = 2000
-            ids = list(ids) + skipped
-            labels = list(labels) + [-1] * len(skipped)
-            probabilities = list(probabilities) + [0.0] * len(skipped)
-            methods = ['average'] * (len(ids) - len(skipped)) + ['blurry'] * len(skipped)
-            for offset in range(0, len(ids), chunk):
-                batch = list(zip(ids[offset:offset + chunk], labels[offset:offset + chunk],
-                                 probabilities[offset:offset + chunk],
-                                 methods[offset:offset + chunk]))
-                with db:
-                    if not cleared:
-                        # Старое стирается в той же транзакции, что и первая
-                        # пачка нового — снаружи каталог не бывает пустым.
-                        db.execute('DELETE FROM face_clusters')
-                        cleared = True
-                    db.executemany(
-                        'INSERT INTO face_clusters(face_id,label,probability,method,computed_at) '
-                        'VALUES(?,?,?,?,?) ON CONFLICT(face_id) DO UPDATE SET label=excluded.label,'
-                        'probability=excluded.probability,method=excluded.method,'
-                        'computed_at=excluded.computed_at',
-                        [(int(face_id), int(label), float(probability), method, now)
-                         for face_id, label, probability, method in batch])
-                self._set(done=min(offset + chunk, len(ids)), total=len(ids))
-                if self._should_stop():
-                    stopped_midway = True
-                    break
+            self._set(step='prepare', step_index=1, message='Собираю треки и эталоны')
+            face_quality.ensure_schema(db)
+            face_quality.measure(db, self.app.store.folder)
+            self._set(step='cluster', step_index=3, message='Склеиваю треки и проверяю ограничения')
+            minimum = int(options['noise_cluster_size']) if scope == 'noise' else self.app.store.min_cluster_size
+            result = video_identities.rebuild(db, options, minimum, self._should_stop, scope=scope)
             db.close()
             db = None
             with self.app.lock:
-                self.app.store.reload_faces()
-            if stopped_midway:
-                self._set(status='stopped', message='Остановлено — часть групп уже пересобрана, '
-                                                     'остальные соберутся при следующем запуске')
-            else:
-                self._set(step='save', step_index=len(self.STEPS), done=len(ids), total=len(ids))
-                self._set(status='completed', message='Готово')
+                self.app.identity_reload_pending = True
+            self._set(status='completed', step='save', step_index=4,
+                      done=len(result['assignments']), total=len(result['assignments']),
+                      message=f"Готово: {len(result['identities'])} video identities")
+        except InterruptedError:
+            self._set(status='stopped', message='Остановлено — предыдущие группы сохранены')
         except Exception as exc:
-            print(f'Recluster failed: {exc}', file=sys.stderr, flush=True)
             self._set(status='error', error=str(exc), message='Ошибка пересборки')
         finally:
             if db is not None:
-                try:
-                    db.close()
-                except sqlite3.Error:
-                    pass
+                db.close()
 
     def _run_leftovers(self):
-        """Второй проход по одному остатку: то, что не собралось в группы.
-
-        Здесь ничего не стирается — трогаются только строки, у которых сейчас
-        label=-1. Названные лица и уже собранные группы не задеваются вовсе,
-        поэтому прерывание на любом шаге безопасно само по себе.
-        """
-        db = None
-        try:
-            options = catalog_settings.load(self.app.catalog_folder)
-            smallest = int(options.get('noise_cluster_size', 3))
-            db = open_catalog_db(self.app.store.folder, check_same_thread=False)
-            self._set(step='prepare', step_index=1, message='Собираю остаток')
-            blurry = face_quality.blurry_ids(
-                db, float(options['face_blur_threshold']), float(options['face_min_size']))
-            rows = [row for row in db.execute('''
-                SELECT faces.id, faces.embedding FROM faces
-                JOIN face_clusters ON face_clusters.face_id = faces.id
-                LEFT JOIN face_people ON face_people.face_id = faces.id
-                LEFT JOIN face_exclusions ON face_exclusions.face_id = faces.id
-                WHERE face_clusters.label = -1 AND face_people.face_id IS NULL
-                  AND face_exclusions.face_id IS NULL
-                ORDER BY faces.id''') if row[0] not in blurry]
-            total = len(rows)
-            self._set(done=0, total=total, faces_total=total)
-            if total < smallest:
-                self._set(status='completed', message='Разбирать нечего')
-                return
-            if self._should_stop():
-                self._set(status='stopped', message='Остановлено — ничего не тронуто')
-                return
-
-            self._set(step='vectors', step_index=2, done=0, total=total,
-                      step_started_at=time.time(), message='Загружаю векторы лиц')
-            ids, vectors = [], []
-            for face_id, blob in rows:
-                vector = np.frombuffer(blob, dtype='<f4').astype('<f4')
-                vectors.append(vector / max(float(np.linalg.norm(vector)), 1e-12))
-                ids.append(face_id)
-                if len(ids) % 2000 == 0:
-                    self._set(done=len(ids))
-            self._set(done=total, total=total)
-            if self._should_stop():
-                self._set(status='stopped', message='Остановлено — ничего не тронуто')
-                return
-
-            self._set(step='cluster', step_index=3, done=0, total=1,
-                      step_started_at=time.time(), message='Ищу группы в остатке')
-            labels, probabilities = cluster_embeddings(
-                np.stack(vectors), algorithm='average', min_cluster_size=smallest)
-            self._set(done=1, total=1)
-            if self._should_stop():
-                self._set(status='stopped', message='Остановлено — ничего не тронуто')
-                return
-
-            # Новые метки продолжают нумерацию, иначе они слились бы с
-            # существующими группами.
-            highest = db.execute('SELECT MAX(label) FROM face_clusters').fetchone()[0]
-            offset = (highest if highest is not None else -1) + 1
-            found = [(face_id, int(label) + offset, float(probability))
-                     for face_id, label, probability in zip(ids, labels, probabilities)
-                     if int(label) >= 0]
-            self._set(step='save', step_index=4, done=0, total=len(found),
-                      step_started_at=time.time(), message='Сохраняю найденные группы')
-            now = datetime.now(timezone.utc).isoformat()
-            for start in range(0, len(found), 2000):
-                batch = found[start:start + 2000]
-                with db:
-                    db.executemany(
-                        'UPDATE face_clusters SET label=?,probability=?,method=?,computed_at=? '
-                        'WHERE face_id=? AND label=-1',
-                        [(label, probability, 'average-leftovers', now, face_id)
-                         for face_id, label, probability in batch])
-                self._set(done=min(start + 2000, len(found)))
-                if self._should_stop():
-                    break
-            db.close()
-            db = None
-            with self.app.lock:
-                self.app.store.reload_faces()
-            groups = len({label for _, label, _ in found})
-            self._set(status='completed', done=len(found), total=len(found),
-                      message=f'Собрано групп: {groups}, лиц: {len(found)}')
-        except Exception as exc:
-            print(f'Leftover recluster failed: {exc}', file=sys.stderr, flush=True)
-            self._set(status='error', error=str(exc), message='Ошибка разбора остатка')
-        finally:
-            if db is not None:
-                try:
-                    db.close()
-                except sqlite3.Error:
-                    pass
+        # The same constraints and video identity units must apply in every path.
+        self._run('noise')
 
 
 class HighlightService:
@@ -1365,6 +1200,9 @@ class App:
             'track_start': extra.get('track_start'),
             'track_stop': extra.get('track_stop'),
             'blur': extra.get('blur'),
+            'video_identity_id': extra.get('video_identity_id'),
+            'identity_status': extra.get('identity_status'),
+            'assignment_source': extra.get('assignment_source'),
             'thumbnail': f'/media/thumb/{face_id}',
             'original': f'/media/original/{face_id}',
             'confidence': self.store.auto_confidence.get(face_id, 0),
@@ -1393,6 +1231,13 @@ class App:
                 details[face_id] = {
                     'path': path, 'track_start': track_start, 'track_stop': track_stop,
                     'blur': blur, 'taken': taken, 'dhash': curated_hash or plain_hash}
+            for fid, identity, status, source in self.store.db.execute(
+                    'SELECT f.id,t.identity_id,t.status,p.source FROM faces f '
+                    'LEFT JOIN face_track_identities t ON t.face_id=f.id '
+                    'LEFT JOIN face_people p ON p.face_id=f.id '
+                    f'WHERE f.id IN ({marks})', batch):
+                details.setdefault(fid, {}).update(video_identity_id=identity,
+                                                   identity_status=status, assignment_source=source)
         return details
 
     def faces_payload(self, face_ids):
@@ -1444,12 +1289,19 @@ class App:
     def state(self, viewer='', admin=False, hide_adult=False):
         masked = self.masked_faces(viewer, admin, hide_adult)
         with self.lock:
+            if getattr(self, 'identity_reload_pending', False):
+                self.store.reload_faces()
+                self.identity_reload_pending = False
             face_count = self.store.db.execute('SELECT COUNT(*) FROM faces').fetchone()[0]
             if face_count != len(self.store.rows) and not self.device.status().get('active'):
                 self.store.reload_faces()
             else:
                 # Скан мог обновить лица, не меняя их число: метки досчитываем.
                 self.store.refresh_labels()
+            import video_identities
+            if (video_identities.needs_rebuild(self.store.db) and not self.device.status().get('active')
+                    and self.recluster_job.status()['status'] not in {'running', 'stopped', 'error'}):
+                self.recluster_job.start()
             groups = [self.without(group, masked) for group in self.store.groups()]
             groups = [group for group in groups if group['face_ids']]
             # Скрытый альбом — решение владельца картотеки, не приватность
@@ -2595,7 +2447,9 @@ class Handler(BaseHTTPRequestHandler):
                 path = query.get('path', [''])[0]
                 with self.app.lock:
                     count = self.app.store.video_people_hint(path)
-                return self.json_response({'path': path, 'count': count})
+                    import video_identities
+                    diagnostic = video_identities.hint_status(self.app.store.db, path, count)
+                return self.json_response({'path': path, 'count': count, **diagnostic})
             if parsed.path == '/api/folders':
                 query = parse_qs(parsed.query)
                 path = query.get('path', [''])[0]

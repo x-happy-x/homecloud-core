@@ -76,6 +76,9 @@ DEFAULTS = {
     'highlights_require_adult_check': True,
 }
 
+from video_identities import DEFAULTS as IDENTITY_DEFAULTS
+DEFAULTS.update(IDENTITY_DEFAULTS)
+
 LIMITS = {
     'video_track_step': (0.1, 5.0),
     'video_track_gap': (0.3, 10.0),
@@ -92,6 +95,11 @@ LIMITS = {
     'face_blur_threshold': (0.5, 1.0),
     'face_min_size': (0, 200),
 }
+
+LIMITS.update({key: (0.0, 1.0) for key in IDENTITY_DEFAULTS})
+LIMITS.update({'identity_min_size': (1., 512.), 'identity_core_samples': (2, 5),
+               'identity_sample_spacing': (.1, 5.), 'identity_representatives': (2, 5),
+               'identity_pair_count': (2, 3), 'identity_temporal_gap': (0., 5.)})
 
 CHOICES = {
     'caption_backend': ('local', 'lmstudio'),
@@ -178,6 +186,10 @@ def write(db, changes):
                 'ON CONFLICT(key) DO UPDATE SET value=excluded.value,changed=excluded.changed',
                 [(key, json.dumps(value, ensure_ascii=False), time.time())
                  for key, value in known.items()])
+            if any(key.startswith('identity_') for key in known) and db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='identity_state'").fetchone():
+                from video_identities import mark_dirty
+                mark_dirty(db)
     return read(db)
 
 
