@@ -272,6 +272,24 @@ class Driver:
             return False
 
 
+def is_junction(item):
+    """Папка-junction Windows: is_symlink() её не видит (до Python 3.12).
+
+    В старых профилях «Application Data» — junction на свою же папку, и обход
+    по ней уходит в бесконечную петлю. Облачные заглушки OneDrive тоже
+    reparse point, но цели у них нет — их не пропускаем.
+    """
+    if os.name != 'nt':
+        return False
+    try:
+        if not item.stat(follow_symlinks=False).st_file_attributes & 0x400:  # REPARSE_POINT
+            return False
+        os.readlink(item.path)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 class LocalDriver(Driver):
     """Обычная файловая система этой машины: свой диск ядра или папка хаба."""
     kind = 'local'
@@ -306,7 +324,7 @@ class LocalDriver(Driver):
             with os.scandir(native) as items:
                 for item in items:
                     try:
-                        if item.is_symlink():
+                        if item.is_symlink() or is_junction(item):
                             continue
                         is_dir = item.is_dir()
                         info = item.stat()
