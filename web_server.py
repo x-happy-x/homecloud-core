@@ -32,6 +32,7 @@ import catalogdb
 import people_albums
 import catalog_index
 import duplicates
+import envs
 import face_quality
 import face_stacks
 import highlight_generator
@@ -301,7 +302,7 @@ class SemanticService:
         self.root = Path(__file__).resolve().parent
         self.catalog = Path(catalog).resolve()
         # Same venv as vision_python in device_job.py.
-        self.python = self.root / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
+        self.python = envs.python('vision-venv', self.root)
         self.process = None
         self.model = None
         self.lock = threading.RLock()
@@ -367,7 +368,7 @@ class RouterController:
         self.root = Path(__file__).resolve().parent
         self.catalog = Path(catalog).resolve()
         # Same venv as vision_python in device_job.py.
-        self.python = self.root / 'work' / 'vision-venv' / 'Scripts' / 'python.exe'
+        self.python = envs.python('vision-venv', self.root)
         self.progress_file = self.catalog / 'router-progress.json'
         self.stop_file = self.catalog / 'router-stop.request'
         self.process = None
@@ -408,7 +409,7 @@ class RouterController:
                     raise ValueError('Неизвестный разметчик')
                 scope = 'reviewed' if options.get('scope') == 'reviewed' else 'queue'
                 count = max(1, min(int(options.get('count') or 20), 5000))
-                python = self.root / 'work' / router_taggers.ENGINES[engine]['venv'] / 'Scripts' / 'python.exe'
+                python = envs.python(router_taggers.ENGINES[engine]['venv'], self.root)
                 if not python.is_file():
                     raise ValueError(f'Нет окружения {python.parent.parent.name}')
                 command = [str(self.root / 'router_taggers.py'), engine, '--scope', scope,
@@ -601,7 +602,7 @@ class DeviceController:
             return False
 
     def info(self):
-        worker_root = self.root / 'work'
+        worker_root = envs.worker_root(self.root)
         vision = worker_root / 'vision-venv' / 'Scripts' / 'python.exe'
         audio = worker_root / 'audio-venv' / 'Scripts' / 'python.exe'
         imgutils = worker_root / 'imgutils-venv' / 'Scripts' / 'python.exe'

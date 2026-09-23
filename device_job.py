@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 
+import envs
 import hublink
 import pathkeys
 import pathrules
@@ -307,7 +308,7 @@ def run(args):
             return
 
     here = Path(__file__).resolve().parent
-    worker_root = here / 'work'
+    worker_root = envs.worker_root(here)
     face_python = Path(sys.executable)
     vision_python = worker_root / 'vision-venv' / 'Scripts' / 'python.exe'
     ocr_python = Path(r'C:\cv-ocr\Scripts\python.exe')

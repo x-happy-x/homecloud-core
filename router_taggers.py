@@ -18,6 +18,7 @@ from pathlib import Path
 import sys
 import time
 
+import envs
 import router_learning
 import settings as catalog_settings
 
@@ -366,7 +367,7 @@ def overview(catalog, root):
         source, version = router_learning.prediction_source(db, embedding_model)
         result = []
         for engine, meta in ENGINES.items():
-            python = Path(root) / 'work' / meta['venv'] / 'Scripts' / 'python.exe'
+            python = envs.python(meta['venv'], root)
             if engine == 'ram_plus':
                 ready = python.is_file() and ram_available()
                 note = 'Готовая модель распознавания: 4585 тегов, из них собраны наши метки.'
