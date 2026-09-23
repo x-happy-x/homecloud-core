@@ -36,7 +36,7 @@ if (!(Test-Path -LiteralPath $IdentityFile)) { throw "Нет ключа $Identit
 $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 
 if (!$SkipTests) {
-    & $python -m unittest test_pathkeys test_hub test_envs
+    & $python -m unittest test_pathkeys test_hub test_envs test_components
     if ($LASTEXITCODE -ne 0) { throw 'Тесты не прошли' }
 }
 

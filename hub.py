@@ -387,6 +387,39 @@ class Hub:
             raise RuntimeError(detail or f"{core['name']} недоступно: {exc}") from exc
         return payload if raw else json.loads(payload or b'{}')
 
+    def components(self, core):
+        """Окружения и модели ядра; у каждой модели — на каких ещё ядрах в сети она есть."""
+        result = self.core_call(core, '/api/core/components', timeout=60)
+        peers = {}
+        for other in self.cores.load():
+            if other['id'] == core['id'] or not self.core_status(other['id'], max_age=30).get('online'):
+                continue
+            try:
+                data = self.core_call(other, '/api/core/components', timeout=60)
+            except RuntimeError:
+                continue
+            for item in data.get('models', []):
+                if item.get('installed'):
+                    peers.setdefault(item['id'], []).append({'id': other['id'],
+                                                             'name': other['name']})
+        for item in result.get('models', []):
+            item['peers'] = peers.get(item['id'], [])
+        return result
+
+    def start_component(self, core, body):
+        """Установка окружения, загрузка модели или её копия с другого ядра (from)."""
+        action = str(body.get('action') or '')
+        payload = {'id': str(body.get('id') or ''), 'action': action}
+        if action == 'copy':
+            source = self.cores.get(str(body.get('from') or ''))
+            if source is None or source['id'] == core['id']:
+                raise ValueError('Не выбрано ядро, с которого копировать')
+            # Пропуск только на чтение моделей: свой токен ядро-источник не отдаёт.
+            ticket = self.core_call(source, '/api/core/components/ticket', 'POST', {})['ticket']
+            payload['peer'] = {'url': f"http://{source['host']}:{source['port']}",
+                               'ticket': ticket}
+        return self.core_call(core, '/api/core/components/start', 'POST', payload, timeout=30)
+
     def core_status(self, core_id, max_age=2.0):
         with self.status_lock:
             cached = self.status_cache.get(core_id)
@@ -1257,6 +1290,12 @@ class HubApi:
             return Installer.start(hub, core, str(body.get('action') or 'update'))
         if action == 'start' and method == 'POST':
             return Installer.start(hub, core, 'start')
+        if action == 'components' and method == 'GET':
+            return hub.components(core)
+        if action == 'components/start' and method == 'POST':
+            return hub.start_component(core, body)
+        if action == 'components/stop' and method == 'POST':
+            return hub.core_call(core, '/api/core/components/stop', 'POST', {})
         if action == 'job/start' and method == 'POST':
             job = self.app.device.start(body.get('roots', []), body.get('features', {}),
                                         body.get('paths', []), force=bool(body.get('force')),

@@ -44,7 +44,11 @@ def python(venv, root=ROOT):
 def models_root(root=ROOT):
     """Кэш моделей: models/cv-models ядра, иначе общий C:/cv-models (без прохода по ссылке)."""
     own = real(Path(root) / 'models') / 'cv-models'
-    return own if own.is_dir() else real(SHARED_MODELS)
+    if own.is_dir():
+        return own
+    shared = real(SHARED_MODELS)
+    # На новом ядре общей папки нет — модели ложатся в его собственную.
+    return shared if shared.is_dir() else own
 
 
 def hf_home(root=ROOT):
@@ -52,5 +56,7 @@ def hf_home(root=ROOT):
     return models_root(root) / 'huggingface'
 
 
-def ocr_python():
-    return real(SHARED_OCR) / 'Scripts' / 'python.exe'
+def ocr_python(root=ROOT):
+    """OCR: прежний общий C:/cv-ocr, а если его нет — work/cv-ocr ядра (туда его ставит components)."""
+    shared = real(SHARED_OCR) / 'Scripts' / 'python.exe'
+    return shared if shared.is_file() else worker_root(root) / 'cv-ocr' / 'Scripts' / 'python.exe'
