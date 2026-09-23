@@ -10,6 +10,8 @@ import time
 
 import numpy as np
 
+import catalogdb
+import pathkeys
 import video as video_media
 
 
@@ -27,7 +29,7 @@ CONTENT_LABELS = {
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=30)
+    db = catalogdb.connect(catalog, timeout=30)
     db.execute('PRAGMA foreign_keys=ON')
     db.executescript('''
         CREATE TABLE IF NOT EXISTS photo_analysis (
@@ -216,19 +218,8 @@ def classify_embeddings(torch, processor, model, images):
 def analyze(args):
     catalog = args.catalog.resolve()
     db = connect(catalog)
-    root_sql = ''
-    root_values = []
-    scope = []
-    if args.root:
-        for root in args.root:
-            value = str(root.resolve()).rstrip('\\/')
-            scope.append('(photos.path=? OR photos.path LIKE ?)')
-            root_values.extend((value, value + os.sep + '%'))
-    for path in args.path:
-        scope.append('photos.path=?')
-        root_values.append(str(path.resolve()))
-    if scope:
-        root_sql = ' AND (' + ' OR '.join(scope) + ')'
+    # Папки и снимки задания — ключи источников (см. pathkeys.py).
+    root_sql, root_values = pathkeys.scope_sql(args.root, args.path, 'photos.path')
     # Пересчитываем только новое и изменившееся: снимок версии файла — размер и mtime.
     fresh_sql = '' if args.force else '''
         AND (selected_embedding.path IS NULL OR selected_embedding.size != photos.size OR
@@ -414,8 +405,8 @@ def main():
                                 help='Пересчитать даже то, что уже посчитано')
     analyze_parser.add_argument('--progress-file', type=Path)
     analyze_parser.add_argument('--stop-file', type=Path)
-    analyze_parser.add_argument('--root', action='append', type=Path, default=[])
-    analyze_parser.add_argument('--path', action='append', type=Path, default=[])
+    analyze_parser.add_argument('--root', action='append', type=str, default=[])
+    analyze_parser.add_argument('--path', action='append', type=str, default=[])
     analyze_parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
                                 help='Считать снимки, ролики или всё сразу')
     query_parser = sub.add_parser('query')

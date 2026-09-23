@@ -99,7 +99,8 @@ LIMITS = {
 LIMITS.update({key: (0.0, 1.0) for key in IDENTITY_DEFAULTS})
 LIMITS.update({'identity_min_size': (1., 512.), 'identity_core_samples': (2, 5),
                'identity_sample_spacing': (.1, 5.), 'identity_representatives': (2, 5),
-               'identity_pair_count': (2, 3), 'identity_temporal_gap': (0., 5.)})
+               'identity_pair_count': (2, 3), 'identity_temporal_gap': (0., 5.),
+               'identity_profile_years': (1, 10), 'identity_profile_min_size': (1., 512.)})
 
 CHOICES = {
     'caption_backend': ('local', 'lmstudio'),
@@ -128,8 +129,13 @@ def visual_models(cache=r'C:\cv-models\huggingface'):
     result = []
     for item in VISUAL_MODELS:
         folder = root / ('models--' + item['id'].replace('/', '--')) / 'snapshots'
-        weights = list(folder.glob('*/model.safetensors')) if folder.is_dir() else []
-        installed = any(path.stat().st_size == item['bytes'] for path in weights)
+        try:
+            weights = list(folder.glob('*/model.safetensors')) if folder.is_dir() else []
+            installed = any(path.stat().st_size == item['bytes'] for path in weights)
+        except OSError:
+            # Capability probing must not make /api/device fail when Windows rejects
+            # traversal through a reparse point or a temporarily unavailable drive.
+            installed = False
         result.append({key: value for key, value in item.items() if key != 'bytes'} |
                       {'installed': installed})
     return result
@@ -189,7 +195,7 @@ def write(db, changes):
             if any(key.startswith('identity_') for key in known) and db.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='identity_state'").fetchone():
                 from video_identities import mark_dirty
-                mark_dirty(db)
+                mark_dirty(db, 'settings')
     return read(db)
 
 
@@ -198,7 +204,8 @@ def load(catalog):
     from pathlib import Path
     folder = Path(catalog)
     folder.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(folder / 'catalog.sqlite', timeout=30)
+    import catalogdb
+    db = catalogdb.connect(folder, timeout=30)
     try:
         return read(db)
     finally:

@@ -7,8 +7,11 @@
 `D:\\trash\\Apps\\Наши снимки` — нужен.
 """
 import fnmatch
+import re
 
 SEPARATORS = ('\\', '/')
+# Ключ источника (см. pathkeys.py): id не короче двух символов, потом двоеточие.
+_SOURCE = re.compile(r'^[a-z0-9][a-z0-9_-]{1,31}:')
 
 
 def _lines(raw):
@@ -31,6 +34,10 @@ def prepare(values):
 
 
 def _matches(path, rule):
+    # Ключ источника: правило без источника («D:/Игры») действует на путь
+    # внутри любого источника, с источником («pc-x:d:/игры») — только на свой.
+    if _SOURCE.match(path) and not _SOURCE.match(rule):
+        path = path.split(':', 1)[1]
     if '*' in rule or '?' in rule or '[' in rule:
         return fnmatch.fnmatchcase(path, rule)
     # Без масок правило — это сама папка и всё, что внутри неё.
@@ -51,6 +58,10 @@ def filter_paths(paths, block, allow=()):
     return [path for path in paths if not blocked(path, block, allow)]
 
 
+def _native(value):
+    return value.split(':', 1)[1] if _SOURCE.match(value) else value
+
+
 def enter(path, block=(), allow=()):
     """Стоит ли обходу заходить в эту папку.
 
@@ -61,7 +72,10 @@ def enter(path, block=(), allow=()):
     if not blocked(path, block, allow):
         return True
     target = normalize(path)
-    return any(rule == target or rule.startswith(target + '/') for rule in allow)
+    native = _native(target)
+    return any(rule == target or rule.startswith(target + '/')
+               or (not _SOURCE.match(rule) and (rule == native or rule.startswith(native + '/')))
+               for rule in allow)
 
 
 def ensure_column(db):

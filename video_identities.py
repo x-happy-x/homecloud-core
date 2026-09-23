@@ -12,7 +12,7 @@ import sqlite3
 
 import numpy as np
 
-VERSION = 2
+VERSION = 6
 DEFAULTS = {
     'identity_min_size': 32.0, 'identity_min_confidence': 0.8,
     'identity_max_blur': 0.76, 'identity_min_quality': 0.40,
@@ -24,6 +24,9 @@ DEFAULTS = {
     'identity_tracking_threshold': 0.35,
     'identity_temporal_bonus': 0.02, 'identity_temporal_gap': 1.2,
     'identity_temporal_iou': 0.3,
+    'identity_profile_years': 3, 'identity_profile_min_size': 48.0,
+    'identity_profile_max_blur': 0.68, 'identity_child_margin': 0.14,
+    'identity_group_floor': 0.55,
 }
 
 
@@ -124,12 +127,31 @@ def ensure_schema(db):
           identity_id INTEGER REFERENCES video_identities(id),
           status TEXT NOT NULL, score REAL, reason TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS identity_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS video_people_hints (
+          path TEXT PRIMARY KEY REFERENCES photos(path) ON DELETE CASCADE,
+          count INTEGER NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS face_identity_conflicts (
+          face_a INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+          face_b INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'manual-split',
+          history_id INTEGER, PRIMARY KEY(face_a,face_b), CHECK(face_a < face_b));
+        CREATE TABLE IF NOT EXISTS person_age_profiles (
+          person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+          period_start INTEGER NOT NULL, period_end INTEGER NOT NULL,
+          center BLOB NOT NULL, samples INTEGER NOT NULL,
+          age_sensitive INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+          PRIMARY KEY(person_id,period_start));
     ''')
     columns = {r[1] for r in db.execute('PRAGMA table_info(face_people)')}
     for name, declaration in [('source', "TEXT NOT NULL DEFAULT 'human'"),
                               ('score', 'REAL'), ('version', 'INTEGER')]:
         if name not in columns:
             db.execute(f'ALTER TABLE face_people ADD COLUMN {name} {declaration}')
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='face_quality'").fetchone():
+        quality_columns = {r[1] for r in db.execute('PRAGMA table_info(face_quality)')}
+        for name in ('confidence', 'geometry'):
+            if name not in quality_columns:
+                db.execute(f'ALTER TABLE face_quality ADD COLUMN {name} REAL')
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='face_clusters'").fetchone():
         db.execute("INSERT OR IGNORE INTO identity_state(key,value) SELECT 'highest_label',COALESCE(MAX(label),-1) FROM face_clusters")
     db.commit()
@@ -194,7 +216,7 @@ def load_tracks(db, options=None):
     return tracks
 
 
-def conflicts(tracks):
+def conflicts(tracks, db=None):
     moments, pairs = defaultdict(list), set()
     for fid, track in tracks.items():
         for moment in track['moments']:
@@ -203,6 +225,24 @@ def conflicts(tracks):
         for i, a in enumerate(members):
             for b in members[i + 1:]:
                 pairs.add(tuple(sorted((a, b))))
+    if db is not None:
+        ids = set(tracks)
+        pairs.update((a, b) for a, b in db.execute(
+            'SELECT face_a,face_b FROM face_identity_conflicts') if a in ids and b in ids)
+    return pairs
+
+
+def catalog_conflicts(db, tracks):
+    """Hard negatives from time overlap, manual splits and one still image."""
+    pairs = conflicts(tracks)
+    pairs.update(db.execute('SELECT face_a,face_b FROM face_identity_conflicts'))
+    by_path = defaultdict(list)
+    for fid, path in db.execute('''SELECT f.id,f.path FROM faces f JOIN photos p ON p.path=f.path
+                                   WHERE COALESCE(p.kind,'photo')!='video' '''):
+        by_path[path].append(fid)
+    for ids in by_path.values():
+        for index, a in enumerate(ids):
+            pairs.update(tuple(sorted((a, b))) for b in ids[index + 1:])
     return pairs
 
 
@@ -349,10 +389,119 @@ def diverse_bank(samples, options=None):
     return bank
 
 
-def prototype_banks(db, tracks, options=None, exclude_path=None):
+def prototype_score(candidate, prototypes, options=None):
+    """Match against several independently confirmed views of a person."""
+    if not candidate or not prototypes:
+        return -1., 0
+    if len(candidate) > 1:
+        return bank_score(candidate, prototypes, options)
+    scores = sorted((float(candidate[0] @ vector) for vector in prototypes), reverse=True)
+    support = min(3, len(scores))
+    return float(np.mean(scores[:support])), support
+
+
+def consolidate(identities, tracks, cannot, options=None, target=None):
+    """Recover fragments using multi-view evidence without crossing hard negatives."""
+    p = {**DEFAULTS, **(options or {})}
+    groups = list(identities)
+    while target is None or len(groups) > target:
+        candidates = []
+        for left in range(len(groups)):
+            for right in range(left + 1, len(groups)):
+                a, b = groups[left], groups[right]
+                if a['path'] != b['path'] or incompatible(a['members'], b['members'], tracks, cannot):
+                    continue
+                # Multi-view evidence may forgive one mediocre pair, but never
+                # bridge two groups through a clearly different appearance.
+                floor = p['identity_stitch_threshold'] - p['identity_margin']
+                if any(bank_score(tracks[x]['match_bank'], tracks[y]['match_bank'], p)[0] < floor
+                       for x in a['core'] for y in b['core']):
+                    continue
+                score, support = bank_score(a['bank'], b['bank'], p)
+                threshold = p['identity_attach_threshold'] if support >= 2 else p['identity_single_threshold']
+                if score >= threshold:
+                    candidates.append((score, left, right))
+        if not candidates:
+            break
+        _, left, right = max(candidates, key=lambda item: (item[0], -item[1], -item[2]))
+        a, b = groups[left], groups[right]
+        core = a['core'] | b['core']
+        samples = [(sample['quality'], sample['embedding']) for fid in sorted(core)
+                   for sample in tracks[fid]['samples'] if sample['reliable']]
+        a.update(core=core, members=a['members'] | b['members'],
+                 attachment={**a['attachment'], **b['attachment']},
+                 bank=diverse_bank(samples, p))
+        a['vector'] = unit(np.mean(a['bank'], axis=0))
+        groups.pop(right)
+    return groups
+
+
+def apply_people_hint(path, identities, face_ids, tracks, cannot, target, options=None):
+    """Assign weak fragments to `target` constrained identities when possible."""
+    p = {**DEFAULTS, **(options or {})}
+    result = list(identities)
+    buckets = [item['members'] for item in result] + [set() for _ in range(max(0, target-len(result)))]
+    degree = {fid: sum(tuple(sorted((fid, other))) in cannot for other in face_ids if other != fid)
+              for fid in face_ids}
+    for fid in sorted(face_ids, key=lambda item: (-degree[item], item)):
+        candidates = []
+        for index, members in enumerate(buckets):
+            if any(tuple(sorted((fid, other))) in cannot for other in members):
+                continue
+            if not members:
+                candidates.append((1, 0., -index, index)); continue
+            bank = [vector for other in members for vector in tracks[other]['match_bank']]
+            score, _ = bank_score(tracks[fid]['match_bank'], bank, p)
+            confident = score >= p['identity_tracking_threshold']
+            candidates.append((2 if confident else 0, score, -index, index))
+        if candidates:
+            _, chosen_score, _, index = max(candidates)
+        else:
+            index = len(buckets); buckets.append(set()); chosen_score = 0.
+        buckets[index].add(fid)
+        if index < len(result):
+            result[index]['attachment'][fid] = chosen_score
+    for members in buckets[len(result):]:
+        if not members:
+            continue
+        samples = [(sample['quality'], sample['embedding']) for fid in sorted(members)
+                   for sample in tracks[fid]['samples']]
+        bank = diverse_bank(samples, p)
+        if not bank:
+            bank = [vector for fid in sorted(members) for vector in tracks[fid]['match_bank']]
+        result.append({'path': path, 'core': set(members), 'members': set(members),
+                       'attachment': {}, 'bank': bank,
+                       'vector': unit(np.mean(bank, axis=0)), 'hinted': True})
+    return result
+
+
+def capture_years(db):
+    """Capture year from curation, falling back to the indexed file timestamp."""
+    curated = db.execute("SELECT 1 FROM sqlite_master WHERE name='photo_curation'").fetchone()
+    if curated:
+        rows = db.execute('''SELECT p.path,c.taken_ts,p.modified FROM photos p
+                             LEFT JOIN photo_curation c ON c.path=p.path''')
+    else:
+        rows = db.execute('SELECT path,NULL,modified FROM photos')
+    result = {}
+    for path, taken, modified in rows:
+        stamp = taken if taken is not None else (modified / 1e9 if modified else None)
+        if stamp:
+            try:
+                result[path] = datetime.fromtimestamp(stamp, timezone.utc).year
+            except (OSError, OverflowError, ValueError):
+                pass
+    return result
+
+
+def prototype_profiles(db, tracks, options=None, exclude_path=None, years=None):
+    """Several quality-only prototype banks per person and capture period."""
+    p = {**DEFAULTS, **(options or {})}
+    years = capture_years(db) if years is None else years
     samples = defaultdict(list)
     has_quality = db.execute("SELECT 1 FROM sqlite_master WHERE name='face_quality'").fetchone()
-    quality_rows = dict((r[0], r[1:]) for r in db.execute('SELECT face_id,blur,size FROM face_quality')) if has_quality else {}
+    quality_rows = dict((r[0], r[1:]) for r in db.execute(
+        'SELECT face_id,blur,size,confidence,geometry FROM face_quality')) if has_quality else {}
     for fid, person, path, blob, start, moment in db.execute('''
         SELECT f.id,fp.person_id,f.path,f.embedding,f.track_start,f.frame_time FROM faces f
         JOIN face_people fp ON fp.face_id=f.id AND fp.source='human'
@@ -362,17 +511,61 @@ def prototype_banks(db, tracks, options=None, exclude_path=None):
         WHERE e.face_id IS NULL AND p.status='ok' AND COALESCE(t.active,1)=1'''):
         if path == exclude_path:
             continue
+        width = max(1, int(p['identity_profile_years']))
+        year = years.get(path)
+        period = year - year % width if year is not None else 0
         if start is not None or moment is not None:
             if fid in tracks:
-                samples[person].extend((s['quality'], s['embedding']) for s in tracks[fid]['samples'] if s['reliable'])
+                samples[person, period].extend(
+                    (s['quality'], s['embedding']) for s in tracks[fid]['samples'] if s['reliable'])
         else:
-            blur, size = quality_rows.get(fid, (None, None))
-            p = {**DEFAULTS, **(options or {})}
+            blur, size, confidence, geometry = quality_rows.get(fid, (None, None, None, None))
             vector = unit(blob)
-            if (vector is not None and blur is not None and size is not None
-                    and blur < p['identity_max_blur'] and size >= p['identity_min_size']):
-                samples[person].append((1-blur, vector))
-    return {person: diverse_bank(items, options) for person, items in samples.items()}
+            # A manually named poor crop remains visible, but it must not teach
+            # the recognizer. Unknown legacy quality is accepted until measured.
+            if (vector is not None and (blur is None or blur < p['identity_profile_max_blur'])
+                    and (size is None or size >= p['identity_profile_min_size'])
+                    and (confidence is None or confidence >= p['identity_min_confidence'])
+                    and (geometry is None or geometry > 0)):
+                samples[person, period].append((1 - (blur if blur is not None else 0.), vector))
+    profiles = defaultdict(dict)
+    counts = defaultdict(dict)
+    for (person, period), items in samples.items():
+        profiles[person][period] = diverse_bank(items, p)
+        counts[person][period] = len(items)
+    result = {}
+    for person, periods in profiles.items():
+        centers = [unit(np.mean(bank, axis=0)) for period, bank in periods.items()
+                   if period and bank and counts[person][period] >= 2]
+        sensitive = len(centers) > 1 and min(float(a @ b) for i, a in enumerate(centers)
+                                             for b in centers[i + 1:]) < .86
+        result[person] = {'periods': periods, 'counts': counts[person],
+                          'age_sensitive': sensitive}
+    return result
+
+
+def profile_match(candidate, profiles, year, options=None):
+    """Compare to the nearest age period; return score, support and margin."""
+    p = {**DEFAULTS, **(options or {})}
+    scored = []
+    for person, profile in profiles.items():
+        periods = profile['periods']
+        if year is not None and periods:
+            nearest = min(periods, key=lambda start: abs(start - year) if start else 10_000)
+            bank = periods[nearest]
+        else:
+            bank = [vector for values in periods.values() for vector in values]
+        score, support = prototype_score(candidate, bank, p)
+        margin = p['identity_child_margin'] if profile['age_sensitive'] else p['identity_named_margin']
+        scored.append((score, support, margin, person))
+    return sorted(scored, key=lambda item: (-item[0], item[3]))
+
+
+def prototype_banks(db, tracks, options=None, exclude_path=None):
+    """Compatibility view used by diagnostics and older callers."""
+    profiles = prototype_profiles(db, tracks, options, exclude_path)
+    return {person: [vector for bank in profile['periods'].values() for vector in bank]
+            for person, profile in profiles.items()}
 
 
 def stable_labels(groups, old, highest):
@@ -389,6 +582,20 @@ def stable_labels(groups, old, highest):
         if index not in result:
             highest += 1; result[index] = highest
     return result, highest
+
+
+def split_photo_partition(partition, units, floor):
+    """Break density chains into internally compatible complete-link groups."""
+    refined = []
+    for index in partition:
+        for bucket in refined:
+            if all(float(units[index]['vector'] @ units[other]['vector']) >= floor
+                   for other in bucket):
+                bucket.append(index)
+                break
+        else:
+            refined.append([index])
+    return refined
 
 
 def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, scope='all'):
@@ -414,29 +621,48 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
                 eligible -= members
     tracks = {i:t for i,t in all_tracks.items() if i in eligible}
     identities, unresolved, cannot = stitch(tracks, p, debug, stop_check)
-    cannot = conflicts(all_tracks)
+    cannot = catalog_conflicts(db, all_tracks)
+    hints = dict(db.execute('SELECT path,count FROM video_people_hints'))
+    by_path = defaultdict(list)
+    for identity in identities:
+        by_path[identity['path']].append(identity)
+    identities = []
+    for path, local in sorted(by_path.items()):
+        identities.extend(consolidate(local, tracks, cannot, p, hints.get(path)))
+    unresolved = set(tracks) - set().union(*(item['members'] for item in identities)) if tracks else set()
+    for path, target in hints.items():
+        local = [item for item in identities if item['path'] == path]
+        weak = {fid for fid in unresolved if tracks[fid]['path'] == path}
+        if weak and len(local) < int(target):
+            adjusted = apply_people_hint(path, local, weak, tracks, cannot, int(target), p)
+            identities = [item for item in identities if item['path'] != path] + adjusted
+            unresolved -= set().union(*(item['members'] for item in adjusted))
     check()
     named = dict(db.execute("SELECT face_id,person_id FROM face_people WHERE source='human'"))
     occupied = {fid:person for fid,person in db.execute('SELECT face_id,person_id FROM face_people') if fid not in eligible}
     auto_names = {}
+    years = capture_years(db)
+    named_paths = {row[0] for row in db.execute('''SELECT DISTINCT f.path FROM faces f
+        JOIN face_people fp ON fp.face_id=f.id AND fp.source='human' ''')}
+    global_profiles = prototype_profiles(db, all_tracks, p, years=years)
     # Leave-one-video-out prototypes prevent self-confirmation of a video.
-    current_path, banks = None, {}
+    current_path, profiles = None, {}
     for ident in identities:
         check()
         path = ident['path']
         if path != current_path:
-            banks = prototype_banks(db, all_tracks, p, exclude_path=path)
+            profiles = (prototype_profiles(db, all_tracks, p, exclude_path=path, years=years)
+                        if path in named_paths else global_profiles)
             current_path = path
         manual = {named[i] for i in ident['members'] if i in named}
-        scores = sorted([(bank_score(ident['bank'], bank, p)[0], person)
-                         for person, bank in banks.items()], key=lambda x: (-x[0], x[1]))
+        scores = profile_match(ident['bank'], profiles, years.get(path), p)
         person, confidence = None, 0.
         if len(manual) == 1:
             person, confidence = next(iter(manual)), 1.
         elif scores:
-            confidence, candidate = scores[0]
+            confidence, _support, margin, candidate = scores[0]
             runner = scores[1][0] if len(scores) > 1 else -1.
-            if confidence >= p['identity_named_threshold'] and confidence-runner >= p['identity_named_margin']:
+            if confidence >= p['identity_named_threshold'] and confidence-runner >= margin:
                 person = candidate
         if person is not None:
             others = {i for i, name in {**occupied, **named, **{k:v[0] for k,v in auto_names.items()}}.items() if name == person}
@@ -452,7 +678,8 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
     quality_rows = {}
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='face_quality'").fetchone():
         quality_rows = {r[0]: r[1:] for r in db.execute('SELECT face_id,blur,size FROM face_quality')}
-    for fid, blob in db.execute('''SELECT f.id,f.embedding FROM faces f
+    photo_profiles = {}
+    for fid, path, blob in db.execute('''SELECT f.id,f.path,f.embedding FROM faces f
         LEFT JOIN face_exclusions e ON e.face_id=f.id JOIN photos p ON p.path=f.path
         LEFT JOIN face_track_data t ON t.face_id=f.id
         WHERE f.track_start IS NULL AND f.frame_time IS NULL AND e.face_id IS NULL
@@ -463,7 +690,24 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
         vector = unit(blob)
         if vector is None or (blur is not None and blur >= p.get('face_blur_threshold', .76)) or (size is not None and size < p.get('face_min_size',20)):
             continue
-        units.append({'members': {fid}, 'vector': vector, 'identity': None, 'person': named.get(fid)})
+        person = named.get(fid)
+        confidence = 1. if person is not None else 0.
+        if person is None:
+            profiles = (photo_profiles.setdefault(path, prototype_profiles(
+                     db, all_tracks, p, exclude_path=path, years=years))
+                     if path in named_paths else global_profiles)
+            scores = profile_match([vector], profiles, years.get(path), p)
+            if scores:
+                confidence, support, margin, candidate = scores[0]
+                runner = scores[1][0] if len(scores) > 1 else -1.
+                if (support >= 2 and confidence >= p['identity_named_threshold']
+                        and confidence - runner >= margin):
+                    owners = {**occupied, **named, **{k:v[0] for k,v in auto_names.items()}}
+                    others = {i for i, owner in owners.items() if owner == candidate}
+                    if not any(tuple(sorted((fid, other))) in cannot for other in others):
+                        person = candidate
+                        auto_names[fid] = (candidate, confidence)
+        units.append({'members': {fid}, 'vector': vector, 'identity': None, 'person': person})
     labels = [-1] * len(units)
     if len(units) >= 2:
         # The photo-only minimum is applied after constraints. Two video units
@@ -506,8 +750,15 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
             else:
                 partitions.append([index])
         for partition in partitions:
-            if any(units[i]['identity'] for i in partition) or len(partition) >= min_cluster_size:
-                groups.append(set().union(*(units[i]['members'] for i in partition)))
+            refined = [partition]
+            if not any(units[i]['identity'] for i in partition):
+                # Density clustering can connect two people through a chain of
+                # mediocre faces. Re-split with complete support so every face
+                # in an automatic group remains compatible with every other.
+                refined = split_photo_partition(partition, units, p['identity_group_floor'])
+            for bucket in refined:
+                if any(units[i]['identity'] for i in bucket) or len(bucket) >= min_cluster_size:
+                    groups.append(set().union(*(units[i]['members'] for i in bucket)))
     old = dict(db.execute('SELECT face_id,label FROM face_clusters'))
     state = dict(db.execute('SELECT key,value FROM identity_state'))
     mapping, highest = stable_labels(groups, old, max(int(state.get('highest_label', '-1')), max(old.values(), default=-1)))
@@ -520,7 +771,8 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
                   for i,t in sorted(tracks.items())]},sort_keys=True).encode()).hexdigest()
     return {'identities': identities, 'unresolved': unresolved, 'assignments': assignments,
             'names': auto_names, 'highest': highest, 'fingerprint': fingerprint,
-            'tracks': tracks, 'cannot': cannot, 'scope': scope}
+            'tracks': tracks, 'cannot': cannot, 'scope': scope,
+            'profiles': global_profiles, 'profile_years': int(p['identity_profile_years'])}
 
 
 def publish(db, result, data_version):
@@ -558,7 +810,20 @@ def publish(db, result, data_version):
         db.execute('DELETE FROM face_clusters WHERE face_id IN (SELECT id FROM identity_publish_ids)')
         db.executemany('INSERT INTO face_clusters VALUES(?,?,?,?,?)',
                        [(fid,label,score,method,now) for fid,(label,score,method) in result['assignments'].items()])
+        db.execute('DELETE FROM person_age_profiles')
+        profile_rows = []
+        for person, profile in result['profiles'].items():
+            for period, bank in profile['periods'].items():
+                if not bank:
+                    continue
+                center = unit(np.mean(bank, axis=0))
+                profile_rows.append((person, period,
+                    period + result['profile_years'] - 1 if period else 0,
+                    center.tobytes(), profile['counts'][period],
+                    int(profile['age_sensitive']), now))
+        db.executemany('INSERT INTO person_age_profiles VALUES(?,?,?,?,?,?,?)', profile_rows)
         db.execute("INSERT OR REPLACE INTO identity_state VALUES('highest_label',?)", (str(result['highest']),))
+        db.execute("INSERT OR REPLACE INTO identity_state VALUES('algorithm_version',?)", (str(VERSION),))
         if result['scope'] == 'all':
             db.execute("INSERT OR REPLACE INTO identity_state VALUES('dirty','0')")
         db.commit()
@@ -576,13 +841,23 @@ def rebuild(db, options=None, min_cluster_size=8, stop_check=None, scope='all'):
     return result
 
 
-def mark_dirty(db):
-    db.execute("INSERT OR REPLACE INTO identity_state VALUES('dirty','1')")
+def mark_dirty(db, reason='manual'):
+    """Пометить идентичности устаревшими и сохранить причину изменения."""
+    db.execute("INSERT OR REPLACE INTO identity_state VALUES('dirty',?)", (reason,))
 
 
 def needs_rebuild(db):
     dirty = db.execute("SELECT value FROM identity_state WHERE key='dirty'").fetchone()
-    return bool(dirty and dirty[0] == '1')
+    version = db.execute("SELECT value FROM identity_state WHERE key='algorithm_version'").fetchone()
+    return bool((dirty and dirty[0] != '0') or not version or version[0] != str(VERSION))
+
+
+def needs_auto_rebuild(db):
+    """Автозапуск разрешён после сканирования или изменения алгоритма."""
+    dirty = db.execute("SELECT value FROM identity_state WHERE key='dirty'").fetchone()
+    version = db.execute("SELECT value FROM identity_state WHERE key='algorithm_version'").fetchone()
+    return bool((dirty and dirty[0] in {'scan', 'settings'})
+                or not version or version[0] != str(VERSION))
 
 
 def hint_status(db, path, count):

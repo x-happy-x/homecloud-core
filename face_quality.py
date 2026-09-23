@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
+import catalogfiles
+
 # Поменялся расчёт — подними версию, и оценки пересчитаются по миниатюрам.
 VERSION = 1
 BLUR_THRESHOLD = 0.76
@@ -41,6 +43,10 @@ def ensure_schema(db):
           blur REAL, size REAL,
           keep INTEGER NOT NULL DEFAULT 0,
           version INTEGER NOT NULL, computed_at TEXT NOT NULL)''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(face_quality)')}
+    for name in ('confidence', 'geometry'):
+        if name not in columns:
+            db.execute(f'ALTER TABLE face_quality ADD COLUMN {name} REAL')
     db.commit()
 
 
@@ -98,6 +104,14 @@ def read_thumbnail(path):
     return cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
 
 
+def thumbnail_file(folder, thumbnail):
+    """Миниатюра лица на этой машине: у ядра она может лежать только на хабе."""
+    try:
+        return catalogfiles.fetch(folder, thumbnail)
+    except Exception:
+        return Path(folder) / thumbnail
+
+
 def box_size(raw_box):
     """Меньшая сторона рамки лица на оригинале, в точках."""
     try:
@@ -142,7 +156,7 @@ def measure(db, folder, face_ids=None):
     for face_id, raw_box, thumbnail in rows:
         blur = None
         if thumbnail:
-            image = read_thumbnail(folder / thumbnail)
+            image = read_thumbnail(thumbnail_file(folder, thumbnail))
             if image is not None:
                 blur = face_blur(image)
         found.append((face_id, None if blur is None else round(blur, 4),

@@ -10,6 +10,10 @@ import sqlite3
 import time
 from pathlib import Path
 
+import catalogdb
+import pathkeys
+import sources
+
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS photo_hashes (
   path TEXT PRIMARY KEY,
@@ -34,14 +38,14 @@ def ensure_schema(db):
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=60)
+    db = catalogdb.connect(catalog, timeout=60)
     ensure_schema(db)
     return db
 
 
 def file_sha1(path):
     digest = hashlib.sha1()
-    with Path(path).open('rb') as stream:
+    with open(path, 'rb') as stream:
         while True:
             chunk = stream.read(CHUNK)
             if not chunk:
@@ -98,8 +102,9 @@ def compute(db, rows, similar, progress=None, stop=None, disk=None):
     for path, size, modified in rows:
         if stop and stop():
             break
-        target = Path((disk or {}).get(path, path))
         try:
+            # Ключ источника — в файл на этой машине (свой диск, UNC или копия).
+            target = Path(sources.local((disk or {}).get(path, path)))
             if not target.is_file():
                 raise OSError('файл не найден')
             sha1 = file_sha1(target)
@@ -260,7 +265,7 @@ def index(found, shapes, folder=""):
 
 def parent(path):
     """Папка файла ровно в том виде, в каком её считает сводка."""
-    return str(Path(path).parent)
+    return pathkeys.parent(path)
 
 
 def in_folder(group, folder):

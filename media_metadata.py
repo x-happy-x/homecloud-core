@@ -436,8 +436,8 @@ def _result(groups, coords):
 
 
 def read(path):
-    """Метаданные по виду файла."""
-    path = Path(path)
+    """Метаданные по виду файла. Ключ источника превращается в файл на этой машине."""
+    path = Path(video_media.local(path))
     if not path.is_file():
         raise FileNotFoundError('Файл не найден на диске')
     if video_media.is_video(str(path)):

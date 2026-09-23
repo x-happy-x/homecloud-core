@@ -33,6 +33,8 @@ import time
 
 from PIL import Image, ImageOps
 
+import catalogdb
+import pathkeys
 import video as video_media
 
 DEFAULT_MODEL = 'mobilenetv3_v1.4_dist'
@@ -43,7 +45,7 @@ ANIME_THRESHOLD = 0.85
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=30)
+    db = catalogdb.connect(catalog, timeout=30)
     db.execute('PRAGMA foreign_keys=ON')
     db.executescript('''
         CREATE TABLE IF NOT EXISTS face_authenticity (
@@ -78,15 +80,7 @@ def progress(path, **state):
 
 def scope_sql(roots, paths, column='path'):
     """Условие «только выбранные папки и файлы» — как в остальных этапах."""
-    clauses, values = [], []
-    for root in roots:
-        value = str(Path(root).resolve()).rstrip('\\/')
-        clauses.append(f'({column}=? OR {column} LIKE ?)')
-        values.extend((value, value + os.sep + '%'))
-    for path in paths:
-        clauses.append(f'{column}=?')
-        values.append(str(Path(path).resolve()))
-    return (' AND (' + ' OR '.join(clauses) + ')' if clauses else ''), values
+    return pathkeys.scope_sql(roots, paths, column)
 
 
 def pending(db, args):
@@ -104,7 +98,7 @@ def pending(db, args):
 
 def wide_crop(path, box_json, frame_time, margin=0.4):
     """Кроп вокруг лица с запасом — на тесной обрезке модель путается."""
-    path = Path(path)
+    path = Path(video_media.local(path))
     if not path.is_file():
         return None
     if video_media.is_video(path):
@@ -139,8 +133,8 @@ def main():
     parser.add_argument('--model', default=DEFAULT_MODEL)
     parser.add_argument('--progress-file', type=Path)
     parser.add_argument('--stop-file', type=Path)
-    parser.add_argument('--root', action='append', type=Path, default=[])
-    parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--root', action='append', type=str, default=[])
+    parser.add_argument('--path', action='append', type=str, default=[])
     parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
                         help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--force', action='store_true',

@@ -34,6 +34,10 @@ import time
 
 import numpy as np
 
+import catalogdb
+import pathkeys
+import sources
+
 # Поменять формулу оценки — поднять SCORE_VERSION (файлы не перечитываются).
 # Поменять то, что достаётся из самого файла, — поднять FILE_VERSION.
 SCORE_VERSION = 2
@@ -109,7 +113,7 @@ SAFE_RATINGS = ('safe', 'unknown')
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=60)
+    db = catalogdb.connect(catalog, timeout=60)
     ensure_schema(db)
     return db
 
@@ -527,15 +531,7 @@ def signature(row, prompts_stamp):
 
 def candidates(db, roots=(), paths=(), limit=None):
     """Снимки с готовым визуальным анализом — только у них есть тип и эмбеддинг."""
-    scope, values = [], []
-    for root in roots:
-        value = str(Path(root).resolve()).rstrip('\\/')
-        scope.append('(photos.path=? OR photos.path LIKE ?)')
-        values.extend((value, value + os.sep + '%'))
-    for path in paths:
-        scope.append('photos.path=?')
-        values.append(str(Path(path).resolve()))
-    where = (' AND (' + ' OR '.join(scope) + ')') if scope else ''
+    where, values = pathkeys.scope_sql(roots, paths, 'photos.path')
     adult = _table_exists(db, 'photo_adult_analysis')
     hashes = _table_exists(db, 'photo_hashes')
     sql = f'''
@@ -675,7 +671,7 @@ def curate(catalog, roots=(), paths=(), force=False, limit=None, progress=None, 
             if not read:
                 return {name: old[name] for name in FILE_FIELDS}, None
             try:
-                target = disk.get(row['path'], row['path'])
+                target = sources.local(disk.get(row['path'], row['path']))
                 return read_file(row['path'], target, row['modified'],
                                  need_dhash=row['hash_dhash'] is None), None
             except Exception as exc:
@@ -770,8 +766,8 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     run = sub.add_parser('curate', help='оценить снимки (окружение .venv)')
     run.add_argument('--catalog', type=Path, required=True)
-    run.add_argument('--root', action='append', type=Path, default=[])
-    run.add_argument('--path', action='append', type=Path, default=[])
+    run.add_argument('--root', action='append', type=str, default=[])
+    run.add_argument('--path', action='append', type=str, default=[])
     run.add_argument('--limit', type=int, default=0)
     run.add_argument('--workers', type=int, default=6)
     run.add_argument('--force', action='store_true',

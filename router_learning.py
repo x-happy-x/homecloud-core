@@ -12,6 +12,8 @@ import uuid
 
 import numpy as np
 
+import catalogdb
+import catalogfiles
 import settings as catalog_settings
 
 
@@ -118,7 +120,7 @@ CREATE TABLE IF NOT EXISTS router_skips (
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=60)
+    db = catalogdb.connect(catalog, timeout=60)
     db.execute('PRAGMA foreign_keys=ON')
     db.executescript(SCHEMA)
     for table in ('router_training_labels', 'router_reviews'):
@@ -569,6 +571,17 @@ def save_similar(catalog, path, values, reviewer='', threshold=.985):
     return paths
 
 
+def model_file(model_path, catalog):
+    """Файл модели на этой машине. Обучало другое ядро — он лежит на хабе."""
+    path = Path(model_path)
+    if path.is_file():
+        return path
+    try:
+        return catalogfiles.fetch(catalog, f'router-models/{path.name}')
+    except Exception:
+        return path
+
+
 def apply_trained(db, embedding_model, version, model_path, stamp=None):
     """Apply a saved router to every matching embedding, without opening photos."""
     import torch
@@ -637,7 +650,7 @@ def bootstrap(catalog, progress=None):
             "SELECT version,model_path FROM router_models WHERE status='active' "
             'AND embedding_model=? LIMIT 1', (model_name,)).fetchone()
         if active:
-            apply_trained(db, model_name, active[0], active[1], stamp)
+            apply_trained(db, model_name, active[0], model_file(active[1], catalog), stamp)
         write_progress(progress, status='completed', action='bootstrap', total=len(rows),
                        completed=len(rows), model=model_name)
     finally:
@@ -729,6 +742,8 @@ def train(catalog, progress=None):
         target = folder / f'{version}.pt'
         torch.save({'state_dict': model.state_dict(), 'input_dims': x_train.shape[1],
                     'hidden': hidden, 'labels': trainable, 'embedding_model': embedding_model}, target)
+        # Каталог на хабе — модель тоже туда: применять её может и другое ядро.
+        catalogfiles.publish(catalog, f'router-models/{version}.pt')
         stamp = now()
         with db:
             db.execute('''INSERT INTO router_models

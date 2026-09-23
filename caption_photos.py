@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from analyze_photos import connect
+import pathkeys
 import video as video_media
 
 
@@ -144,27 +145,16 @@ def main():
     parser.add_argument('--lmstudio-url', default=LMSTUDIO_URL)
     parser.add_argument('--progress-file', type=Path)
     parser.add_argument('--stop-file', type=Path)
-    parser.add_argument('--root', action='append', type=Path, default=[])
-    parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--root', action='append', type=str, default=[])
+    parser.add_argument('--path', action='append', type=str, default=[])
     parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
                         help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--force', action='store_true',
                         help='Описать заново, даже если описание уже есть')
     args = parser.parse_args()
     db = connect(args.catalog.resolve())
-    root_sql = ''
-    root_values = []
-    scope = []
-    if args.root:
-        for root in args.root:
-            value = str(root.resolve()).rstrip('\\/')
-            scope.append('(photo_analysis.path=? OR photo_analysis.path LIKE ?)')
-            root_values.extend((value, value + os.sep + '%'))
-    for path in args.path:
-        scope.append('photo_analysis.path=?')
-        root_values.append(str(path.resolve()))
-    if scope:
-        root_sql = ' AND (' + ' OR '.join(scope) + ')'
+    # Папки и снимки задания — ключи источников (см. pathkeys.py).
+    root_sql, root_values = pathkeys.scope_sql(args.root, args.path, 'photo_analysis.path')
     candidate_sql = '' if args.path else " AND photo_analysis.content_type IN ('photo','document','screenshot')"
     fresh_sql = '' if args.force else " AND (photo_analysis.caption_status IS NULL OR photo_analysis.caption_status='error')"
     rows = db.execute('''

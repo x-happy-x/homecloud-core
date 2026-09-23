@@ -9,12 +9,25 @@ import os
 import sys
 from pathlib import Path
 
+import pathkeys
+
 SUPPORTED = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm', '.3gp', '.3g2',
              '.mpg', '.mpeg', '.mts', '.m2ts', '.wmv', '.flv'}
 
 
 def is_video(path):
-    return Path(path).suffix.casefold() in SUPPORTED
+    return pathkeys.suffix(str(path)) in SUPPORTED
+
+
+def local(path):
+    """Путь на этой машине: ключ источника превращается в файл (sources.local)."""
+    if hasattr(path, '__fspath__') and not isinstance(path, (str, Path)):
+        return os.fspath(path)
+    text = str(path)
+    if pathkeys.is_key(text):
+        import sources
+        return sources.local(text)
+    return text
 
 
 # Вид файлов у фазы обработки: снимки, ролики или всё сразу.
@@ -39,6 +52,7 @@ def only(kinds, rows, index=0):
 def _open(path):
     """VideoCapture, с запасным вариантом короткого пути Windows."""
     import cv2
+    path = local(path)
     capture = cv2.VideoCapture(str(path))
     if capture.isOpened() or os.name != 'nt':
         return capture
@@ -160,7 +174,7 @@ def open_frame(path):
     from PIL import Image, ImageOps
     if is_video(path):
         return to_image(poster(path))
-    with Image.open(path) as original:
+    with Image.open(local(path)) as original:
         return ImageOps.exif_transpose(original).convert('RGB')
 
 

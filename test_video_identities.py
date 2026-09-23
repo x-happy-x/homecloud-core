@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -25,6 +26,25 @@ def track(fid, angle=0, moments=(0., 1.), core=True, name=None, path='a.mp4'):
             'moments':set(moments),'observations':len(moments), 'samples':samples,
             'bank':bank,'match_bank':bank or [vector(angle)],'core':core,
             'named':name,'quality':.9 if core else .1,'first_box':None,'last_box':None}
+
+
+class RebuildTriggerTests(unittest.TestCase):
+    def test_manual_changes_do_not_auto_rebuild(self):
+        db = sqlite3.connect(':memory:')
+        vi.ensure_schema(db)
+        db.execute("INSERT OR REPLACE INTO identity_state VALUES('algorithm_version',?)",
+                   (str(vi.VERSION),))
+        vi.mark_dirty(db, 'manual')
+        self.assertTrue(vi.needs_rebuild(db))
+        self.assertFalse(vi.needs_auto_rebuild(db))
+
+    def test_scan_changes_auto_rebuild(self):
+        db = sqlite3.connect(':memory:')
+        vi.ensure_schema(db)
+        db.execute("INSERT OR REPLACE INTO identity_state VALUES('algorithm_version',?)",
+                   (str(vi.VERSION),))
+        vi.mark_dirty(db, 'scan')
+        self.assertTrue(vi.needs_auto_rebuild(db))
 
 
 class StitchTests(unittest.TestCase):
@@ -75,6 +95,13 @@ class StitchTests(unittest.TestCase):
         self.assertEqual(len(identities),2)
         self.assertFalse(any({1,3} <= x['members'] for x in identities))
 
+    def test_multi_view_consolidation_recovers_moderate_fragment(self):
+        tracks={1:track(1,0),2:track(2,20,(3.,4.)),3:track(3,55,(6.,7.))}
+        identities,_,cannot=vi.stitch(tracks)
+        self.assertEqual(len(identities),2)
+        recovered=vi.consolidate(identities,tracks,cannot)
+        self.assertEqual([item['members'] for item in recovered],[{1,2,3}])
+
     def test_manual_names_conflict(self):
         identities,_,_=vi.stitch({1:track(1,name=1),2:track(2,moments=(3.,4.),name=2)})
         self.assertEqual(len(identities),2)
@@ -98,6 +125,17 @@ class StitchTests(unittest.TestCase):
     def test_pair_support_does_not_repeat_sample(self):
         _,support=vi.bank_score([vector(0)],[vector(0),vector(1),vector(2)])
         self.assertEqual(support,1)
+
+    def test_quality_control_splits_a_density_chain(self):
+        units=[{'vector':vector(angle)} for angle in (0,40,80)]
+        self.assertEqual(vi.split_photo_partition([0,1,2],units,.55),[[0,1],[2]])
+
+    def test_people_hint_seeds_weak_tracks_without_merging_simultaneous_faces(self):
+        tracks={1:track(1,0,(0.,),False),2:track(2,5,(3.,),False),
+                3:track(3,90,(0.,),False)}
+        groups=vi.apply_people_hint('a.mp4',[],set(tracks),tracks,vi.conflicts(tracks),2)
+        self.assertEqual({frozenset(item['members']) for item in groups},
+                         {frozenset({1,2}),frozenset({3})})
 
     def test_decoder_failure_is_not_a_successful_empty_video(self):
         from unittest.mock import MagicMock
@@ -161,6 +199,65 @@ class CatalogTests(unittest.TestCase):
         banks=vi.prototype_banks(self.db,vi.load_tracks(self.db),exclude_path='known.mp4')
         self.assertFalse(banks)
 
+    def test_photo_fragment_attaches_to_several_confirmed_views(self):
+        def photo(fid, angle, path):
+            self.db.execute("INSERT INTO photos(path,status,kind) VALUES(?,'ok','photo')",(path,))
+            self.db.execute('INSERT INTO faces(id,path,box,embedding) VALUES(?,?,?,?)',
+                            (fid,path,'[0,0,100,100]',vector(angle).tobytes()))
+        photo(1,0,'known-a.jpg');photo(2,4,'known-b.jpg');photo(3,2,'fragment.jpg')
+        photo(4,90,'other.jpg')
+        self.db.execute("INSERT INTO people VALUES(1,'Name','now')")
+        self.db.executemany('INSERT INTO face_people(face_id,person_id) VALUES(?,1)',[(1,),(2,)])
+        self.db.commit()
+        vi.rebuild(self.db,min_cluster_size=2)
+        self.assertEqual(self.db.execute('SELECT person_id,source FROM face_people WHERE face_id=3').fetchone(),
+                         (1,'automatic'))
+
+    def test_one_confirmed_photo_is_not_enough_for_automatic_name(self):
+        for fid, angle, path in [(1,0,'known.jpg'),(2,1,'fragment.jpg')]:
+            self.db.execute("INSERT INTO photos(path,status,kind) VALUES(?,'ok','photo')",(path,))
+            self.db.execute('INSERT INTO faces(id,path,box,embedding) VALUES(?,?,?,?)',
+                            (fid,path,'[0,0,100,100]',vector(angle).tobytes()))
+        self.db.execute("INSERT INTO people VALUES(1,'Name','now')")
+        self.db.execute('INSERT INTO face_people(face_id,person_id) VALUES(1,1)')
+        self.db.commit()
+        vi.rebuild(self.db,min_cluster_size=2)
+        self.assertIsNone(self.db.execute('SELECT person_id FROM face_people WHERE face_id=2').fetchone())
+
+    def test_age_profiles_are_stored_by_period_and_mark_large_change(self):
+        self.db.execute("INSERT INTO people VALUES(1,'Child','now')")
+        for fid, angle, year in [(1,0,2017),(2,2,2018),(3,35,2023),(4,37,2024)]:
+            stamp=int(datetime(year,1,1,tzinfo=timezone.utc).timestamp()*1e9)
+            path=f'{year}-{fid}.jpg'
+            self.db.execute("INSERT INTO photos(path,status,kind,modified) VALUES(?,'ok','photo',?)",
+                            (path,stamp))
+            self.db.execute('INSERT INTO faces(id,path,box,embedding) VALUES(?,?,?,?)',
+                            (fid,path,'[0,0,100,100]',vector(angle).tobytes()))
+            self.db.execute('INSERT INTO face_people(face_id,person_id) VALUES(?,1)',(fid,))
+        self.db.commit()
+        vi.rebuild(self.db,min_cluster_size=2)
+        profiles=self.db.execute('SELECT period_start,period_end,samples,age_sensitive '
+                                 'FROM person_age_profiles ORDER BY period_start').fetchall()
+        self.assertEqual([row[:2] for row in profiles],[(2016,2018),(2022,2024)])
+        self.assertTrue(all(row[2]>=2 and row[3]==1 for row in profiles))
+
+    def test_poor_manual_face_does_not_become_prototype(self):
+        import face_quality
+        face_quality.ensure_schema(self.db)
+        self.db.execute("INSERT INTO people VALUES(1,'Name','now')")
+        for fid, angle, blur, size in [(1,0,.2,100),(2,1,.9,20)]:
+            path=f'quality-{fid}.jpg'
+            self.db.execute("INSERT INTO photos(path,status,kind) VALUES(?,'ok','photo')",(path,))
+            self.db.execute('INSERT INTO faces(id,path,box,embedding) VALUES(?,?,?,?)',
+                            (fid,path,'[0,0,100,100]',vector(angle).tobytes()))
+            self.db.execute('INSERT INTO face_people(face_id,person_id) VALUES(?,1)',(fid,))
+            self.db.execute('''INSERT INTO face_quality
+                (face_id,blur,size,keep,version,computed_at) VALUES(?,?,?,?,?,?)''',
+                            (fid,blur,size,0,1,'now'))
+        self.db.commit()
+        profiles=vi.prototype_profiles(self.db,vi.load_tracks(self.db))
+        self.assertEqual(sum(len(bank) for bank in profiles[1]['periods'].values()),1)
+
     def test_stale_input_cannot_publish(self):
         self.add(1)
         revision=self.db.execute('PRAGMA data_version').fetchone()[0]
@@ -199,6 +296,16 @@ class CatalogTests(unittest.TestCase):
             with self.db:merge_faces(self.db,'a.mp4',[item])
         self.assertEqual(self.db.execute('SELECT id FROM faces').fetchall(),[(1,)])
         self.assertEqual(self.db.execute('SELECT source FROM face_people').fetchone()[0],'human')
+
+    def test_photo_scan_persists_detection_quality_for_prototypes(self):
+        self.db.execute("INSERT INTO photos(path,status,kind) VALUES('photo.jpg','ok','photo')")
+        quality={'blur':.2,'size':96.,'confidence':.97,'geometry':.9}
+        item=('photo.jpg','[0,0,96,96]',vector(0).tobytes(),'face.jpg',None,None,None,
+              {'photo_quality':quality})
+        with self.db:
+            merge_faces(self.db,'photo.jpg',[item])
+        row=self.db.execute('SELECT blur,size,confidence,geometry FROM face_quality').fetchone()
+        self.assertEqual(row,(.2,96.,.97,.9))
 
     def test_exception_during_publish_rolls_back_every_table(self):
         self.add(1);vi.rebuild(self.db)
