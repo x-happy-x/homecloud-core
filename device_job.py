@@ -311,7 +311,8 @@ def run(args):
     worker_root = envs.worker_root(here)
     face_python = Path(sys.executable)
     vision_python = worker_root / 'vision-venv' / 'Scripts' / 'python.exe'
-    ocr_python = Path(r'C:\cv-ocr\Scripts\python.exe')
+    ocr_python = envs.ocr_python()
+    hf_home = str(envs.hf_home(here))
     audio_python = worker_root / 'audio-venv' / 'Scripts' / 'python.exe'
     imgutils_python = worker_root / 'imgutils-venv' / 'Scripts' / 'python.exe'
     stage = args.progress_file.with_name('device-stage-progress.json')
@@ -364,7 +365,7 @@ def run(args):
     if any(args.features.get(name) for name in ('visual', 'ocr', 'caption')):
         options = catalog_settings.load(args.catalog)
         env = os.environ.copy()
-        env.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_OFFLINE='1', PYTHONUTF8='1')
+        env.update(HF_HOME=hf_home, HF_HUB_OFFLINE='1', PYTHONUTF8='1')
         command = [str(vision_python), str(here / 'analyze_photos.py'), 'analyze',
                    '--catalog', str(args.catalog), '--limit', '100000000', '--batch-size', '24',
                    '--model', options['visual_model'],
@@ -382,7 +383,7 @@ def run(args):
         return
 
     if args.features.get('ocr'):
-        os.environ.update(PADDLE_PDX_CACHE_HOME=r'C:\cv-models\paddle',
+        os.environ.update(PADDLE_PDX_CACHE_HOME=str(envs.models_root(here) / 'paddle'),
                           PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK='True', PYTHONUTF8='1')
         run_child(args, [str(ocr_python), str(here / 'ocr_photos.py'),
                   '--catalog', str(args.catalog), '--limit', '100000000',
@@ -395,7 +396,7 @@ def run(args):
     # WD/NudeNet идут до описания: тогда Qwen получает уже готовые локальные
     # рейтинги и только самые уверенные теги как вспомогательный контекст.
     if args.features.get('adult'):
-        os.environ.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_OFFLINE='1', PYTHONUTF8='1')
+        os.environ.update(HF_HOME=hf_home, HF_HUB_OFFLINE='1', PYTHONUTF8='1')
         run_child(args, [str(vision_python), str(here / 'adult_photos.py'),
                   '--catalog', str(args.catalog), '--limit', '100000000',
                   '--progress-file', str(stage), '--stop-file', str(args.stop_file),
@@ -405,7 +406,7 @@ def run(args):
         return
 
     if args.features.get('caption'):
-        os.environ.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_OFFLINE='1', PYTHONUTF8='1')
+        os.environ.update(HF_HOME=hf_home, HF_HUB_OFFLINE='1', PYTHONUTF8='1')
         options = catalog_settings.load(args.catalog)
         run_child(args, [str(vision_python), str(here / 'caption_photos.py'),
                   '--catalog', str(args.catalog), '--limit', '100000000',
@@ -421,7 +422,7 @@ def run(args):
         options = catalog_settings.load(args.catalog)
         # Предыдущие этапы включили офлайн для Hugging Face; здесь он мешает
         # забрать модель распознавания, если её ещё нет.
-        os.environ.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_OFFLINE='0',
+        os.environ.update(HF_HOME=hf_home, HF_HUB_OFFLINE='0',
                           HF_HUB_DISABLE_SYMLINKS_WARNING='1', PYTHONUTF8='1')
         run_child(args, [str(audio_python), str(here / 'speech_videos.py'),
                   '--catalog', str(args.catalog), '--limit', '100000000',
@@ -445,7 +446,7 @@ def run(args):
 
     if args.features.get('diarize'):
         # Тот же офлайн-манёвр, что и у речи: закачка модели должна идти в сеть.
-        os.environ.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_OFFLINE='0',
+        os.environ.update(HF_HOME=hf_home, HF_HUB_OFFLINE='0',
                           HF_HUB_DISABLE_SYMLINKS_WARNING='1', PYTHONUTF8='1')
         run_child(args, [str(audio_python), str(here / 'speaker_diarization.py'),
                   '--catalog', str(args.catalog), '--limit', '100000000',
@@ -466,7 +467,7 @@ def run(args):
             # выходит, не загружая модель. Ошибка здесь не роняет этап: без
             # описаний оценка обойдётся одной технической частью.
             publish(args, 'running', 'curation', total=0, completed=0)
-            prompts_env = {**os.environ, 'HF_HOME': r'C:\cv-models\huggingface',
+            prompts_env = {**os.environ, 'HF_HOME': hf_home,
                            'HF_HUB_OFFLINE': '1', 'PYTHONUTF8': '1'}
             with prompts_log.open('w', encoding='utf-8', errors='replace') as sink:
                 subprocess.run([str(vision_python), str(here / 'photo_curation.py'), 'prompts',

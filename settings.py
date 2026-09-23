@@ -122,9 +122,12 @@ VISUAL_MODELS = (
 )
 
 
-def visual_models(cache=r'C:\cv-models\huggingface'):
+def visual_models(cache=None):
     """Configured models and whether their PyTorch weights finished downloading."""
     from pathlib import Path
+    if cache is None:
+        import envs
+        cache = envs.hf_home()
     root = Path(cache) / 'hub'
     result = []
     for item in VISUAL_MODELS:
