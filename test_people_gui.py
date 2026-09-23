@@ -61,11 +61,31 @@ class PeopleGuiStoreTests(unittest.TestCase):
 
                 face_id = named[0]['face_ids'][0]
                 store.exclude([face_id])
+                self.assertGreater(store.db.execute(
+                    'SELECT count(*) FROM face_identity_conflicts').fetchone()[0], 0)
                 excluded = [group for group in store.groups() if group['kind'] == 'excluded']
                 self.assertEqual(len(excluded[0]['face_ids']), 1)
                 self.assertEqual(store.undo(), 'Лица исключены из автоматических групп')
+                self.assertEqual(store.db.execute(
+                    'SELECT count(*) FROM face_identity_conflicts').fetchone()[0], 0)
                 named = [group for group in store.groups() if group['kind'] == 'person']
                 self.assertEqual(len(named[0]['face_ids']), 6)
+            finally:
+                store.db.close()
+
+    def test_assign_does_not_request_full_recluster(self):
+        """Ручное имя применяется сразу и не запускает тяжёлую пересборку."""
+        with tempfile.TemporaryDirectory() as temp:
+            store = self.make_store(temp)
+            try:
+                with store.db:
+                    store.db.execute(
+                        "INSERT OR REPLACE INTO identity_state VALUES('dirty','0')")
+                automatic = next(group for group in store.groups() if group['kind'] == 'auto')
+                store.assign(automatic['face_ids'], 'Мама')
+                dirty = store.db.execute(
+                    "SELECT value FROM identity_state WHERE key='dirty'").fetchone()
+                self.assertEqual(dirty[0], '0')
             finally:
                 store.db.close()
 

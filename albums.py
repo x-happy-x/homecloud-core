@@ -5,7 +5,8 @@
 самого каталога (`photos.dir`) и показываем той же иерархией, что на диске.
 """
 import time
-from pathlib import PurePath
+
+import pathkeys
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS albums (
@@ -223,10 +224,14 @@ def folder_clause(path, deep=True):
 
 
 class Folders:
-    """Дерево папок каталога. Пересобирается, когда каталог менялся."""
+    """Дерево папок каталога. Пересобирается, когда каталог менялся.
 
-    def __init__(self, db):
+    root_label — подпись корня: у хаба это «PC-X · D:» или «Netcraze · /HDD».
+    """
+
+    def __init__(self, db, root_label=None):
         self.db = db
+        self.root_label = root_label
         self.stamp = None
         self.nodes = {}
         self.roots = []
@@ -240,21 +245,18 @@ class Folders:
         for folder, count in self.db.execute(
                 "SELECT dir,COUNT(*) FROM photos WHERE status='ok' AND dir IS NOT NULL "
                 'GROUP BY dir'):
-            chain, current = [], PurePath(folder)
-            while True:
-                chain.append(str(current))
-                parent = current.parent
-                if parent == current:
-                    break
-                current = parent
-            chain.reverse()
+            chain = pathkeys.chain(folder)
+            folder = chain[-1]
             for index, key in enumerate(chain):
                 node = nodes.get(key)
                 if node is None:
                     parent = chain[index - 1] if index else ''
+                    name = pathkeys.name(key) or key
+                    if not index and self.root_label:
+                        name = self.root_label(key)
                     node = nodes[key] = {
                         'path': key, 'parent': parent, 'direct': 0, 'total': 0,
-                        'name': PurePath(key).name or key, 'children': []}
+                        'name': name, 'children': []}
                     if parent:
                         nodes[parent]['children'].append(key)
                     else:

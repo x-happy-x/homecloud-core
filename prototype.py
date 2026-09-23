@@ -1,5 +1,6 @@
 """Local face-catalog experiment. Does not download models or upload photos."""
 import argparse
+from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import html
@@ -13,8 +14,12 @@ import time
 
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
 
+import catalogdb
+import catalogfiles
+import pathkeys
 import pathrules
 import settings as catalog_settings
+import sources
 import video as video_media
 import video_tracks
 import video_identities
@@ -38,8 +43,9 @@ def configure_gpu_runtime():
 
 
 def database(folder, check_same_thread=True):
+    folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(folder / 'catalog.sqlite', check_same_thread=check_same_thread)
+    db = catalogdb.connect(folder, timeout=30, check_same_thread=check_same_thread)
     db.execute('PRAGMA foreign_keys=ON')
     db.executescript('''
         CREATE TABLE IF NOT EXISTS photos (
@@ -71,6 +77,8 @@ def database(folder, check_same_thread=True):
         db.execute('ALTER TABLE faces ADD COLUMN track_stop REAL')
     db.commit()
     video_identities.ensure_schema(db)
+    import face_quality
+    face_quality.ensure_schema(db)
     return db
 
 
@@ -180,21 +188,31 @@ def scan(args):
     import numpy as np
     from PIL import Image, ImageOps
     from insightface.app.common import Face
-    root = args.photos.resolve()
+    # Папка задания — ключ источника (pc-x:D:\\Фото, netcraze:/HDD/photo) или,
+    # у старого локального каталога, обычный путь этой машины.
+    keyed = pathkeys.is_key(args.photos)
+    root = pathkeys.trim(args.photos) if keyed else Path(args.photos).resolve()
     data = args.data.resolve()
     progress_file = args.progress_file.resolve() if args.progress_file else None
     stop_file = args.stop_file.resolve() if args.stop_file else None
     started_at = time.time()
     last_progress_write = 0.0
-    if not root.is_dir():
+    if keyed and not args.use_inventory:
+        raise ValueError('Папку источника лица берут из описи: нужен --use-inventory')
+    if not keyed and not root.is_dir():
         raise ValueError('Photo directory does not exist')
-    if data == root or root in data.parents:
+    if not keyed and (data == root or root in data.parents):
         raise ValueError('Keep catalog/cache outside the source photo directory')
-    excluded_roots = [path.resolve() for path in args.exclude_path]
+    excluded_roots = [pathkeys.trim(path) if keyed else Path(path).resolve()
+                      for path in args.exclude_path]
     excluded_names = {name.casefold() for name in args.exclude_dir_name}
     excluded_patterns = [pattern.casefold() for pattern in args.exclude_file_pattern]
-    included_paths = {path.resolve() for path in args.include_path}
-    if any(root != path.parent and root not in path.parents for path in included_paths):
+    included_paths = {pathkeys.trim(path) if keyed else Path(path).resolve()
+                      for path in args.include_path}
+    if keyed:
+        if any(not pathkeys.inside(path, root) for path in included_paths):
+            raise ValueError('Included photo must be inside the photo directory')
+    elif any(root != path.parent and root not in path.parents for path in included_paths):
         raise ValueError('Included photo must be inside the photo directory')
     options = catalog_settings.load(data)
     block_rules, allow_rules = pathrules.prepare(options)
@@ -217,7 +235,7 @@ def scan(args):
             excluded_dirs, excluded_files = catalog_exclusions(index)
         finally:
             index.close()
-        excluded_roots = excluded_roots + [Path(item) for item in excluded_dirs]
+        excluded_roots = excluded_roots + [item if keyed else Path(item) for item in excluded_dirs]
     except Exception as exc:  # каталога может ещё не быть
         print(f'Exclusions unavailable: {exc}', file=sys.stderr, flush=True)
 
@@ -228,6 +246,10 @@ def scan(args):
     def is_excluded(path):
         resolved = path.resolve()
         return any(resolved == excluded or excluded in resolved.parents for excluded in excluded_roots)
+
+    # Версия файла источника — из описи: копия во временной папке ядра имеет
+    # своё время, и по ней каждый скан считал бы файл изменённым.
+    listed = {}
 
     def publish(status, current='', force=False):
         nonlocal last_progress_write
@@ -273,20 +295,22 @@ def scan(args):
         from catalog_index import bounds
         index = database(data)
         low, high = bounds(root)
-        for (found,) in index.execute(
-                'SELECT path FROM photos WHERE path>=? AND path<? '
+        for found, found_size, found_modified in index.execute(
+                'SELECT path,size,modified FROM photos WHERE path>=? AND path<? '
                 "AND status NOT IN ('excluded','missing') ORDER BY path",
                 (low, high)):
-            candidate = Path(found)
+            candidate = found if keyed else Path(found)
             if pathrules.blocked(found, block_rules, allow_rules):
                 continue
-            if not keep_kind(candidate):
+            if not keep_kind(found):
                 continue
-            if included_paths and candidate.resolve() not in included_paths:
+            if included_paths and (found if keyed else candidate.resolve()) not in included_paths:
                 continue
-            if any(fnmatch.fnmatch(candidate.name.casefold(), pattern)
+            if any(fnmatch.fnmatch(pathkeys.name(found).casefold(), pattern)
                    for pattern in excluded_patterns):
                 continue
+            if keyed:
+                listed[found] = (found_size or 0, found_modified or 0)
             paths.append(candidate)
         index.close()
         print(f'Using catalog inventory: {len(paths)} files.', flush=True)
@@ -391,7 +415,8 @@ def scan(args):
 
     publish('running', force=True)
     for path in paths:
-        filename = path.name
+        key = str(path)
+        filename = pathkeys.name(key)
         if stop_file and stop_file.exists():
             publish('stopped', str(path), force=True)
             print('Stopped from Web UI. Re-run scan to continue.', file=sys.stderr)
@@ -405,13 +430,18 @@ def scan(args):
             return
         stat = None
         try:
-                stat = path.stat()
-                key = str(path)
+                if keyed:
+                    # Сам файл — на этой машине: свой диск, UNC или временная копия.
+                    local = Path(sources.local(key))
+                    size, modified = listed[key]
+                    stat = type('Stat', (), {'st_size': size, 'st_mtime_ns': modified})()
+                else:
+                    local, stat = path, path.stat()
                 if key in excluded_files:
                     skipped += 1
                     publish('running', str(path))
                     continue
-                is_video = video_media.is_video(path)
+                is_video = video_media.is_video(key)
                 kind_signature = video_signature if is_video else signature
                 old = db.execute('SELECT size,modified,model,status FROM photos WHERE path=?',
                                  (key,)).fetchone()
@@ -446,8 +476,14 @@ def scan(args):
                         crop = image.crop(tuple(int(value) for value in box[:4]))
                         crop.thumbnail((160, 160))
                         crop.save(data / thumbnail)
+                        catalogfiles.publish(data, thumbnail)
+                        import face_quality
+                        blur = face_quality.face_blur(crop)
+                        quality = video_identities.quality(
+                            box[:4], float(box[4]), blur, landmarks[number], options)
                         found.append((key, json.dumps(box[:4].tolist()), embedding.tobytes(),
-                                      thumbnail, moment))
+                                      thumbnail, moment, None, None,
+                                      {'photo_quality': quality}))
                     return found
 
                 def mark(status, note=None, kind='photo', duration=None):
@@ -457,7 +493,7 @@ def scan(args):
                         'dir=excluded.dir,size=excluded.size,modified=excluded.modified,'
                         'model=excluded.model,status=excluded.status,error=excluded.error,'
                         'kind=excluded.kind,duration=excluded.duration',
-                        (key, str(path.parent), stat.st_size, stat.st_mtime_ns,
+                        (key, pathkeys.parent(key), stat.st_size, stat.st_mtime_ns,
                          kind_signature, status, note, kind, duration))
                     if status == 'ignored':
                         db.execute('DELETE FROM faces WHERE path=?', (key,))
@@ -469,7 +505,7 @@ def scan(args):
                         nonlocal video_position
                         video_position = moment
                         publish('running', str(path))
-                    info = video_media.probe(path)
+                    info = video_media.probe(local)
                     duration = info['duration'] or None
                     short = (options['video_min_seconds']
                              and duration and duration < options['video_min_seconds'])
@@ -483,7 +519,7 @@ def scan(args):
                         publish('running', str(path))
                         continue
                     tracks = video_tracks.find_tracks(
-                        path, models, step_seconds=options['video_track_step'],
+                        local, models, step_seconds=options['video_track_step'],
                         gap_seconds=options['video_track_gap'],
                         best_frames=options['video_track_best'],
                         stop_seconds=options['video_max_seconds'],
@@ -495,6 +531,7 @@ def scan(args):
                         ).hexdigest()
                         thumbnail = f'thumbnails/{token}.jpg'
                         track['extra']['crop'].save(data / thumbnail)
+                        catalogfiles.publish(data, thumbnail)
                         results.append((
                             key, json.dumps([round(value, 1) for value in track['box']]),
                             track['embedding'].tobytes(), thumbnail,
@@ -502,7 +539,7 @@ def scan(args):
                             round(track['start'], 3), round(track['stop'], 3), track))
                     print(f'  {filename}: треков {len(tracks)}', flush=True)
                 else:
-                    with Image.open(path) as original:
+                    with Image.open(local) as original:
                         img = ImageOps.exif_transpose(original).convert('RGB')
                     reason = catalog_settings.rejects(
                         options, size=stat.st_size, width=img.size[0], height=img.size[1])
@@ -515,9 +552,10 @@ def scan(args):
                         publish('running', str(path))
                         continue
                     results = find_faces(img)
-                after = path.stat()
-                if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
-                    raise RuntimeError('File changed during processing; retry scan')
+                if not keyed:
+                    after = local.stat()
+                    if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+                        raise RuntimeError('File changed during processing; retry scan')
                 with db:
                     mark('ok', None, 'video' if is_video else 'photo', duration)
                     merge_faces(db, key, results)
@@ -535,7 +573,7 @@ def scan(args):
             print(f'ERROR: {path}: {exc}', file=sys.stderr, flush=True)
             with db:
                 db.execute('INSERT INTO photos(path,dir,size,modified,model,status,error) VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET status=excluded.status,error=excluded.error',
-                           (str(path), str(path.parent), stat.st_size if stat else None,
+                           (key, pathkeys.parent(key), stat.st_size if stat else None,
                             stat.st_mtime_ns if stat else None, signature, 'error', str(exc)))
             publish('running', str(path))
     if not finish_faces():
@@ -594,7 +632,7 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
             box = None
         embedding = np.frombuffer(raw_embedding, dtype='<f4') if raw_embedding else None
         previous.append((face_id, box, moment, track_start, track_stop, embedding))
-    video_identities.mark_dirty(db)
+    video_identities.mark_dirty(db, 'scan')
     taken = set()
     for item in results:
         path_key, box_json, embedding, thumbnail = item[:4]
@@ -635,15 +673,29 @@ def merge_faces(db, key, results, threshold=0.45, track_embedding_threshold=0.5)
                 'INSERT INTO faces(path,box,embedding,thumbnail,frame_time,'
                 'track_start,track_stop) VALUES(?,?,?,?,?,?,?)',
                 (path_key, box_json, embedding, thumbnail, moment, track_start, track_stop))
-            if len(item) > 7:
+            face_id = cursor.lastrowid
+            if len(item) > 7 and track_start is not None:
                 video_identities.save_track(db, cursor.lastrowid, item[7])
-            continue
-        taken.add(best)
-        db.execute('UPDATE faces SET box=?,embedding=?,thumbnail=?,frame_time=?,'
-                  'track_start=?,track_stop=? WHERE id=?',
-                   (box_json, embedding, thumbnail, moment, track_start, track_stop, best))
-        if len(item) > 7:
-            video_identities.save_track(db, best, item[7])
+        else:
+            taken.add(best)
+            face_id = best
+            db.execute('UPDATE faces SET box=?,embedding=?,thumbnail=?,frame_time=?,'
+                      'track_start=?,track_stop=? WHERE id=?',
+                       (box_json, embedding, thumbnail, moment, track_start, track_stop, best))
+            if len(item) > 7 and track_start is not None:
+                video_identities.save_track(db, best, item[7])
+        if (len(item) > 7 and track_start is None and isinstance(item[7], dict)
+                and item[7].get('photo_quality')):
+            import face_quality
+            q = item[7]['photo_quality']
+            db.execute('''INSERT INTO face_quality
+                (face_id,blur,size,keep,version,computed_at,confidence,geometry)
+                VALUES(?,?,?,0,?,?,?,?) ON CONFLICT(face_id) DO UPDATE SET
+                blur=excluded.blur,size=excluded.size,version=excluded.version,
+                computed_at=excluded.computed_at,confidence=excluded.confidence,
+                geometry=excluded.geometry''',
+                (face_id, q.get('blur'), q.get('size'), face_quality.VERSION,
+                 datetime.now(timezone.utc).isoformat(), q.get('confidence'), q.get('geometry')))
         # Keep the previous label until the complete replacement is ready.
         # identity_state.dirty invalidates the computation without losing keys.
     protected = {row[0] for row in db.execute("SELECT face_id FROM face_people WHERE source='human'")}
@@ -806,19 +858,19 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('doctor')
     scan_parser = sub.add_parser('scan')
-    scan_parser.add_argument('--photos', type=Path, required=True)
+    scan_parser.add_argument('--photos', type=str, required=True)
     scan_parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
                              help='Сканировать снимки, ролики или всё сразу')
     scan_parser.add_argument('--models', type=Path, required=True)
     scan_parser.add_argument('--data', type=Path, default=Path('data'))
     scan_parser.add_argument('--limit', type=int, default=1000)
-    scan_parser.add_argument('--exclude-path', action='append', type=Path, default=[],
+    scan_parser.add_argument('--exclude-path', action='append', type=str, default=[],
                              help='Skip this directory tree; repeat for multiple paths')
     scan_parser.add_argument('--exclude-dir-name', action='append', default=[],
                              help='Skip directories with this name (case-insensitive); repeat as needed')
     scan_parser.add_argument('--exclude-file-pattern', action='append', default=[],
                              help='Skip matching file names, for example *__an__*')
-    scan_parser.add_argument('--include-path', action='append', type=Path, default=[],
+    scan_parser.add_argument('--include-path', action='append', type=str, default=[],
                              help='Process only this exact photo; repeat for a selection')
     scan_parser.add_argument('--use-inventory', action='store_true',
                              help='Взять список файлов из описи каталога, не обходя диск')

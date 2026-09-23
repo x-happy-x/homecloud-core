@@ -31,7 +31,10 @@ import time
 
 import numpy as np
 
+import catalogdb
+import pathkeys
 import photo_curation
+import sources
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS highlight_groups (
@@ -114,8 +117,7 @@ def ensure_schema(db):
 
 
 def connect(catalog, check_same_thread=True):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=60,
-                         check_same_thread=check_same_thread)
+    db = catalogdb.connect(catalog, timeout=60, check_same_thread=check_same_thread)
     photo_curation.ensure_schema(db)
     ensure_schema(db)
     return db
@@ -803,7 +805,7 @@ def contact_sheet(group, output, cell=220):
     for index, photo in enumerate(photos):
         x, y = (index % columns) * cell, 40 + (index // columns) * (cell + 30)
         try:
-            with Image.open(photo['path']) as source:
+            with Image.open(sources.local(photo['path'])) as source:
                 source.draft('RGB', (cell * 2, cell * 2))
                 image = ImageOps.exif_transpose(source).convert('RGB')
             image.thumbnail((cell - 6, cell - 6))
@@ -814,7 +816,7 @@ def contact_sheet(group, output, cell=220):
         draw.text((x + 4, y + cell), f"#{photo['pick']} s={photo['score']:.2f} v={reasons.get('visual') or 0:.2f} "
                                      f"t={reasons['technical']:.2f} x{reasons.get('series', 0) + 1}",
                   fill='black')
-        draw.text((x + 4, y + cell + 13), Path(photo['path']).name[:34], fill='gray')
+        draw.text((x + 4, y + cell + 13), pathkeys.name(photo['path'])[:34], fill='gray')
     sheet.save(output, quality=88)
 
 

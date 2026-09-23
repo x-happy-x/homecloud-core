@@ -2,6 +2,7 @@
 import argparse
 import base64
 import binascii
+import contextlib
 import hashlib
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -27,6 +28,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 import albums
+import catalogdb
 import people_albums
 import catalog_index
 import duplicates
@@ -35,6 +37,7 @@ import face_stacks
 import highlight_generator
 import job_features
 import media_metadata
+import pathkeys
 import pathrules
 import photo_curation
 import privacy
@@ -42,6 +45,7 @@ import reverse_search
 import router_learning
 import router_taggers
 import settings as catalog_settings
+import sources
 import speaker_diarization
 import speech_videos
 import video as video_media
@@ -51,6 +55,11 @@ from prototype import cluster_embeddings, database as open_catalog_db
 
 
 WEB_ROOT = Path(__file__).with_name('web').resolve()
+
+
+def hub_grid_limit():
+    import hub as hub_module
+    return hub_module.GRID_LIMIT
 SEARCH_FRAME_MAX_BYTES = 700 * 1024
 SEARCH_FRAME_MAX_SIDE = 1600
 
@@ -96,10 +105,10 @@ def _build_search_upload(app, raw_path, frame_jpeg=None):
     if frame_jpeg:
         if row[1] != 'video':
             raise ValueError('Кадр можно передать только для видео')
-        return _decode_search_frame(frame_jpeg), f'{Path(raw_path).stem}-frame.jpg'
+        return _decode_search_frame(frame_jpeg), f'{pathkeys.stem(raw_path)}-frame.jpg'
     # Фото идут старым путём; для видео без кадра остаётся совместимый fallback
     # на представительный кадр.
-    return _encode_search_jpeg(video_media.open_frame(file_path)), Path(raw_path).name
+    return _encode_search_jpeg(video_media.open_frame(file_path)), pathkeys.name(raw_path)
 
 
 def _upload_search_image(app, raw_path, frame_jpeg=None):
@@ -245,7 +254,7 @@ class AnalysisController:
                 payload['status'] = 'interrupted'
             payload['stop_requested'] = payload['active'] and self.stop_file.exists()
             try:
-                db = sqlite3.connect(self.catalog / 'catalog.sqlite', timeout=1)
+                db = catalogdb.connect(self.catalog, timeout=1)
                 exists = db.execute("SELECT 1 FROM sqlite_master WHERE name='photo_analysis'").fetchone()
                 if exists:
                     payload['catalog_indexed'] = db.execute(
@@ -436,6 +445,7 @@ class DeviceController:
 
     def __init__(self, catalog, device_id=None, device_name=None):
         self.root = Path(__file__).resolve().parent
+        self.model_cache = self.root / 'models' / 'cv-models' / 'huggingface'
         self.catalog = Path(catalog).resolve()
         self.device_id = device_id or socket.gethostname().casefold()
         self.device_name = device_name or socket.gethostname()
@@ -449,7 +459,7 @@ class DeviceController:
 
     def history_db(self):
         """Список источников заданий живёт рядом с каталогом, в нём же."""
-        db = sqlite3.connect(self.catalog / 'catalog.sqlite', timeout=10)
+        db = catalogdb.connect(self.catalog, timeout=10)
         db.execute('''CREATE TABLE IF NOT EXISTS scan_runs (
             id INTEGER PRIMARY KEY,
             roots_json TEXT NOT NULL, paths_json TEXT NOT NULL,
@@ -582,6 +592,14 @@ class DeviceController:
                     continue
         return result
 
+    @staticmethod
+    def path_available(path, kind='dir'):
+        """Probe an optional capability without taking /api/device down on Windows errors."""
+        try:
+            return path.is_file() if kind == 'file' else path.is_dir()
+        except OSError:
+            return False
+
     def info(self):
         worker_root = self.root / 'work'
         vision = worker_root / 'vision-venv' / 'Scripts' / 'python.exe'
@@ -593,21 +611,23 @@ class DeviceController:
             'hostname': socket.gethostname(), 'platform': sys.platform,
             'drives': self.drives(),
             'visual_model': options['visual_model'],
-            'visual_models': catalog_settings.visual_models(),
+            'visual_models': catalog_settings.visual_models(self.model_cache),
             'capabilities': {
                 'inventory': True,
-                'faces': (self.root / 'models' / 'buffalo_l').is_dir(),
-                'visual': vision.is_file() and Path(r'C:\cv-models\huggingface').is_dir(),
-                'ocr': Path(r'C:\cv-ocr\Scripts\python.exe').is_file(),
-                'caption': vision.is_file() and Path(
-                    r'C:\cv-models\huggingface\hub\models--Qwen--Qwen3-VL-2B-Instruct').is_dir(),
-                'adult': vision.is_file() and Path(
-                    r'C:\cv-models\huggingface\hub\models--SmilingWolf--wd-eva02-large-tagger-v3').is_dir(),
-                'speech': audio.is_file(),
-                'diarize': (audio.is_file()
-                           and (Path(r'C:\cv-models\huggingface').is_dir()
-                                or (self.root / 'hf-token.txt').is_file())),
-                'authenticity': imgutils.is_file(),
+                'faces': self.path_available(self.root / 'models' / 'buffalo_l'),
+                'visual': (self.path_available(vision, 'file')
+                           and self.path_available(self.model_cache)),
+                'ocr': self.path_available(Path(r'C:\cv-ocr\Scripts\python.exe'), 'file'),
+                'caption': self.path_available(vision, 'file') and self.path_available(
+                    self.model_cache / 'hub' / 'models--Qwen--Qwen3-VL-2B-Instruct'),
+                'adult': self.path_available(vision, 'file') and self.path_available(
+                    self.model_cache / 'hub' /
+                    'models--SmilingWolf--wd-eva02-large-tagger-v3'),
+                'speech': self.path_available(audio, 'file'),
+                'diarize': (self.path_available(audio, 'file')
+                           and (self.path_available(self.model_cache)
+                                or self.path_available(self.root / 'hf-token.txt', 'file'))),
+                'authenticity': self.path_available(imgutils, 'file'),
                 # Оценка и подборки идут в основном окружении по готовым данным.
                 'curation': True,
                 'highlights': True,
@@ -658,7 +678,7 @@ class DeviceController:
             if self.run_id and not payload['active']:
                 self.finish(payload.get('status', 'interrupted'))
             try:
-                db = sqlite3.connect(self.catalog / 'catalog.sqlite', timeout=1)
+                db = catalogdb.connect(self.catalog, timeout=1)
                 payload['catalog_photos'] = db.execute(
                     "SELECT COUNT(*) FROM photos WHERE status='ok'").fetchone()[0]
                 payload['catalog_faces'] = db.execute('SELECT COUNT(*) FROM faces').fetchone()[0]
@@ -707,7 +727,7 @@ class DeviceController:
                 raise ValueError('За один запуск можно выбрать не более 500 фотографий')
             if raw_paths:
                 placeholders = ','.join('?' for _ in raw_paths)
-                with sqlite3.connect(self.catalog / 'catalog.sqlite') as catalog_db:
+                with catalogdb.connect(self.catalog) as catalog_db:
                     known = {row[0] for row in catalog_db.execute(
                         f"SELECT path FROM photos WHERE status='ok' AND path IN ({placeholders})",
                         raw_paths)}
@@ -731,7 +751,8 @@ class DeviceController:
                 raise ValueError('Недоступно на устройстве: ' + ', '.join(unavailable))
             if selected['visual'] and visual_model is not None:
                 model = str(visual_model)
-                available = {item['id']: item for item in catalog_settings.visual_models()}
+                available = {item['id']: item for item in catalog_settings.visual_models(
+                    self.model_cache)}
                 if model not in available:
                     raise ValueError('Неизвестная модель визуального индекса')
                 if not available[model]['installed']:
@@ -1040,7 +1061,10 @@ class HighlightService:
 
 class App:
     def __init__(self, data, min_cluster_size=8, token=None,
-                 device_id=None, device_name=None, max_faces=0):
+                 device_id=None, device_name=None, max_faces=0, hub=None):
+        # hub — каталог живёт на VM, а считают ядра (см. hub.py); без него —
+        # прежний бэкенд одного компьютера со своим диском и моделями.
+        self.hub = hub
         schema = analysis_database(Path(data).resolve())
         schema.close()
         self.store = CatalogStore(data, min_cluster_size, thread_safe=True,
@@ -1054,16 +1078,39 @@ class App:
         speaker_diarization.connect(data).close()
         speech_videos.connect(data).close()
         highlight_generator.connect(data).close()
-        self.folders = albums.Folders(self.store.db)
-        self.duplicates = DuplicateService(data)
-        self.recluster_job = ReclusterController(self)
-        self.highlights = HighlightService(data)
+        self.folders = albums.Folders(
+            self.store.db, root_label=self.folder_root_label if hub is not None else None)
         self.catalog_folder = Path(data).resolve()
-        self.scanner = ScanController()
-        self.analyzer = AnalysisController()
-        self.semantic = SemanticService(data)
-        self.router = RouterController(data)
-        self.device = DeviceController(data, device_id, device_name)
+        import hub as hub_module
+        hub_module.ensure_thumbs(self.store.db)
+        if hub is not None:
+            def reload_after_recluster(_status):
+                self.identity_reload_pending = True
+
+            def duplicate_stats():
+                db = duplicates.connect(self.catalog_folder)
+                try:
+                    return duplicates.stats(db)
+                finally:
+                    db.close()
+            self.duplicates = hub_module.RemoteTask(hub, 'duplicates', local_status=duplicate_stats)
+            self.recluster_job = hub_module.RemoteTask(hub, 'recluster',
+                                                       on_finish=reload_after_recluster)
+            self.highlights = hub_module.RemoteTask(hub, 'highlights')
+            self.scanner = hub_module.Idle()
+            self.analyzer = hub_module.Idle()
+            self.semantic = hub_module.RemoteSemantic(hub)
+            self.router = hub_module.RemoteTask(hub, 'router', capability='visual')
+            self.device = hub_module.RemoteJobs(hub, data)
+        else:
+            self.duplicates = DuplicateService(data)
+            self.recluster_job = ReclusterController(self)
+            self.highlights = HighlightService(data)
+            self.scanner = ScanController()
+            self.analyzer = AnalysisController()
+            self.semantic = SemanticService(data)
+            self.router = RouterController(data)
+            self.device = DeviceController(data, device_id, device_name)
         self.token = token or secrets.token_urlsafe(32)
         self._centroids_stamp = None
         self._centroids_cache = {}
@@ -1076,11 +1123,39 @@ class App:
         self.dup_cache = {}
 
     def file_for(self, path):
-        """Скрытый снимок живёт в личной папке — оттуда его и читаем."""
+        """Скрытый снимок живёт в личной папке — оттуда его и читаем.
+
+        У хаба это не путь, а файл в источнике (hub.SourceMedia): у него те же
+        exists/open, а путь на диске хаба появляется только по local().
+        """
         with self.lock:
             row = self.store.db.execute(
                 'SELECT stored FROM hidden_photos WHERE path=?', (str(path),)).fetchone()
-        return Path(row[0]) if row else Path(path)
+        target = row[0] if row else str(path)
+        if self.hub is not None:
+            if not pathkeys.is_key(target):
+                target = str(path)
+            return self.hub.media(target)
+        return Path(target)
+
+    def folder_root_label(self, key):
+        """Корень дерева папок у хаба — источник: «PC-X · D:», «Netcraze · /HDD»."""
+        source, native = pathkeys.split(key)
+        name = self.hub.source_names().get(source, source) if source else ''
+        if not name:
+            return native
+        return name if native.strip('\\/') == '' else f'{name} · {native}'
+
+    @staticmethod
+    @contextlib.contextmanager
+    def open_image(media):
+        """PIL-картинка из пути или из файла источника (поток с перемоткой)."""
+        if isinstance(media, Path):
+            with Image.open(media) as image:
+                yield image
+            return
+        with media.open() as stream, Image.open(stream) as image:
+            yield image
 
     def router_batch_archive(self, hide_adult=False, count=10):
         """Build a private offline review pack without exposing original paths."""
@@ -1193,9 +1268,14 @@ class App:
         moment = row[4] if len(row) > 4 else None
         extra = (details or {}).get(face_id, {})
         return {
-            'id': face_id, 'filename': Path(row[1]).name, 'path': row[1],
+            'id': face_id, 'filename': pathkeys.name(row[1]), 'path': row[1],
+            'source': pathkeys.source_of(row[1]),
             'kind': 'video' if video_media.is_video(row[1]) else 'photo',
             'frame_time': moment,
+            # Координаты лица хранятся в пикселях исходника. Размер нужен
+            # просмотрщику сразу, пока подробная карточка фото ещё загружается.
+            'width': extra.get('width'),
+            'height': extra.get('height'),
             # Промежуток трека: просмотрщик открывает ролик с его начала.
             'track_start': extra.get('track_start'),
             'track_stop': extra.get('track_stop'),
@@ -1217,20 +1297,43 @@ class App:
             batch = face_ids[offset:offset + 900]
             marks = ','.join('?' * len(batch))
             for (face_id, path, track_start, track_stop, blur, taken, modified,
-                 curated_hash, plain_hash) in self.store.db.execute(
+                 curated_hash, plain_hash, width, height, raw_box) in self.store.db.execute(
                     'SELECT faces.id,faces.path,faces.track_start,faces.track_stop,'
                     'face_quality.blur,photo_curation.taken_ts,photos.modified,'
-                    'photo_curation.dhash,photo_hashes.dhash FROM faces '
+                    'photo_curation.dhash,photo_hashes.dhash,'
+                    'COALESCE(photo_thumbs.width,photo_analysis.width,photo_hashes.width),'
+                    'COALESCE(photo_thumbs.height,photo_analysis.height,photo_hashes.height),'
+                    'faces.box FROM faces '
                     'LEFT JOIN face_quality ON face_quality.face_id=faces.id '
+                    'LEFT JOIN photo_thumbs ON photo_thumbs.path=faces.path '
                     'LEFT JOIN photo_curation ON photo_curation.path=faces.path '
                     'LEFT JOIN photo_hashes ON photo_hashes.path=faces.path '
                     'LEFT JOIN photos ON photos.path=faces.path '
+                    'LEFT JOIN photo_analysis ON photo_analysis.path=faces.path '
                     f'WHERE faces.id IN ({marks})', batch):
                 if taken is None and modified:
                     taken = modified / 1e9
+                try:
+                    box = json.loads(raw_box)[:4] if raw_box else []
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    box = []
+                # Старый photo_hashes мог содержать размер служебной миниатюры.
+                # Если рамка в него физически не помещается, берём заголовок
+                # оригинала и не декодируем весь снимок.
+                if (not video_media.is_video(path)
+                        and (not width or not height or
+                             (len(box) == 4 and (box[2] > width or box[3] > height)))):
+                    try:
+                        with self.open_image(self.file_for(path)) as source:
+                            width, height = source.size
+                            if source.getexif().get(274, 1) in {5, 6, 7, 8}:
+                                width, height = height, width
+                    except (OSError, ValueError, sources.SourceError):
+                        pass
                 details[face_id] = {
                     'path': path, 'track_start': track_start, 'track_stop': track_stop,
-                    'blur': blur, 'taken': taken, 'dhash': curated_hash or plain_hash}
+                    'blur': blur, 'taken': taken, 'dhash': curated_hash or plain_hash,
+                    'width': width, 'height': height}
             for fid, identity, status, source in self.store.db.execute(
                     'SELECT f.id,t.identity_id,t.status,p.source FROM faces f '
                     'LEFT JOIN face_track_identities t ON t.face_id=f.id '
@@ -1254,7 +1357,7 @@ class App:
             info = details.get(face_id, {})
             path = self.store.by_id[face_id][1]
             described.append({
-                'id': face_id, 'path': path, 'folder': str(Path(path).parent),
+                'id': face_id, 'path': path, 'folder': pathkeys.parent(path),
                 'kind': 'video' if video_media.is_video(path) else 'photo',
                 'taken': info.get('taken'), 'dhash': info.get('dhash'),
                 'vector': vectors.get(face_id), 'blur': info.get('blur')})
@@ -1299,9 +1402,14 @@ class App:
                 # Скан мог обновить лица, не меняя их число: метки досчитываем.
                 self.store.refresh_labels()
             import video_identities
-            if (video_identities.needs_rebuild(self.store.db) and not self.device.status().get('active')
+            if (video_identities.needs_auto_rebuild(self.store.db) and not self.device.status().get('active')
                     and self.recluster_job.status()['status'] not in {'running', 'stopped', 'error'}):
-                self.recluster_job.start()
+                try:
+                    self.recluster_job.start()
+                except (RuntimeError, ValueError) as exc:
+                    # У хаба группы пересобирает ядро; нет ядра — подождут его.
+                    if not getattr(exc, 'quiet', False):
+                        print(f'Пересборка групп отложена: {exc}', file=sys.stderr, flush=True)
             groups = [self.without(group, masked) for group in self.store.groups()]
             groups = [group for group in groups if group['face_ids']]
             # Скрытый альбом — решение владельца картотеки, не приватность
@@ -1536,9 +1644,12 @@ class App:
         'photo_adult_analysis.description,photos.modified,photos.kind,photos.duration,'
         'photo_analysis.caption_short,photo_analysis.caption_search,'
         'photo_analysis.caption_tags_json,photo_analysis.caption_json,'
-        'video_speech.text,photos.size,photo_analysis.width,photo_analysis.height')
+        'video_speech.text,photos.size,COALESCE(photo_thumbs.width,photo_analysis.width),'
+        'COALESCE(photo_thumbs.height,photo_analysis.height)')
+    # Размеры оригинала знает превью (ядро снимает их при обходе источника).
     PHOTO_SOURCE = (
         'FROM photos LEFT JOIN faces ON faces.path=photos.path '
+        'LEFT JOIN photo_thumbs ON photo_thumbs.path=photos.path '
         'LEFT JOIN photo_analysis ON photo_analysis.path=photos.path '
         'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=photos.path '
         'LEFT JOIN video_speech ON video_speech.path=photos.path '
@@ -1707,7 +1818,7 @@ class App:
             dirs = dict(db.execute("SELECT path,dir FROM photos WHERE status='ok'"))
 
             def keys_of(path, modified):
-                return (dirs.get(path) or str(Path(path).parent),)
+                return (dirs.get(path) or pathkeys.parent(path),)
         elif by in ('album', 'person'):
             sql = ('SELECT path,album_id FROM album_photos' if by == 'album' else
                    'SELECT DISTINCT faces.path,people.name FROM faces '
@@ -1874,8 +1985,8 @@ class App:
                 # Группа — та же самая, что и в разделе «Люди»: по имени, если
                 # оно есть, иначе по автокластеру (face_clusters), а не по
                 # случайному совпадению строки имени или отдельной карточке.
-                for face_id, path, moment, person_id, name, bigfam_id in self.store.db.execute(
-                        f'SELECT faces.id,faces.path,faces.frame_time,face_people.person_id,'
+                for face_id, path, moment, raw_box, person_id, name, bigfam_id in self.store.db.execute(
+                        f'SELECT faces.id,faces.path,faces.frame_time,faces.box,face_people.person_id,'
                         f'people.name,people.bigfam_id FROM faces '
                         f'LEFT JOIN face_people ON face_people.face_id=faces.id '
                         f'LEFT JOIN people ON people.id=face_people.person_id '
@@ -1883,10 +1994,17 @@ class App:
                     label = self.store.auto_labels.get(face_id, -1)
                     group = (f'person:{person_id}' if person_id is not None
                             else f'auto:{label}' if label != -1 else f'noise:{face_id}')
+                    try:
+                        box = json.loads(raw_box)[:4] if raw_box else None
+                        if not isinstance(box, list) or len(box) != 4:
+                            box = None
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        box = None
                     faces_by_path[path].append({
                         'id': face_id, 'thumbnail': f'/media/thumb/{face_id}',
                         'frame_time': moment, 'name': name, 'bigfam_id': bigfam_id,
-                        'group': group})
+                        'group': group,
+                        'box': box})
         # Multi-label роутер показываем рядом с описанием. Ручная разметка имеет
         # приоритет: подтверждённый отрицательный тег не должен всплывать из AI.
         router_by_path = {path: [] for path in paths}
@@ -1926,8 +2044,32 @@ class App:
                         })
                     router_by_path[raw].sort(
                         key=lambda item: (not item['verified'], -item['score'], item['title']))
+        # Анализ может хранить размер уменьшенной рабочей копии. Для карточки
+        # одного снимка читаем только заголовок исходника: рамки лиц хранятся в
+        # его координатах, а просмотрщик показывает уменьшенную копию.
+        source_dimensions = {}
+        if exact_path and rows and rows[0][14] != 'video':
+            with self.lock:
+                known = self.store.db.execute(
+                    'SELECT width,height FROM photo_thumbs WHERE path=? AND size=? '
+                    'AND modified=?', (rows[0][0], rows[0][21], rows[0][13])).fetchone()
+            if known and known[0] and known[1]:
+                # Превью сделано из этой же версии файла: его размеры — размеры оригинала.
+                source_dimensions[rows[0][0]] = known
+            else:
+                try:
+                    with self.open_image(self.file_for(rows[0][0])) as source:
+                        width, height = source.size
+                        if source.getexif().get(274, 1) in {5, 6, 7, 8}:
+                            width, height = height, width
+                        source_dimensions[rows[0][0]] = (width, height)
+                except (OSError, ValueError, sources.SourceError):
+                    pass
+        source_names = self.hub.source_names() if self.hub is not None else {}
         return [{
-            'path': path, 'filename': Path(path).name, 'folder': str(Path(path).parent),
+            'path': path, 'filename': pathkeys.name(path), 'folder': pathkeys.parent(path),
+            'source': pathkeys.source_of(path),
+            'source_name': source_names.get(pathkeys.source_of(path), pathkeys.source_of(path)),
             'preview': f'/media/photo?path={quote(path, safe="")}&v={round((modified or 0) / 1e6)}',
             'face_id': face_id,
             'content_type': content_type, 'blur_score': blur_score,
@@ -1950,7 +2092,9 @@ class App:
             'video': (f'/media/video?path={quote(path, safe="")}' if kind == 'video' else ''),
             # Время файла в миллисекундах: галерее нужна дата снимка.
             'taken': round((modified or 0) / 1e6) or None,
-            'size': size or 0, 'width': width or 0, 'height': height or 0,
+            'size': size or 0,
+            'width': source_dimensions.get(path, (width or 0, height or 0))[0],
+            'height': source_dimensions.get(path, (width or 0, height or 0))[1],
         } for path, face_id, content_type, blur_score, caption, ocr_text,
               ocr_status, caption_status, adult_rating, adult_score, adult_tags,
               adult_regions, adult_description, modified, kind, duration,
@@ -2027,6 +2171,42 @@ class App:
             result.append({**group, 'photos': items})
         return {'groups': result, 'total': len(chosen), 'summary': summary,
                 'offset': offset, 'limit': limit}
+
+    def duplicate_export(self, similar=False, viewer='', admin=False):
+        """Compact hash inventory for comparing this catalog with other devices."""
+        with self.lock:
+            skip = {row[0] for row in self.store.db.execute(
+                'SELECT path FROM hidden_photos' + ('' if admin else ' WHERE owner<>?'),
+                () if admin else (viewer or '',))}
+            columns = 'path,size,sha1,dhash,width,height'
+            rows = self.store.db.execute(
+                f'SELECT {columns} FROM photo_hashes '
+                'WHERE sha1 IS NOT NULL' + (' AND dhash IS NOT NULL' if similar else '')
+                + ' ORDER BY path').fetchall()
+        items = [{'path': path, 'size': size or 0, 'sha1': sha1,
+                  'dhash': dhash if similar else None,
+                  'width': width or 0, 'height': height or 0}
+                 for path, size, sha1, dhash, width, height in rows if path not in skip]
+        return {'items': items, 'hashed': len(items),
+                'pictured': sum(item['dhash'] is not None for item in items)}
+
+    def duplicate_cards(self, paths, viewer='', admin=False):
+        """Hydrate a small cross-device result page without exporting the catalog."""
+        wanted = list(dict.fromkeys(str(path) for path in (paths or [])))
+        if not wanted or len(wanted) > 200:
+            raise ValueError('Выберите от 1 до 200 фотографий')
+        visible = self.visible_paths(wanted, viewer, admin)
+        shown = [path for path in wanted if path in visible]
+        cards = {item['path']: item for item in self.hydrate_payloads(shown)}
+        with self.lock:
+            marks = ','.join('?' * len(shown))
+            shapes = ({row[0]: row[1:] for row in self.store.db.execute(
+                f'SELECT path,size,width,height FROM photo_hashes WHERE path IN ({marks})', shown)}
+                if shown else {})
+        return {'photos': [{**cards[path], 'size': shapes.get(path, (0, 0, 0))[0] or 0,
+                            'width': shapes.get(path, (0, 0, 0))[1] or 0,
+                            'height': shapes.get(path, (0, 0, 0))[2] or 0}
+                           for path in shown if path in cards]}
 
     def visible_paths(self, paths, viewer='', admin=False, hide_adult=False):
         """Какие из путей этому зрителю можно показать в обычной галерее."""
@@ -2110,7 +2290,7 @@ class App:
         for size in (0, 240, 400, 640, 960, 1440, 2200):
             for blur in ('', 'explicit', 'regions', 'full'):
                 key = hashlib.sha1(
-                    f'{Path(raw_path).resolve()}|{stamp}|{size}|{blur}'.encode('utf-8')).hexdigest()
+                    f'{raw_path}|{stamp}|{size}|{blur}'.encode('utf-8')).hexdigest()
                 (folder / key[:2] / f'{key}.jpg').unlink(missing_ok=True)
 
     def folder_paths(self, folder):
@@ -2123,8 +2303,21 @@ class App:
     def delete_photos(self, paths):
         return self._delete_photos(paths, limit=500)
 
-    def _delete_photos(self, paths, limit=None):
+    def _remove_originals(self, targets):
+        """Файлы — в корзину. targets: [(ключ каталога, где файл лежит сейчас)]."""
+        if self.hub is not None:
+            return self.hub.remove_originals(targets)
         from send2trash import send2trash
+        deleted, errors = [], []
+        for raw, stored in targets:
+            try:
+                send2trash(stored)
+                deleted.append(raw)
+            except OSError as exc:
+                errors.append({'path': raw, 'error': str(exc)})
+        return deleted, errors
+
+    def _delete_photos(self, paths, limit=None):
         paths = list(dict.fromkeys(str(path) for path in (paths or [])))
         if not paths or (limit is not None and len(paths) > limit):
             raise ValueError(f'Выберите от 1 до {limit} фотографий' if limit
@@ -2139,17 +2332,14 @@ class App:
                 'SELECT thumbnail FROM faces WHERE path=?', (path,))] for path in known}
             stamps = dict(self.store.db.execute(
                 f'SELECT path,modified FROM photos WHERE path IN ({placeholders})', paths))
-            deleted, errors = [], []
-            for raw in paths:
-                if raw not in known:
-                    errors.append({'path': raw, 'error': 'Фотография не найдена в каталоге'})
-                    continue
-                try:
-                    # Скрытый снимок лежит в личной папке, а не по исходному пути.
-                    send2trash(stored.get(raw, raw))
-                    deleted.append(raw)
-                except OSError as exc:
-                    errors.append({'path': raw, 'error': str(exc)})
+        errors = [{'path': raw, 'error': 'Фотография не найдена в каталоге'}
+                  for raw in paths if raw not in known]
+        # Скрытый снимок лежит в личной папке, а не по исходному пути. Файлы
+        # удаляются без замка каталога: в сетевом источнике это надолго.
+        deleted, failed = self._remove_originals(
+            [(raw, stored.get(raw, raw)) for raw in paths if raw in known])
+        errors.extend(failed)
+        with self.lock:
             if deleted:
                 deleted_marks = ','.join('?' for _ in deleted)
                 with self.store.db:
@@ -2167,6 +2357,8 @@ class App:
                         f'DELETE FROM photos WHERE path IN ({deleted_marks})', deleted)
                 privacy.forget(self.store.db, deleted)
                 duplicates.forget(self.store.db, deleted)
+                if self.hub is not None:
+                    self.hub.forget_thumbs(self.store.db, deleted)
                 for raw in deleted:
                     self.drop_previews(raw, stamps.get(raw))
                     for thumbnail in thumbnails.get(raw, []):
@@ -2186,6 +2378,10 @@ class App:
             result = self._delete_photos(paths, limit=None)
             self.folders.refresh(force=True)
             return {**result, 'folder_removed': False}
+        if self.hub is not None:
+            self.hub.remove_folder(folder)
+            self.folders.refresh(force=True)
+            return {'deleted': 0, 'folder_removed': True, 'errors': []}
         directory = Path(folder).resolve()
         if not directory.is_dir():
             raise ValueError('Папка не найдена')
@@ -2196,11 +2392,67 @@ class App:
         self.folders.refresh(force=True)
         return {'deleted': 0, 'folder_removed': True, 'errors': []}
 
+    RENAMED_TABLES = (
+        'faces', 'photo_analysis', 'photo_adult_analysis',
+        'photo_embeddings', 'photo_hashes', 'album_photos',
+        'router_batch_items', 'router_predictions', 'router_reviews',
+        'router_training_labels', 'video_diarization',
+        'video_speaker_faces', 'video_speaker_turns',
+        'video_speakers', 'video_speech', 'video_speech_segments',
+        'photo_curation', 'photo_thumbs', 'video_people_hints', 'highlight_photos')
+
+    def _hub_move(self, moves, target):
+        """Перенос внутри источника: файлы двигает источник, ключи — каталог."""
+        if not moves:
+            raise ValueError('В этой папке нет медиа из каталога')
+        paths = [old for old, _new in moves]
+        marks = ','.join('?' for _ in paths)
+        with self.lock:
+            if self.store.db.execute(
+                    f'SELECT 1 FROM hidden_photos WHERE path IN ({marks}) LIMIT 1',
+                    paths).fetchone():
+                raise ValueError('Среди выбранных есть скрытые медиа; '
+                                 'сначала верните их из скрытого альбома')
+            new_marks = ','.join('?' for _ in moves)
+            conflict = self.store.db.execute(
+                f'SELECT path FROM photos WHERE path IN ({new_marks}) LIMIT 1',
+                [new for _old, new in moves]).fetchone()
+        if conflict:
+            raise ValueError(f'Путь уже есть в каталоге: {conflict[0]}')
+        done, errors = self.hub.move_originals(moves)
+        if done:
+            with self.lock, self.store.db:
+                for old, new in done:
+                    for table in self.RENAMED_TABLES:
+                        try:
+                            self.store.db.execute(
+                                f'UPDATE {table} SET path=? WHERE path=?', (new, old))
+                        except sqlite3.Error:
+                            pass
+                    self.store.db.execute('UPDATE photos SET path=?,dir=? WHERE path=?',
+                                          (new, pathkeys.parent(new), old))
+            self.hub.rename_thumbs(done)
+            with self.lock:
+                self.store.reload_faces()
+            self.folders.refresh(force=True)
+        return {'moved': len(done), 'target': target, 'errors': errors}
+
     def move_folder_media(self, folder, target):
         folder = str(folder or '').strip()
         target = str(target or '').strip()
         if not folder or not target:
             raise ValueError('Выберите исходную папку и папку назначения')
+        if self.hub is not None:
+            folder, target = pathkeys.trim(folder), pathkeys.trim(target)
+            if pathkeys.source_of(folder) != pathkeys.source_of(target):
+                raise ValueError('Переносить можно только внутри одного источника')
+            if pathkeys.inside(target, folder):
+                raise ValueError('Нельзя перемещать папку внутрь самой себя')
+            destination = pathkeys.join(target, pathkeys.name(folder))
+            start = pathkeys.prefix(folder)
+            moves = [(key, pathkeys.join(destination, key[len(start):]))
+                     for key in self.folder_paths(folder) if key.startswith(start)]
+            return self._hub_move(moves, destination)
         source_dir, target_dir = Path(folder).resolve(), Path(target).resolve()
         if not target_dir.is_dir():
             raise ValueError('Папка назначения не найдена')
@@ -2279,6 +2531,84 @@ class App:
                     print(f'Failed to roll back move for {old}', file=sys.stderr, flush=True)
             raise
 
+    def move_photos(self, paths, target):
+        """Переместить выбранные медиа прямо в указанную папку."""
+        paths = list(dict.fromkeys(str(path or '').strip() for path in paths if path))
+        if self.hub is not None:
+            target = pathkeys.trim(str(target or '').strip())
+            if not paths:
+                raise ValueError('Файлы для перемещения не выбраны')
+            if any(pathkeys.source_of(path) != pathkeys.source_of(target) for path in paths):
+                raise ValueError('Переносить можно только внутри одного источника')
+            moves = [(path, pathkeys.join(target, pathkeys.name(path))) for path in paths
+                     if pathkeys.parent(path) != target]
+            return self._hub_move(moves, target)
+        target_dir = Path(str(target or '').strip()).resolve()
+        if not paths:
+            raise ValueError('Файлы для перемещения не выбраны')
+        if not target_dir.is_dir():
+            raise ValueError('Папка назначения не найдена')
+        hidden = {row[0] for row in self.store.db.execute(
+            f"SELECT path FROM hidden_photos WHERE path IN ({','.join('?' for _ in paths)})",
+            paths)}
+        if hidden:
+            raise ValueError('Среди выбранных есть скрытые медиа; сначала верните их из скрытого альбома')
+        moves, errors = [], []
+        for raw in paths:
+            source = self.file_for(raw).resolve()
+            destination = target_dir / source.name
+            if source.parent == target_dir:
+                errors.append({'path': raw, 'error': 'Файл уже находится в папке назначения'})
+            elif destination.exists():
+                errors.append({'path': raw, 'error': 'Файл с таким именем уже есть в папке назначения'})
+            elif not source.is_file():
+                errors.append({'path': raw, 'error': 'Файл не найден на диске'})
+            else:
+                moves.append((raw, str(destination), source, destination))
+        if errors:
+            return {'moved': 0, 'target': str(target_dir), 'errors': errors}
+        new_paths = [item[1] for item in moves]
+        if new_paths:
+            marks = ','.join('?' for _ in new_paths)
+            conflict = self.store.db.execute(
+                f'SELECT path FROM photos WHERE path IN ({marks}) LIMIT 1', new_paths).fetchone()
+            if conflict:
+                raise ValueError(f'Путь уже есть в каталоге: {conflict[0]}')
+        moved = []
+        try:
+            for raw, new_raw, source, destination in moves:
+                shutil.move(str(source), str(destination))
+                moved.append((raw, new_raw, source, destination))
+            with self.lock, self.store.db:
+                for old, new, _source, _destination in moved:
+                    new_dir = str(Path(new).parent)
+                    for table in (
+                        'faces', 'photo_analysis', 'photo_adult_analysis',
+                        'photo_embeddings', 'photo_hashes', 'album_photos',
+                        'router_batch_items', 'router_predictions', 'router_reviews',
+                        'router_training_labels', 'video_diarization',
+                        'video_speaker_faces', 'video_speaker_turns',
+                        'video_speakers', 'video_speech', 'video_speech_segments',
+                    ):
+                        try:
+                            self.store.db.execute(
+                                f'UPDATE {table} SET path=? WHERE path=?', (new, old))
+                        except sqlite3.Error:
+                            pass
+                    self.store.db.execute('UPDATE photos SET path=?,dir=? WHERE path=?',
+                                          (new, new_dir, old))
+                self.store.reload_faces()
+            self.folders.refresh(force=True)
+            return {'moved': len(moved), 'target': str(target_dir), 'errors': []}
+        except Exception:
+            for _old, _new, source, destination in reversed(moved):
+                try:
+                    if destination.exists() and not source.exists():
+                        shutil.move(str(destination), str(source))
+                except OSError:
+                    print(f'Failed to roll back move for {source}', file=sys.stderr, flush=True)
+            raise
+
     def resolve_groups(self, keys):
         wanted = set(keys)
         return [face_id for group in self.store.groups() if group['key'] in wanted
@@ -2304,6 +2634,10 @@ class Handler(BaseHTTPRequestHandler):
         print(f'{self.address_string()} - {format % args}', flush=True)
 
     def allowed_host(self):
+        # К хабу server.js ходит по имени сервиса compose (homecloud-hub), а
+        # защиту от подмены DNS даёт токен, который хаб требует на каждый запрос.
+        if self.app.hub is not None:
+            return True
         host = self.headers.get('Host', '').split(':', 1)[0].lower()
         if host in {'127.0.0.1', 'localhost', socket.gethostname().lower()}:
             return True
@@ -2347,10 +2681,19 @@ class Handler(BaseHTTPRequestHandler):
     def error_json(self, status, message):
         self.json_response({'error': message}, status)
 
+    def hub_denied(self):
+        """У хаба каждый запрос — от server.js с его токеном: порт виден в сети."""
+        return self.app.hub is not None and not secrets.compare_digest(
+            self.headers.get('X-Local-Token', ''), self.app.token)
+
     def do_GET(self):
         if not self.allowed_host():
             return self.error_json(403, 'Недопустимый Host')
+        if self.hub_denied():
+            return self.error_json(403, 'Неверный токен хаба')
         parsed = urlparse(self.path)
+        if self.app.hub is not None and self.app.hub_api.owns(parsed.path):
+            return self.app.hub_api.dispatch(self, 'GET', parsed, None)
         try:
             if parsed.path == '/api/state':
                 viewer, admin = self.viewer
@@ -2479,6 +2822,12 @@ class Handler(BaseHTTPRequestHandler):
                     hide_adult=query.get('adult', [''])[0] == 'hide'))
             if parsed.path == '/api/duplicates/status':
                 return self.json_response(self.app.duplicates.status())
+            if parsed.path == '/api/duplicates/export':
+                query = parse_qs(parsed.query)
+                viewer, admin = self.viewer
+                return self.json_response(self.app.duplicate_export(
+                    similar=query.get('similar', ['0'])[0] == '1',
+                    viewer=viewer, admin=admin))
             if parsed.path == '/api/duplicates':
                 query = parse_qs(parsed.query)
                 viewer, admin = self.viewer
@@ -2496,7 +2845,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response({
                         'settings': catalog_settings.read(self.app.store.db),
                         'defaults': catalog_settings.DEFAULTS,
-                        'visual_models': catalog_settings.visual_models()})
+                        'visual_models': self.app.device.info()['visual_models']})
             if parsed.path == '/api/albums':
                 with self.app.lock:
                     return self.json_response({'albums': albums.tree(self.app.store.db)})
@@ -2559,10 +2908,20 @@ class Handler(BaseHTTPRequestHandler):
                     hidden=query.get('hidden', ['0'])[0] == '1')
                 if not photos:
                     return self.error_json(404, 'Фотография не найдена')
-                try:
-                    metadata = media_metadata.read(self.app.file_for(path))
-                except OSError as exc:
-                    return self.error_json(404, str(exc) or 'Файл не открылся')
+                stored = None
+                if self.app.hub is not None:
+                    # Сведения собрало ядро при обходе источника — файл не нужен.
+                    with self.app.lock:
+                        stored = self.app.store.db.execute(
+                            'SELECT metadata_json FROM photo_thumbs WHERE path=?',
+                            (path,)).fetchone()
+                if stored and stored[0]:
+                    metadata = json.loads(stored[0])
+                else:
+                    try:
+                        metadata = media_metadata.read(self.app.file_for(path))
+                    except (OSError, sources.SourceError) as exc:
+                        return self.error_json(404, str(exc) or 'Файл не открылся')
                 return self.json_response({'path': path, **metadata})
             if parsed.path == '/api/speech':
                 query = parse_qs(parsed.query)
@@ -2666,6 +3025,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error_json(413, 'Запрос слишком большой')
             body = json.loads(self.rfile.read(length) or b'{}')
             path = urlparse(self.path).path
+            if self.app.hub is not None and self.app.hub_api.owns(path):
+                return self.app.hub_api.dispatch(self, 'POST', urlparse(self.path), body)
             if path == '/api/scan/start':
                 return self.json_response({'ok': True, 'scan': self.app.scanner.start()})
             if path == '/api/scan/stop':
@@ -2798,7 +3159,8 @@ class Handler(BaseHTTPRequestHandler):
                     result = privacy.hide(
                         self.app.store.db, self.app.catalog_folder, viewer,
                         body.get('paths', []),
-                        catalog_settings.read(self.app.store.db))
+                        catalog_settings.read(self.app.store.db),
+                        move=self.app.hub is None)
                 return self.json_response({'ok': True, **result})
             if path == '/api/photos/reveal':
                 viewer, admin = self.viewer
@@ -2825,6 +3187,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/duplicates/scan':
                 return self.json_response({'ok': True, 'job': self.app.duplicates.start(
                     bool(body.get('similar')))})
+            if path == '/api/duplicates/cards':
+                viewer, admin = self.viewer
+                return self.json_response(self.app.duplicate_cards(
+                    body.get('paths', []), viewer=viewer, admin=admin))
             if path == '/api/duplicates/stop':
                 return self.json_response({'ok': True, 'job': self.app.duplicates.stop()})
             if path == '/api/settings':
@@ -2904,6 +3270,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/photos/folder/move':
                 return self.json_response({'ok': True, **self.app.move_folder_media(
                     body.get('folder', ''), body.get('target', ''))})
+            if path == '/api/photos/move':
+                return self.json_response({'ok': True, **self.app.move_photos(
+                    body.get('paths', []), body.get('target', ''))})
             with self.app.lock:
                 if path == '/api/assign-groups':
                     self.app.store.assign(self.app.resolve_groups(body.get('group_keys', [])),
@@ -2934,22 +3303,38 @@ class Handler(BaseHTTPRequestHandler):
             print(f'POST error: {exc}', file=sys.stderr, flush=True)
             return self.error_json(500, 'Внутренняя ошибка локального сервера')
 
+    @staticmethod
+    def media_size(media):
+        return media.stat().st_size if isinstance(media, Path) else media.size()
+
+    @staticmethod
+    def media_open(media):
+        return media.open('rb') if isinstance(media, Path) else media.open()
+
+    def send_stream(self, media, content_type, cache='private, max-age=3600'):
+        self.send_headers(200, content_type, self.media_size(media), cache)
+        with self.media_open(media) as stream:
+            shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
+
     def send_media(self, raw_id, original):
         try:
             face_id = int(raw_id)
             row = self.app.store.by_id[face_id]
         except (ValueError, KeyError):
             return self.error_json(404, 'Лицо не найдено')
-        path = (self.app.file_for(row[1]).resolve() if original
-                else (self.app.store.folder / row[3]).resolve())
-        if not path.is_file():
-            return self.error_json(404, 'Файл не найден')
-        if original and video_media.is_video(path):
-            return self.send_range(path, mimetypes.guess_type(path.name)[0] or 'video/mp4')
-        content_type = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
-        self.send_headers(200, content_type, path.stat().st_size, 'private, max-age=3600')
-        with path.open('rb') as stream:
-            shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
+        if not original:
+            path = (self.app.store.folder / row[3]).resolve()
+            if not path.is_file():
+                return self.error_json(404, 'Файл не найден')
+            return self.send_stream(path, mimetypes.guess_type(path.name)[0] or 'image/jpeg')
+        media = self.app.file_for(row[1]).resolve()
+        if not media.is_file():
+            return self.error_json(404, 'Оригинал недоступен: источник не в сети')
+        content_type = mimetypes.guess_type(pathkeys.name(row[1]))[0] or 'application/octet-stream'
+        if video_media.is_video(row[1]):
+            return self.send_range(media, content_type if content_type.startswith('video/')
+                                   else 'video/mp4')
+        return self.send_stream(media, content_type)
 
     def send_face_crop(self, raw_id, margin=0.5, size=640):
         """Квадратный кадр вокруг лица из оригинала — на аватарку миниатюры мелковаты."""
@@ -2961,17 +3346,24 @@ class Handler(BaseHTTPRequestHandler):
         with self.app.lock:
             box = self.app.store.db.execute(
                 'SELECT box,frame_time FROM faces WHERE id=?', (face_id,)).fetchone()
-        path = self.app.file_for(row[1]).resolve()
-        if box is None or not box[0] or not path.is_file():
-            return self.error_json(404, 'Файл не найден')
         margin = min(max(margin, 0.0), 2.0)
         size = min(max(size, 64), 1600)
+        cache = (self.preview_file(f'face:{face_id}:{row[1]}', size, '', box[0], margin)
+                 if self.app.hub is not None and box and box[0] else None)
+        if cache is not None and cache.is_file():
+            body = cache.read_bytes()
+            self.send_headers(200, 'image/jpeg', len(body), 'private, max-age=3600')
+            self.wfile.write(body)
+            return
+        media = self.app.file_for(row[1]).resolve()
+        if box is None or not box[0] or not media.is_file():
+            return self.send_face_fallback(row)
         try:
-            if video_media.is_video(path):
+            if video_media.is_video(row[1]):
                 # Лицо жило на конкретной секунде ролика — туда и перематываем.
-                image = video_media.to_image(video_media.poster(path, box[1] or 0))
+                image = video_media.to_image(video_media.poster(media, box[1] or 0))
             else:
-                with Image.open(path) as original:
+                with self.app.open_image(media) as original:
                     image = ImageOps.exif_transpose(original).convert('RGB')
             left, top, right, bottom = (float(value) for value in json.loads(box[0]))
             side = max(right - left, bottom - top) * (1 + margin)
@@ -2983,12 +3375,25 @@ class Handler(BaseHTTPRequestHandler):
             crop.thumbnail((size, size))
             stream = io.BytesIO()
             crop.save(stream, 'JPEG', quality=88)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError, sources.SourceError) as exc:
             print(f'Face crop failed for {face_id}: {exc}', file=sys.stderr, flush=True)
-            return self.error_json(404, 'Не удалось вырезать кадр')
+            return self.send_face_fallback(row)
         body = stream.getvalue()
+        if cache is not None:
+            # Аватарки у хаба запоминаются: без источника они всё равно нужны.
+            try:
+                cache.write_bytes(body)
+            except OSError:
+                pass
         self.send_headers(200, 'image/jpeg', len(body), 'private, max-age=3600')
         self.wfile.write(body)
+
+    def send_face_fallback(self, row):
+        """Оригинала нет — отдаём миниатюру лица, лишь бы не пустое место."""
+        path = (self.app.store.folder / row[3]).resolve() if row[3] else None
+        if path is None or not path.is_file():
+            return self.error_json(404, 'Файл не найден')
+        return self.send_stream(path, 'image/jpeg', 'private, max-age=300')
 
     # Пороги ниже, чем у рейтинга: лишний размытый кусок не страшен, пропущенный — страшен.
     INTIMATE = {'FEMALE_GENITALIA_EXPOSED': .25, 'MALE_GENITALIA_EXPOSED': .25,
@@ -3039,34 +3444,42 @@ class Handler(BaseHTTPRequestHandler):
         folder.mkdir(parents=True, exist_ok=True)
         return folder / f'{key}.jpg'
 
+    def adult_regions(self, raw_path):
+        with self.app.lock:
+            row = self.app.store.db.execute(
+                'SELECT rating,regions_json FROM photo_adult_analysis '
+                "WHERE path=? AND status='ok'", (raw_path,)).fetchone()
+        return (row[0] if row else 'unknown'), (json.loads(row[1]) if row else [])
+
+    def apply_blur(self, image, blur, raw_path, scale=1.0):
+        """Замыливание по правилам 18+; scale — во сколько раз копия меньше оригинала."""
+        from PIL import ImageFilter
+        rating, regions = self.adult_regions(raw_path)
+        if scale != 1.0:
+            regions = [{**item, 'box': [value * scale for value in item.get('box', [])]}
+                       for item in regions if len(item.get('box', [])) == 4]
+        covered = 0 if blur == 'full' else self.blur_regions(image, regions, blur)
+        # Кадр считается небезопасным, а закрывать нечего — прячем целиком:
+        # детектор мелкий и промахивается, оставлять «как есть» нельзя.
+        if blur == 'full' or (not covered and rating in {'explicit', 'nudity'}):
+            image = image.filter(ImageFilter.GaussianBlur(max(18, min(image.size) / 24)))
+        return image
+
     def render_preview(self, path, size, blur, raw_path, moment=0):
         """Готовит уменьшенную копию, при необходимости с замыленными областями."""
-        from PIL import Image, ImageFilter, ImageOps
-        is_video = video_media.is_video(path)
+        is_video = video_media.is_video(raw_path)
         if is_video:
             # У ролика обложка — кадр из начала; дальше всё как с фотографией,
             # включая блюр: рейтинг 18+ у видео теперь тоже считается.
             image = video_media.to_image(video_media.poster(path, moment))
-        elif blur:
-            with Image.open(path) as source:
-                image = ImageOps.exif_transpose(source).convert('RGB')
         else:
-            with Image.open(path) as source:
-                # draft разбирает JPEG сразу в уменьшенном виде — это в разы быстрее.
-                source.draft('RGB', (size * 2, size * 2))
+            with self.app.open_image(path) as source:
+                if not blur:
+                    # draft разбирает JPEG сразу в уменьшенном виде — это в разы быстрее.
+                    source.draft('RGB', (size * 2, size * 2))
                 image = ImageOps.exif_transpose(source).convert('RGB')
         if blur:
-            with self.app.lock:
-                row = self.app.store.db.execute(
-                    'SELECT rating,regions_json FROM photo_adult_analysis '
-                    "WHERE path=? AND status='ok'", (raw_path,)).fetchone()
-            rating = row[0] if row else 'unknown'
-            regions = json.loads(row[1]) if row else []
-            covered = 0 if blur == 'full' else self.blur_regions(image, regions, blur)
-            # Кадр считается небезопасным, а закрывать нечего — прячем целиком:
-            # детектор мелкий и промахивается, оставлять «как есть» нельзя.
-            if blur == 'full' or (not covered and rating in {'explicit', 'nudity'}):
-                image = image.filter(ImageFilter.GaussianBlur(max(18, min(image.size) / 24)))
+            image = self.apply_blur(image, blur, raw_path)
         image.thumbnail((size, size))
         stream = io.BytesIO()
         image.save(stream, 'JPEG', quality=84, optimize=True, progressive=True)
@@ -3074,7 +3487,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_range(self, path, content_type, cache='private, max-age=3600'):
         """Отдаём файл кусками: без этого браузер не перематывает видео."""
-        total = path.stat().st_size
+        total = self.media_size(path)
         header = self.headers.get('Range', '')
         start, end = 0, total - 1
         partial = False
@@ -3104,7 +3517,7 @@ class Handler(BaseHTTPRequestHandler):
         if partial:
             self.send_header('Content-Range', f'bytes {start}-{end}/{total}')
         self.end_headers()
-        with path.open('rb') as stream:
+        with self.media_open(path) as stream:
             stream.seek(start)
             left = length
             while left > 0:
@@ -3125,31 +3538,61 @@ class Handler(BaseHTTPRequestHandler):
             return self.error_json(404, 'Видео не найдено в каталоге')
         path = self.app.file_for(row[0]).resolve()
         if not path.is_file():
-            return self.error_json(404, 'Файл не найден')
-        content_type = mimetypes.guess_type(path.name)[0] or 'video/mp4'
+            return self.error_json(404, 'Видео недоступно: источник не в сети')
+        content_type = mimetypes.guess_type(pathkeys.name(row[0]))[0] or 'video/mp4'
         return self.send_range(path, content_type)
+
+    def send_thumb(self, raw_path, blur, info):
+        """Превью сетки с хаба: без источника и без ядра."""
+        thumb = self.app.hub.thumb_file(raw_path)
+        if thumb is None:
+            return False
+        if not blur:
+            body = thumb.read_bytes()
+        else:
+            with Image.open(thumb) as source:
+                image = source.convert('RGB')
+            width = info[2] if info and info[2] else 0
+            scale = image.width / width if width else 1.0
+            image = self.apply_blur(image, blur, raw_path, scale)
+            stream = io.BytesIO()
+            image.save(stream, 'JPEG', quality=82)
+            body = stream.getvalue()
+        self.send_headers(200, 'image/jpeg', len(body), 'private, max-age=604800')
+        self.wfile.write(body)
+        return True
 
     def send_photo(self, raw_path, blur='', size=0, moment=0):
         with self.app.lock:
             row = self.app.store.db.execute(
-                "SELECT path FROM photos WHERE path=? AND status='ok'", (raw_path,)).fetchone()
+                "SELECT path,modified FROM photos WHERE path=? AND status='ok'",
+                (raw_path,)).fetchone()
+            info = self.app.store.db.execute(
+                'SELECT size,modified,width,height FROM photo_thumbs WHERE path=?',
+                (raw_path,)).fetchone() if self.app.hub is not None else None
         if row is None:
             return self.error_json(404, 'Фотография не найдена в каталоге')
-        path = self.app.file_for(row[0]).resolve()
-        if not path.is_file():
-            return self.error_json(404, 'Файл не найден')
         blur = blur if blur in {'explicit', 'regions', 'full'} else ''
-        size = next((step for step in self.PREVIEW_STEPS if step >= size), self.PREVIEW_STEPS[-1]) \
-            if size > 0 else (self.PREVIEW_STEPS[-1] if blur else 0)
-        if video_media.is_video(path):
+        size = next((step for step in self.PREVIEW_STEPS if step >= size),
+                    self.PREVIEW_STEPS[-1]) if size > 0 else (self.PREVIEW_STEPS[-1] if blur else 0)
+        is_video = video_media.is_video(row[0])
+        if is_video:
             # Целиком ролик сюда отдавать нельзя — это картинка обложки,
             # но блюр 18+ на ней работает так же, как у обычного фото.
             size = size or self.PREVIEW_STEPS[-2]
+        hub = self.app.hub
+        # Сетка у хаба берётся из своих превью: источник для неё не нужен.
+        if (hub is not None and size and size <= hub_grid_limit() and not moment
+                and self.send_thumb(row[0], blur, info)):
+            return
+        path = self.app.file_for(row[0]).resolve()
         if size or blur:
             try:
-                stamp = path.stat().st_mtime_ns
-                cache = self.preview_file(path, size, blur, stamp, moment)
+                stamp = row[1] if hub is not None else path.stat().st_mtime_ns
+                cache = self.preview_file(row[0], size, blur, stamp, moment)
                 if not cache.is_file():
+                    if hub is not None and not path.is_file():
+                        raise FileNotFoundError('источник не в сети')
                     body = self.render_preview(path, size, blur, raw_path, moment)
                     temporary = cache.with_suffix('.tmp')
                     temporary.write_bytes(body)
@@ -3161,12 +3604,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_headers(200, 'image/jpeg', len(body), 'private, max-age=604800')
                 self.wfile.write(body)
                 return
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
+            except (OSError, ValueError, json.JSONDecodeError, sources.SourceError) as exc:
                 print(f'Preview failed for {raw_path}: {exc}', file=sys.stderr, flush=True)
-        content_type = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
-        self.send_headers(200, content_type, path.stat().st_size, 'private, max-age=3600')
-        with path.open('rb') as stream:
-            shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
+                # Оригинал не достать — крупнее превью у хаба ничего нет.
+                if hub is not None and self.send_thumb(row[0], blur, info):
+                    return
+                if hub is not None:
+                    return self.error_json(404, 'Источник не в сети, а превью ещё нет')
+        if not path.is_file():
+            return self.error_json(404, 'Файл недоступен: источник не в сети')
+        content_type = mimetypes.guess_type(pathkeys.name(row[0]))[0] or 'application/octet-stream'
+        self.send_stream(path, content_type)
 
     def send_static(self, raw_path):
         if not WEB_ROOT.is_dir():
@@ -3199,6 +3647,18 @@ def main():
                         help='файл с постоянным токеном; создаётся, если его нет')
     parser.add_argument('--device-id')
     parser.add_argument('--device-name')
+    parser.add_argument('--role', choices=('local', 'hub', 'core'), default='local',
+                        help='local — бэкенд одного компьютера; hub — каталог на VM; '
+                             'core — вычислитель при хабе')
+    parser.add_argument('--hub-data', type=Path,
+                        help='hub: папка реестров (sources.json, cores.json, пакеты ядра)')
+    parser.add_argument('--link-port', type=int, default=18401,
+                        help='hub: порт, на который ходят ядра')
+    parser.add_argument('--link-url', default='',
+                        help='hub: адрес этого порта, как его видят ядра')
+    parser.add_argument('--ssh-key', type=Path, help='hub: ключ для SSH к устройствам')
+    parser.add_argument('--legacy', type=Path,
+                        help='core: старый каталог этого устройства для переноса на хаб')
     args = parser.parse_args()
     if args.host not in {'0.0.0.0', '127.0.0.1', 'localhost'}:
         parser.error('--host must be 0.0.0.0, 127.0.0.1 or localhost')
@@ -3210,10 +3670,28 @@ def main():
         token = args.token_file.read_text(encoding='ascii').strip()
         if not token:
             parser.error(f'Пустой токен в {args.token_file}')
+    if args.role == 'core':
+        import core
+        if not token:
+            parser.error('Ядру нужен --token-file: им хаб подписывает запросы')
+        return core.serve(args, token)
+    hub = None
+    if args.role == 'hub':
+        import hub as hub_module
+        if not token:
+            parser.error('Хабу нужен --token-file: им server.js подписывает запросы')
+        hub = hub_module.Hub(args.data, args.hub_data or args.data, args.link_url,
+                             str(args.ssh_key) if args.ssh_key else None)
+        hub_module.serve_link(hub, args.host, args.link_port)
+        print(f'Порт связи ядер: {args.link_port}', flush=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
     server.app = App(args.data, args.min_cluster_size, token,
-                     args.device_id, args.device_name, args.max_faces)
+                     args.device_id, args.device_name, args.max_faces, hub=hub)
+    if hub is not None:
+        import hub as hub_module
+        server.app.hub_api = hub_module.HubApi(server.app, hub)
+        args.no_browser = True
     browser_host = '127.0.0.1' if args.host == '0.0.0.0' else args.host
     url = f'http://{browser_host}:{server.server_port}/'
     print(f'Local photo UI: {url}', flush=True)

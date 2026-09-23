@@ -10,6 +10,8 @@ import sys
 import time
 import traceback
 
+import hublink
+import pathkeys
 import pathrules
 import settings as catalog_settings
 from catalog_index import EXCLUDED_NAMES, SUPPORTED, connect as index_db, take_inventory
@@ -45,12 +47,15 @@ ANALYSIS_FEATURES = ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', '
 CATALOG_FEATURES = ('highlights',)
 
 
-def planned_phases(features):
+def planned_phases(features, remote=False):
     """Этапы задания в том порядке, в котором их на самом деле выполняет run()."""
     plan = []
     if features.get('inventory') or (
             not features.get('faces') and any(features.get(name) for name in ANALYSIS_FEATURES)):
         plan.append('inventory')
+        # У ядра при хабе обход источника всегда обновляет превью сетки.
+        if remote:
+            plan.append('thumbs')
     if features.get('faces'):
         plan.append('faces')
     if any(features.get(name) for name in ('visual', 'ocr', 'caption')):
@@ -192,8 +197,8 @@ def inventory(args):
     try:
         # Даже остановленный на середине обход уже что-то нашёл и сохранил —
         # эти цифры возвращаем тоже, а не отбрасываем как пустой результат.
-        summary = take_inventory(db, args.root or [path.parent for path in args.path],
-                                 report=report, stop=args.stop_file.exists,
+        roots = args.root or sorted({pathkeys.parent(path) for path in args.path})
+        summary = take_inventory(db, roots, report=report, stop=args.stop_file.exists,
                                  rules=pathrules.load(args.catalog))
         record['finished_at'] = time.time()
         record['status'] = 'stopped' if summary.get('stopped') else 'done'
@@ -210,8 +215,8 @@ def inventory(args):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--catalog', type=Path, required=True)
-    parser.add_argument('--root', action='append', type=Path, default=[])
-    parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--root', action='append', type=str, default=[])
+    parser.add_argument('--path', action='append', type=str, default=[])
     parser.add_argument('--features', required=True)
     parser.add_argument('--kinds', default='{}',
                         help='JSON «фаза → вид файлов»: all, photos или videos')
@@ -221,8 +226,9 @@ def parse_args():
                         help='Переделать даже то, что уже посчитано для этой версии файла')
     args = parser.parse_args()
     args.catalog = args.catalog.resolve()
-    args.root = [root.resolve() for root in args.root]
-    args.path = [path.resolve() for path in args.path]
+    # Ключи источников (pc-x:D:\\Фото) остаются как есть, свои пути — абсолютными.
+    args.root = [pathkeys.normalize_arg(root) for root in args.root]
+    args.path = [pathkeys.normalize_arg(path) for path in args.path]
     if not args.root and not args.path:
         parser.error('provide at least one --root or --path')
     args.features = json.loads(args.features)
@@ -232,9 +238,25 @@ def parse_args():
     return args
 
 
+def thumbnails(args):
+    """Превью сетки и сведения о файлах — на хаб, для нового и изменившегося."""
+    here = Path(__file__).resolve().parent
+    stage = args.progress_file.with_name('device-stage-progress.json')
+    command = [sys.executable, str(here / 'thumbs.py'), '--catalog', str(args.catalog),
+               '--progress-file', str(stage), '--stop-file', str(args.stop_file)]
+    if args.force:
+        command.append('--force')
+    for root in args.root:
+        command.extend(('--root', root))
+    for path in args.path:
+        command.extend(('--path', path))
+    run_child(args, command, 'thumbs')
+
+
 def run(args):
     args.job_started_at = time.time()
-    args.plan = planned_phases(args.features)
+    args.remote = hublink.is_remote(args.catalog)
+    args.plan = planned_phases(args.features, args.remote)
     args.history = {}
     args.timings = read_json(timings_file(args))
     args.stop_file.unlink(missing_ok=True)
@@ -249,6 +271,8 @@ def run(args):
 
     def indexed(folder):
         """Есть ли готовая опись этой папки: тогда лица не будут обходить диск."""
+        if pathkeys.is_key(folder):
+            return ['--use-inventory']
         try:
             db = index_db(args.catalog)
             try:
@@ -269,6 +293,11 @@ def run(args):
         if summary.get('stopped'):
             publish(args, 'stopped', 'inventory', inventory=summary)
             return
+        if args.remote:
+            thumbnails(args)
+            if args.stop_file.exists():
+                publish(args, 'stopped', 'thumbs', inventory=summary)
+                return
         if not any(args.features.get(name) for name in
                    ('faces', *ANALYSIS_FEATURES, *CATALOG_FEATURES)):
             publish(args, 'completed', 'complete', completed=summary.get('total', 0),
@@ -289,13 +318,15 @@ def run(args):
     if args.features.get('faces') and args.path:
         parents = {}
         for path in args.path:
-            parents.setdefault(path.parent, []).append(path)
+            parents.setdefault(pathkeys.parent(path), []).append(path)
         for root, paths in parents.items():
+            # Файлы источника берутся из описи: сам источник лица не обходят.
+            keyed = ['--use-inventory'] if pathkeys.is_key(root) else []
             command = [str(face_python), str(here / 'prototype.py'), 'scan',
                        '--photos', str(root), '--models', str(here / 'models' / 'buffalo_l'),
                        '--data', str(args.catalog), '--limit', str(len(paths)), '--min-side', '160',
                        '--progress-file', str(stage), '--stop-file', str(args.stop_file),
-                       *force, *kinds_of('faces')]
+                       *force, *keyed, *kinds_of('faces')]
             for path in paths:
                 command.extend(('--include-path', str(path)))
             run_child(args, command, 'faces')
@@ -315,10 +346,17 @@ def run(args):
             if args.stop_file.exists():
                 publish(args, 'stopped', 'faces')
                 return
-    elif any(args.features.get(name) for name in ANALYSIS_FEATURES):
+    elif (any(args.features.get(name) for name in ANALYSIS_FEATURES)
+          and not args.features.get('inventory')):
+        # Опись уже прошла в начале задания — второй раз обходить источник незачем.
         if inventory(args).get('stopped'):
             publish(args, 'stopped', 'inventory')
             return
+        if args.remote:
+            thumbnails(args)
+            if args.stop_file.exists():
+                publish(args, 'stopped', 'thumbs')
+                return
 
     root_args = [item for root in args.root for item in ('--root', str(root))]
     root_args.extend(item for path in args.path for item in ('--path', str(path)))

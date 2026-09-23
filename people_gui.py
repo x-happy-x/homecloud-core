@@ -8,12 +8,16 @@ import sqlite3
 import sys
 
 import numpy as np
-from PySide6.QtCore import QSize, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QIcon
-from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
-)
+try:
+    from PySide6.QtCore import QSize, Qt, QUrl
+    from PySide6.QtGui import QDesktopServices, QIcon
+    from PySide6.QtWidgets import (
+        QApplication, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+        QMainWindow, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    )
+except ImportError:
+    # Хабу на VM окно Qt не нужно — ему нужен только CatalogStore.
+    QMainWindow = object
 
 import albums
 from authenticity_photos import ANIME_THRESHOLD
@@ -195,7 +199,7 @@ class CatalogStore:
             # The scanner / ReclusterController owns the CPU work and its connection.
             if not video_identities.needs_rebuild(self.db) and self.db.execute('SELECT 1 FROM faces f LEFT JOIN face_clusters c ON c.face_id=f.id WHERE c.face_id IS NULL LIMIT 1').fetchone():
                 with self.db:
-                    video_identities.mark_dirty(self.db)
+                    video_identities.mark_dirty(self.db, 'scan')
             return 0
         self.measure_quality()
         pending = [row[0] for row in self.db.execute(
@@ -483,7 +487,7 @@ class CatalogStore:
         with self.db:
             self.db.execute('DELETE FROM group_avatars WHERE group_key=?', (group_key,))
 
-    def _snapshot(self, face_ids, description):
+    def _snapshot(self, face_ids, description, mark_identity_dirty=True):
         face_ids = sorted(set(face_ids))
         people = dict(self.db.execute(
             f'SELECT face_id,person_id FROM face_people WHERE face_id IN ({",".join("?" * len(face_ids))})',
@@ -494,10 +498,16 @@ class CatalogStore:
         origins = {r[0]: r[1:] for r in self.db.execute('SELECT face_id,source,score,version FROM face_people')}
         state = [{'face_id': face_id, 'origin': origins.get(face_id), 'person_id': people.get(face_id),
                   'excluded': face_id in excluded} for face_id in face_ids]
-        video_identities.mark_dirty(self.db)
-        self.db.execute('INSERT INTO label_history(created_at,description,before_json) VALUES(?,?,?)',
-                        (datetime.now(timezone.utc).isoformat(), description,
-                         json.dumps(state, separators=(',', ':'))))
+        # Ручное имя сразу хранится в face_people и не требует дорогой полной
+        # пересборки. Для операций, меняющих ограничения автогруппировки
+        # (исключение/undo), пересборку по-прежнему помечаем необходимой.
+        if mark_identity_dirty:
+            video_identities.mark_dirty(self.db)
+        cursor = self.db.execute(
+            'INSERT INTO label_history(created_at,description,before_json) VALUES(?,?,?)',
+            (datetime.now(timezone.utc).isoformat(), description,
+             json.dumps(state, separators=(',', ':'))))
+        return cursor.lastrowid
 
     def find_or_create_person(self, name, bigfam_id=None):
         """Человек по имени: та же запись, если уже есть, иначе новая."""
@@ -521,7 +531,8 @@ class CatalogStore:
         if not face_ids:
             raise ValueError('Выберите группу или лица')
         with self.db:
-            self._snapshot(face_ids, f'Назначено имя «{name.strip()}»')
+            self._snapshot(face_ids, f'Назначено имя «{name.strip()}»',
+                           mark_identity_dirty=False)
             person_id = self.find_or_create_person(name, bigfam_id)
             self.db.executemany(
                 'INSERT INTO face_people(face_id,person_id) VALUES(?,?) '
@@ -538,7 +549,30 @@ class CatalogStore:
             raise ValueError('Выберите ошибочно сгруппированные лица')
         now = datetime.now(timezone.utc).isoformat()
         with self.db:
-            self._snapshot(face_ids, 'Лица исключены из автоматических групп')
+            history_id = self._snapshot(face_ids, 'Лица исключены из автоматических групп')
+            placeholders = ','.join('?' * len(face_ids))
+            labels = [row[0] for row in self.db.execute(
+                f'SELECT DISTINCT label FROM face_clusters WHERE face_id IN ({placeholders})',
+                face_ids)]
+            people = [row[0] for row in self.db.execute(
+                f'SELECT DISTINCT person_id FROM face_people WHERE face_id IN ({placeholders})',
+                face_ids)]
+            peers = set()
+            if labels:
+                marks = ','.join('?' * len(labels))
+                peers.update(row[0] for row in self.db.execute(
+                    f'SELECT face_id FROM face_clusters WHERE label IN ({marks})', labels))
+            if people:
+                marks = ','.join('?' * len(people))
+                peers.update(row[0] for row in self.db.execute(
+                    f'SELECT face_id FROM face_people WHERE person_id IN ({marks})', people))
+            peers.difference_update(face_ids)
+            conflicts = {(min(face_id, peer), max(face_id, peer), now, history_id)
+                         for face_id in face_ids for peer in peers if face_id != peer}
+            self.db.executemany(
+                'INSERT INTO face_identity_conflicts(face_a,face_b,created_at,history_id) '
+                "VALUES(?,?,? ,?) ON CONFLICT(face_a,face_b) DO UPDATE SET "
+                'created_at=excluded.created_at,history_id=excluded.history_id', conflicts)
             self.db.executemany('DELETE FROM face_people WHERE face_id=?',
                                 [(face_id,) for face_id in face_ids])
             self.db.executemany(
@@ -616,6 +650,7 @@ class CatalogStore:
         states = json.loads(row[2])
         with self.db:
             video_identities.mark_dirty(self.db)
+            self.db.execute('DELETE FROM face_identity_conflicts WHERE history_id=?', (row[0],))
             for state in states:
                 face_id = state['face_id']
                 self.db.execute('DELETE FROM face_people WHERE face_id=?', (face_id,))

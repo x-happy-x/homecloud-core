@@ -31,6 +31,10 @@ import time
 
 import numpy as np
 
+import catalogdb
+import pathkeys
+import video as video_media
+
 DEFAULT_MODEL = 'pyannote/speaker-diarization-community-1'
 
 # На длинных роликах со сменой акустики (шум, музыка, разное расстояние до
@@ -42,7 +46,7 @@ MERGE_SIMILARITY = 0.6
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=30)
+    db = catalogdb.connect(catalog, timeout=30)
     db.execute('PRAGMA foreign_keys=ON')
     db.executescript('''
         CREATE TABLE IF NOT EXISTS video_diarization (
@@ -119,15 +123,7 @@ def progress(path, **state):
 
 def scope_sql(roots, paths, column='path'):
     """Условие «только выбранные папки и файлы» — как в остальных этапах."""
-    clauses, values = [], []
-    for root in roots:
-        value = str(Path(root).resolve()).rstrip('\\/')
-        clauses.append(f'({column}=? OR {column} LIKE ?)')
-        values.extend((value, value + os.sep + '%'))
-    for path in paths:
-        clauses.append(f'{column}=?')
-        values.append(str(Path(path).resolve()))
-    return (' AND (' + ' OR '.join(clauses) + ')' if clauses else ''), values
+    return pathkeys.scope_sql(roots, paths, column)
 
 
 def pending(db, args):
@@ -451,8 +447,8 @@ def main():
     parser.add_argument('--hf-token', default='')
     parser.add_argument('--progress-file', type=Path)
     parser.add_argument('--stop-file', type=Path)
-    parser.add_argument('--root', action='append', type=Path, default=[])
-    parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--root', action='append', type=str, default=[])
+    parser.add_argument('--path', action='append', type=str, default=[])
     parser.add_argument('--force', action='store_true',
                         help='Разложить заново, даже если уже посчитано')
     args = parser.parse_args()
@@ -495,7 +491,7 @@ def main():
         state['current'] = path
         progress(target, **state)
         try:
-            audio = decode_audio(path, sampling_rate=16000)
+            audio = decode_audio(video_media.local(path), sampling_rate=16000)
             turns, speakers = diarize(pipeline, audio)
             turns, speakers = merge_close_speakers(turns, speakers)
             links = link_speakers_to_faces(db, path, turns)

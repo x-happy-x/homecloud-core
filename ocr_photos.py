@@ -8,6 +8,7 @@ import time
 import numpy as np
 
 from analyze_photos import connect
+import pathkeys
 import video as video_media
 
 
@@ -50,27 +51,16 @@ def main():
     parser.add_argument('--limit', type=int, default=1000)
     parser.add_argument('--progress-file', type=Path)
     parser.add_argument('--stop-file', type=Path)
-    parser.add_argument('--root', action='append', type=Path, default=[])
-    parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--root', action='append', type=str, default=[])
+    parser.add_argument('--path', action='append', type=str, default=[])
     parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
                         help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--force', action='store_true',
                         help='Распознать текст заново, даже если он уже есть')
     args = parser.parse_args()
     db = connect(args.catalog.resolve())
-    root_sql = ''
-    root_values = []
-    scope = []
-    if args.root:
-        for root in args.root:
-            value = str(root.resolve()).rstrip('\\/')
-            scope.append('(path=? OR path LIKE ?)')
-            root_values.extend((value, value + os.sep + '%'))
-    for path in args.path:
-        scope.append('path=?')
-        root_values.append(str(path.resolve()))
-    if scope:
-        root_sql = ' AND (' + ' OR '.join(scope) + ')'
+    # Папки и снимки задания — ключи источников (см. pathkeys.py).
+    root_sql, root_values = pathkeys.scope_sql(args.root, args.path, 'path')
     candidate_sql = '' if args.path else ''' AND
           (content_type IN ('screenshot','document','meme') OR
            lower(path) LIKE '%screenshot%' OR lower(path) LIKE '%скриншот%')'''

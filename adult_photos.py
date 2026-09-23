@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 from analyze_photos import connect
+import pathkeys
 import settings as catalog_settings
 import video as video_media
 
@@ -228,15 +229,7 @@ def evaluate_path(detector, torch, model, transform, labels, path, threshold, ta
 
 
 def scoped_rows(db, args):
-    clauses, values = [], []
-    for root in args.root:
-        value = str(root.resolve()).rstrip('\\/')
-        clauses.append('(photos.path=? OR photos.path LIKE ?)')
-        values.extend((value, value + os.sep + '%'))
-    for path in args.path:
-        clauses.append('photos.path=?')
-        values.append(str(path.resolve()))
-    scope = ' AND (' + ' OR '.join(clauses) + ')' if clauses else ''
+    scope, values = pathkeys.scope_sql(args.root, args.path, 'photos.path')
     freshness = '' if args.force else ''' AND (
       photo_adult_analysis.path IS NULL OR photo_adult_analysis.size != photos.size OR
       photo_adult_analysis.modified != photos.modified OR photo_adult_analysis.status != 'ok'
@@ -286,8 +279,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--catalog', type=Path, required=True)
     parser.add_argument('--limit', type=int, default=100)
-    parser.add_argument('--root', action='append', type=Path, default=[])
-    parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--root', action='append', type=str, default=[])
+    parser.add_argument('--path', action='append', type=str, default=[])
     parser.add_argument('--kinds', choices=video_media.KINDS, default='all',
                         help='Считать снимки, ролики или всё сразу')
     parser.add_argument('--progress-file', type=Path)

@@ -1,4 +1,4 @@
-<#
+﻿<#
   Поднимает backend.ps1 в фоне по команде SSH. Через WMI (Win32_Process.Create),
   а не Start-Process: Windows-OpenSSH держит всю SSH-сессию в одном Job Object и
   убивает его целиком при закрытии соединения — «отвязанный» через Start-Process

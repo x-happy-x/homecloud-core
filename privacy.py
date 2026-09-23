@@ -76,8 +76,12 @@ def where(viewer, admin, hidden):
     return ' AND photos.path NOT IN (SELECT path FROM hidden_photos)', []
 
 
-def hide(db, catalog, viewer, paths, values=None):
-    """Переносим файлы в личную папку владельца и запоминаем, где они теперь."""
+def hide(db, catalog, viewer, paths, values=None, move=True):
+    """Переносим файлы в личную папку владельца и запоминаем, где они теперь.
+
+    У хаба (move=False) файл остаётся на месте в своём источнике: прячется он
+    только в каталоге, а переносить оригиналы с NAS в чужую папку незачем.
+    """
     ensure_schema(db)
     if not viewer:
         raise ValueError('Скрывать снимки может только вошедший пользователь')
@@ -90,6 +94,12 @@ def hide(db, catalog, viewer, paths, values=None):
             errors.append({'path': raw, 'error': 'Снимок не найден в каталоге'})
             continue
         if db.execute('SELECT 1 FROM hidden_photos WHERE path=?', (raw,)).fetchone():
+            continue
+        if not move:
+            with db:
+                db.execute('INSERT INTO hidden_photos(path,owner,stored,hidden_at) '
+                           'VALUES(?,?,?,?)', (raw, viewer, raw, time.time()))
+            moved.append(raw)
             continue
         source = Path(raw)
         if not source.is_file():
@@ -124,7 +134,7 @@ def reveal(db, viewer, admin, paths):
             continue
         source, target = Path(stored), Path(raw)
         try:
-            if source.is_file():
+            if stored != raw and source.is_file():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
                     raise OSError('На исходном месте уже есть файл')

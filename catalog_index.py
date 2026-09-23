@@ -7,9 +7,12 @@
 from collections import defaultdict
 from datetime import datetime, timezone
 import os
+import re
 from pathlib import Path
 import sqlite3
 
+import catalogdb
+import pathkeys
 import pathrules
 import video as video_media
 
@@ -26,6 +29,8 @@ EXCLUDED_NAMES = {
     # а место для удалённого и восстановления системы; их содержимое не должно
     # ни попадать в галерею, ни считаться «удалённым», если его не сканировать.
     '$recycle.bin', 'recycler', 'system volume information',
+    # Корзина HomeCloud в сетевых источниках: удалённое из галереи лежит там.
+    '.homecloud-trash',
 }
 # Состояния относительно предыдущей описи.
 STATES = ('new', 'changed', 'known', 'missing', 'excluded')
@@ -55,6 +60,8 @@ def ensure_schema(db):
     for name in ('dir', 'state', 'last_run'):
         if name not in columns:
             db.execute(f'ALTER TABLE photos ADD COLUMN {name} TEXT')
+    if 'kind' not in columns:
+        db.execute("ALTER TABLE photos ADD COLUMN kind TEXT NOT NULL DEFAULT 'photo'")
     db.execute('CREATE INDEX IF NOT EXISTS photos_dir ON photos(dir)')
     db.commit()
     if 'dir' not in columns:
@@ -66,14 +73,13 @@ def backfill_dirs(db):
     """Старые записи не знают своей папки — проставляем один раз."""
     rows = db.execute('SELECT path FROM photos WHERE dir IS NULL').fetchall()
     db.executemany('UPDATE photos SET dir=? WHERE path=?',
-                   [(str(Path(path).parent), path) for (path,) in rows])
+                   [(pathkeys.parent(path), path) for (path,) in rows])
     db.commit()
 
 
 def bounds(directory):
     """Границы диапазона путей внутри папки: works для обычного сравнения строк."""
-    prefix = str(directory).rstrip('\\/') + os.sep
-    return prefix, prefix + '￿'
+    return pathkeys.bounds(str(directory))
 
 
 def exclusions(db):
@@ -85,14 +91,61 @@ def exclusions(db):
 
 def _builtin_excluded(path):
     """Путь лежит внутри служебной папки вроде node_modules или корзины."""
-    return any(part.casefold() in EXCLUDED_NAMES for part in Path(path).parts)
+    return any(part.casefold() in EXCLUDED_NAMES
+               for part in re.split(r'[\\/]', pathkeys.native(path)))
 
 
 def is_excluded(path, excluded_dirs, excluded_files):
     if path in excluded_files:
         return True
-    return any(path == item or path.startswith(item.rstrip('\\/') + os.sep)
-               for item in excluded_dirs)
+    return any(pathkeys.inside(path, item) for item in excluded_dirs)
+
+
+def walk_source(root, excluded_dirs, report=None, stop=None, rules=None, access=None):
+    """Обход папки источника через его драйвер: {ключ: (размер, mtime_ns)}.
+
+    Размер и время приходят вместе со списком папки — отдельный stat на
+    каждый файл по сети сделал бы опись в разы дольше.
+    """
+    import sources
+    access = access or sources.core_access()
+    driver, native = access.resolve(root)
+    source = pathkeys.source_of(root)
+    block, allow = rules or ([], [])
+    skip = {pathkeys.trim(item).casefold() for item in excluded_dirs}
+    found = {}
+    queue = [native]
+    seen_dirs = 0
+    while queue:
+        if stop and stop():
+            return found, True
+        current = queue.pop()
+        current_key = pathkeys.make(source, current)
+        try:
+            entries = driver.listdir(current)
+        except FileNotFoundError:
+            if current == native:
+                raise
+            continue
+        except (OSError, sources.SourceError) as exc:
+            if current == native:
+                raise
+            print(f'Папка не читается: {current_key}: {exc}', flush=True)
+            continue
+        for entry in sorted(entries, key=lambda item: item.name.casefold(), reverse=True):
+            key = pathkeys.join(current_key, entry.name)
+            if entry.is_dir:
+                if (entry.name.casefold() in EXCLUDED_NAMES or key.casefold() in skip
+                        or not pathrules.enter(key, block, allow)):
+                    continue
+                queue.append(pathkeys.native(key))
+            elif (pathkeys.suffix(entry.name) in SUPPORTED
+                  and not pathrules.blocked(key, block, allow)):
+                found[key] = (entry.size, entry.mtime_ns)
+        seen_dirs += 1
+        if report and seen_dirs % 10 == 0:
+            report(len(found), current_key)
+    return found, False
 
 
 def walk(roots, excluded_dirs, report=None, stop=None, rules=None):
@@ -146,9 +199,20 @@ def take_inventory(db, roots, report=None, stop=None, rules=None, batch=3000):
     ensure_schema(db)
     run = datetime.now(timezone.utc).isoformat()
     excluded_dirs, excluded_files = exclusions(db)
-    roots = [str(Path(root).resolve()) for root in roots]
-    found, walk_stopped = walk(roots, excluded_dirs, report=report, stop=stop,
+    roots = [pathkeys.trim(root) if pathkeys.is_key(root) else str(Path(root).resolve())
+             for root in roots]
+    local_roots = [root for root in roots if not pathkeys.is_key(root)]
+    found, walk_stopped = walk(local_roots, excluded_dirs, report=report, stop=stop,
                                rules=rules)
+    listed = {}
+    for root in roots:
+        if walk_stopped:
+            break
+        if pathkeys.is_key(root):
+            items, walk_stopped = walk_source(root, excluded_dirs, report=report, stop=stop,
+                                              rules=rules)
+            listed.update(items)
+    found.extend(listed)
 
     known = {}
     for root in roots:
@@ -168,21 +232,25 @@ def take_inventory(db, roots, report=None, stop=None, rules=None, batch=3000):
         if not pending:
             return
         with db:
-            db.executemany('''INSERT INTO photos(path,dir,size,modified,status,state,last_run,model)
-                VALUES(?,?,?,?,?,?,?,'inventory-v2') ON CONFLICT(path) DO UPDATE SET
+            db.executemany('''INSERT INTO photos(path,dir,size,modified,status,state,last_run,kind,model)
+                VALUES(?,?,?,?,?,?,?,?,'inventory-v2') ON CONFLICT(path) DO UPDATE SET
                 dir=excluded.dir,size=excluded.size,modified=excluded.modified,
-                status=excluded.status,state=excluded.state,last_run=excluded.last_run''', pending)
+                status=excluded.status,state=excluded.state,last_run=excluded.last_run,
+                kind=excluded.kind''', pending)
         pending.clear()
 
     for index, path in enumerate(found, 1):
         if stop and stop():
             processed_stopped = True
             break
-        try:
-            info = os.stat(path)
-            size, modified = info.st_size, info.st_mtime_ns
-        except OSError:
-            size, modified = 0, 0
+        if path in listed:
+            size, modified = listed[path]
+        else:
+            try:
+                info = os.stat(path)
+                size, modified = info.st_size, info.st_mtime_ns
+            except OSError:
+                size, modified = 0, 0
         previous = known.get(path)
         if is_excluded(path, excluded_dirs, excluded_files):
             state, status = 'excluded', 'excluded'
@@ -193,8 +261,10 @@ def take_inventory(db, roots, report=None, stop=None, rules=None, batch=3000):
         else:
             state = 'known'
             status = previous[2] if previous[2] in {'ok', 'ignored'} else 'ok'
-        folder = str(Path(path).parent)
-        pending.append((path, folder, size, modified, status, state, run))
+        folder = pathkeys.parent(path)
+        # Вид — по расширению: иначе ролик до анализа видео висит в галерее снимком.
+        kind = 'video' if video_media.is_video(path) else 'photo'
+        pending.append((path, folder, size, modified, status, state, run, kind))
         summary[state] += 1
         summary['bytes'] += size
         counters = per_dir[folder]
@@ -290,17 +360,18 @@ def rebuild_dirs(db, roots, per_dir=None, run=None):
                     counters[state] += 1
 
     totals = defaultdict(lambda: dict.fromkeys(('files', 'bytes', 'subtree', *STATES), 0))
-    tops = [str(Path(root).resolve()).rstrip('\\/') for root in roots]
+    tops = {pathkeys.trim(root if pathkeys.is_key(root) else str(Path(root).resolve()))
+            for root in roots}
     for folder, counters in per_dir.items():
-        current = Path(folder)
-        chain = [str(current)]
+        current = pathkeys.trim(folder)
+        chain = [current]
         # Выше выбранной папки не поднимаемся: там лежат чужие файлы.
-        while str(current).rstrip('\\/') not in tops:
-            parent = current.parent
+        while current not in tops:
+            parent = pathkeys.parent(current)
             if parent == current:
                 break
             current = parent
-            chain.append(str(current))
+            chain.append(current)
         own = totals[chain[0]]
         for key in ('files', 'bytes', *STATES):
             own[key] += counters[key]
@@ -314,15 +385,16 @@ def rebuild_dirs(db, roots, per_dir=None, run=None):
         for root in roots:
             low, high = bounds(root)
             db.execute('DELETE FROM photo_dirs WHERE path>=? AND path<?', (low, high))
-            db.execute('DELETE FROM photo_dirs WHERE path=?', (str(Path(root).resolve()),))
+            db.execute('DELETE FROM photo_dirs WHERE path=?', (
+                pathkeys.trim(root) if pathkeys.is_key(root) else str(Path(root).resolve()),))
         db.executemany('''INSERT INTO photo_dirs(path,parent,name,files,subtree,new,changed,
             missing,excluded,bytes,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET parent=excluded.parent,name=excluded.name,
             files=excluded.files,subtree=excluded.subtree,new=excluded.new,
             changed=excluded.changed,missing=excluded.missing,excluded=excluded.excluded,
             bytes=excluded.bytes,updated_at=excluded.updated_at''',
-            [(path, str(Path(path).parent) if str(Path(path).parent) != path else None,
-              Path(path).name or path, values['files'], values['subtree'], values['new'],
+            [(path, pathkeys.parent(path) if pathkeys.parent(path) != path else None,
+              pathkeys.name(path) or path, values['files'], values['subtree'], values['new'],
               values['changed'], values['missing'], values['excluded'], values['bytes'], run)
              for path, values in totals.items()])
 
@@ -334,8 +406,8 @@ def set_exclusions(db, add=(), remove=()):
     touched = set()
     with db:
         for path in add:
-            path = str(Path(path))
-            kind = 'dir' if Path(path).is_dir() else 'file'
+            path = _plain(path)
+            kind = _kind(db, path)
             db.execute('INSERT INTO scan_exclusions(path,kind,created_at) VALUES(?,?,?) '
                        'ON CONFLICT(path) DO UPDATE SET kind=excluded.kind', (path, kind, now))
             if kind == 'dir':
@@ -347,7 +419,7 @@ def set_exclusions(db, add=(), remove=()):
                            'WHERE path=?', (path,))
             touched.add(path)
         for path in remove:
-            path = str(Path(path))
+            path = _plain(path)
             db.execute('DELETE FROM scan_exclusions WHERE path=?', (path,))
             low, high = bounds(path)
             db.execute("UPDATE photos SET status='ok',state='known' "
@@ -358,8 +430,7 @@ def set_exclusions(db, add=(), remove=()):
     roots = {row[0] for row in db.execute('SELECT path FROM scan_roots')}
     affected = {root for root in roots
                 for path in touched
-                if path == root or path.startswith(root.rstrip('\\/') + os.sep)
-                or root.startswith(path.rstrip('\\/') + os.sep)}
+                if pathkeys.inside(path, root) or pathkeys.inside(root, path)}
     if affected:
         rebuild_dirs(db, sorted(affected))
         with db:
@@ -368,6 +439,22 @@ def set_exclusions(db, add=(), remove=()):
                     excluded=?,bytes=? WHERE path=?''', (*root_totals(db, root), root))
     return {'ok': True, 'excluded': db.execute(
         'SELECT COUNT(*) FROM scan_exclusions').fetchone()[0]}
+
+
+def _plain(path):
+    """Путь исключения в том виде, в каком он лежит в каталоге."""
+    path = str(path)
+    return pathkeys.trim(path) if pathkeys.is_key(path) else str(Path(path))
+
+
+def _kind(db, path):
+    """Папка или файл: у ключа источника — по описи, у своего пути — по диску."""
+    if pathkeys.is_key(path):
+        if db.execute('SELECT 1 FROM photo_dirs WHERE path=?', (path,)).fetchone() or \
+                db.execute('SELECT 1 FROM photos WHERE dir=? LIMIT 1', (path,)).fetchone():
+            return 'dir'
+        return 'file'
+    return 'dir' if Path(path).is_dir() else 'file'
 
 
 def tree(db, path='', limit=400):
@@ -379,7 +466,7 @@ def tree(db, path='', limit=400):
                  for row in db.execute('''SELECT path,first_run,last_run,files,new,changed,
                      missing,excluded,bytes FROM scan_roots ORDER BY path''')]
         return {'path': '', 'parent': None, 'roots': roots, 'directories': [], 'files': []}
-    path = str(Path(path))
+    path = _plain(path)
     excluded_dirs, excluded_files = exclusions(db)
     directories = [dict(zip(('path', 'name', 'files', 'subtree', 'new', 'changed', 'missing',
                              'excluded', 'bytes'), row))
@@ -391,11 +478,11 @@ def tree(db, path='', limit=400):
              for row in db.execute('''SELECT path,size,state,status FROM photos
                  WHERE dir=? ORDER BY path LIMIT ?''', (path, limit))]
     for item in files:
-        item['name'] = Path(item['path']).name
+        item['name'] = pathkeys.name(item['path'])
         item['off'] = item['status'] == 'excluded'
     own = db.execute('''SELECT files,subtree,new,changed,missing,excluded,bytes
         FROM photo_dirs WHERE path=?''', (path,)).fetchone()
-    parent = str(Path(path).parent)
+    parent = pathkeys.parent(path)
     return {'path': path, 'parent': None if parent == path else parent,
             'directories': directories, 'files': files,
             'totals': dict(zip(('files', 'subtree', 'new', 'changed', 'missing',
@@ -404,5 +491,5 @@ def tree(db, path='', limit=400):
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=30)
+    db = catalogdb.connect(catalog, timeout=30)
     return ensure_schema(db)

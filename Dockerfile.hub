@@ -1,0 +1,21 @@
+# Хаб HomeCloud: web_server.py --role hub. Каталог, превью, реестры источников и
+# ядер — в томе /var/lib/homecloud. Моделей и видеокарты здесь нет: считают ядра.
+FROM python:3.12-slim
+
+# smbclient — список шар SMB; ssh-клиент — на случай ручной отладки из контейнера.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends smbclient openssh-client libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements-hub.txt ./
+RUN pip install --no-cache-dir -r requirements-hub.txt
+
+COPY *.py ./
+
+ENV PYTHONUNBUFFERED=1 PYTHONUTF8=1 \
+    HUB_DATA=/var/lib/homecloud \
+    HUB_LINK_URL=http://127.0.0.1:18401
+EXPOSE 18400 18401
+
+CMD ["sh", "-c", "exec python web_server.py --role hub --data \"$HUB_DATA/catalog\" --hub-data \"$HUB_DATA\" --host 0.0.0.0 --port 18400 --link-port 18401 --link-url \"$HUB_LINK_URL\" --token-file \"$HUB_DATA/hub-token.txt\" --ssh-key \"$HUB_DATA/ssh/id_ed25519\" --max-faces 500000 --no-browser"]

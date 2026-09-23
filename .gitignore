@@ -24,3 +24,8 @@ __pycache__/
 .venv/
 .pip-cache/
 work/
+
+# Ядро при хабе: кто оно, связь с хабом, временные копии файлов источников
+core.json
+core-data/
+VERSION.json

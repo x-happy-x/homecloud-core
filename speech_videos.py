@@ -17,6 +17,10 @@ from pathlib import Path
 import sqlite3
 import time
 
+import catalogdb
+import pathkeys
+import video as video_media
+
 DEFAULT_MODEL = 'large-v3'
 DEFAULT_LANGUAGE = 'ru'
 
@@ -31,7 +35,7 @@ MIN_LANGUAGE_PROBABILITY = 0.5
 
 
 def connect(catalog):
-    db = sqlite3.connect(Path(catalog) / 'catalog.sqlite', timeout=30)
+    db = catalogdb.connect(catalog, timeout=30)
     db.execute('PRAGMA foreign_keys=ON')
     db.executescript('''
         CREATE TABLE IF NOT EXISTS video_speech (
@@ -80,15 +84,7 @@ def progress(path, **state):
 
 def scope_sql(roots, paths):
     """Условие «только выбранные папки и файлы» — как в остальных этапах."""
-    clauses, values = [], []
-    for root in roots:
-        value = str(Path(root).resolve()).rstrip('\\/')
-        clauses.append('(path=? OR path LIKE ?)')
-        values.extend((value, value + os.sep + '%'))
-    for path in paths:
-        clauses.append('path=?')
-        values.append(str(Path(path).resolve()))
-    return (' AND (' + ' OR '.join(clauses) + ')' if clauses else ''), values
+    return pathkeys.scope_sql(roots, paths, 'path')
 
 
 def pending(db, args):
@@ -215,8 +211,8 @@ def main():
                         help='Язык архива: берётся, когда определению нельзя верить')
     parser.add_argument('--progress-file', type=Path)
     parser.add_argument('--stop-file', type=Path)
-    parser.add_argument('--root', action='append', type=Path, default=[])
-    parser.add_argument('--path', action='append', type=Path, default=[])
+    parser.add_argument('--root', action='append', type=str, default=[])
+    parser.add_argument('--path', action='append', type=str, default=[])
     parser.add_argument('--force', action='store_true',
                         help='Расшифровать заново, даже если текст уже есть')
     args = parser.parse_args()
@@ -249,7 +245,7 @@ def main():
         state['current'] = path
         progress(target, **state)
         try:
-            audio = decode_audio(path, sampling_rate=16000)
+            audio = decode_audio(video_media.local(path), sampling_rate=16000)
         except Exception as exc:
             # У части роликов дорожки просто нет — это не поломка, а свойство файла.
             fail(db, path, size, modified, args.model, 'silent', f'Нет звука: {exc}')
