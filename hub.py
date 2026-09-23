@@ -283,6 +283,7 @@ class Hub:
         self.status_cache = {}
         self.status_lock = threading.Lock()
         self.installs = {}
+        self.parallel = Parallel(self)
         db = sqlite3.connect(self.database, timeout=60)
         try:
             # WAL: чтение интерфейса и запись ядер не мешают друг другу.
@@ -1085,6 +1086,150 @@ class RemoteSemantic:
         return result
 
 
+class Parallel:
+    """Одно задание на несколько ядер сразу.
+
+    Опись и превью — один раз, на ядре-хозяине источника (диск компьютера
+    читает только он). Пофайловые этапы — долями: ядро i из n берёт снимки
+    с rowid % n == i (pathkeys.shard_sql). Подборки строятся по всему
+    каталогу — один раз, после всех долей. Ядро берут, только если оно
+    умеет все выбранные этапы.
+    """
+    SINGLE = ('inventory', 'highlights')
+
+    def __init__(self, hub):
+        self.hub = hub
+        self.lock = threading.Lock()
+        self.state = None
+        self.stop_requested = False
+
+    def status(self):
+        with self.lock:
+            return dict(self.state) if self.state else {'status': 'idle'}
+
+    def eligible(self, per_file):
+        """Ядра в сети, свободные и умеющие все пофайловые этапы задания."""
+        result, skipped = [], []
+        for core, status in self.hub.online_cores():
+            if status.get('legacy'):
+                continue
+            capabilities = (status.get('device') or {}).get('capabilities') or {}
+            missing = [name for name in per_file if not capabilities.get(name)]
+            if (status.get('job') or {}).get('active'):
+                skipped.append(f"{core['name']}: занято")
+            elif missing:
+                skipped.append(f"{core['name']}: нет {', '.join(missing)}")
+            else:
+                result.append(core)
+        return result, skipped
+
+    def start(self, roots, features, video_features=None, force=False, visual_model=None,
+              cores=None):
+        roots = [pathkeys.trim(str(root)) for root in roots or []]
+        if not roots or any(not pathkeys.is_key(root) for root in roots):
+            raise ValueError('Выберите папки источников')
+        chosen = {name for name, on in {**(features or {}), **(video_features or {})}.items()
+                  if on}
+        per_file = sorted(chosen - set(self.SINGLE))
+        participants, skipped = self.eligible(per_file)
+        if cores:
+            participants = [core for core in participants if core['id'] in set(cores)]
+        if not participants:
+            raise ValueError('Нет свободного ядра, умеющего все выбранные этапы'
+                             + (f" ({'; '.join(skipped)})" if skipped else ''))
+        sources = {pathkeys.source_of(root) for root in roots}
+        owner = self.hub.pick_core(source_id=next(iter(sources)) if len(sources) == 1 else None)
+        with self.lock:
+            if self.state and self.state['status'] == 'running':
+                raise ValueError('Параллельное задание уже идёт')
+            self.stop_requested = False
+            self.state = {
+                'status': 'running', 'step': 'inventory', 'roots': roots,
+                'features': per_file, 'cores': [core['id'] for core in participants],
+                'owner': owner['id'], 'skipped': skipped, 'error': '',
+                'started_at': time.time(), 'finished_at': None, 'parts': []}
+        job = {'roots': roots, 'force': bool(force), 'visual_model': visual_model}
+        plan = {'features': features or {}, 'video_features': video_features,
+                'highlights': 'highlights' in chosen, 'per_file': per_file}
+        threading.Thread(target=self.run, args=(participants, owner, job, plan),
+                         daemon=True).start()
+        return self.status()
+
+    def stop(self):
+        with self.lock:
+            if not self.state or self.state['status'] != 'running':
+                raise ValueError('Параллельного задания нет')
+            self.stop_requested = True
+            targets = list(self.state['cores']) + [self.state['owner']]
+        for core_id in dict.fromkeys(targets):
+            try:
+                self.hub.core_call(core_id, '/api/device/job/stop', 'POST', {}, timeout=15)
+            except RuntimeError:
+                continue
+        return self.status()
+
+    def only(self, source, names):
+        return {name: bool(source.get(name)) for name in names} if source else None
+
+    def run(self, participants, owner, job, plan):
+        try:
+            self.step('inventory', [(owner, {'features': {'inventory': True}})], job)
+            per_file = plan['per_file']
+            if per_file:
+                count = len(participants)
+                self.step('shards', [
+                    (core, {'features': self.only(plan['features'], per_file),
+                            'video_features': self.only(plan['video_features'], per_file),
+                            'shard': {'index': index, 'count': count}})
+                    for index, core in enumerate(participants)], job)
+            if plan['highlights']:
+                # Доля «0 из 1»: ядро не обходит источник, фильтра по долям нет.
+                self.step('highlights', [(participants[0], {
+                    'features': {'highlights': True},
+                    'shard': {'index': 0, 'count': 1}})], job)
+            with self.lock:
+                self.state.update(status='completed', step='done', finished_at=time.time())
+        except Exception as exc:
+            with self.lock:
+                self.state.update(status='stopped' if self.stop_requested else 'error',
+                                  error='' if self.stop_requested else str(exc),
+                                  finished_at=time.time())
+
+    def step(self, name, launches, job):
+        """Запускает задания step на ядрах и ждёт, пока все закончат."""
+        if self.stop_requested:
+            raise RuntimeError('Остановлено')
+        parts = []
+        for core, extra in launches:
+            self.hub.core_call(core, '/api/device/job/start', 'POST', {**job, **extra}, timeout=60)
+            parts.append({'core': core['id'], 'name': core['name'],
+                          'shard': extra.get('shard'), 'status': 'running'})
+        with self.lock:
+            self.state.update(step=name, parts=parts)
+        while True:
+            time.sleep(3)
+            running = False
+            for part in parts:
+                status = self.hub.core_status(part['core'], max_age=0)
+                current = status.get('job') or {}
+                part.update(phase=current.get('phase'), completed=current.get('completed'),
+                            total=current.get('total'))
+                if not status.get('online'):
+                    part['status'] = 'offline'
+                elif current.get('active'):
+                    part['status'] = 'running'
+                    running = True
+                else:
+                    part['status'] = current.get('status') or 'completed'
+            with self.lock:
+                self.state['parts'] = [dict(part) for part in parts]
+            if not running:
+                break
+        failed = [part for part in parts if part['status'] not in {'completed', 'complete'}]
+        if failed:
+            raise RuntimeError('; '.join(f"{part['name']}: {part['status']}" for part in failed))
+
+
 class RemoteJobs:
     """Задания ядер вместо DeviceController: сводка для интерфейса и запуск."""
 
@@ -1231,6 +1376,15 @@ class HubApi:
         hub = self.hub
         parts = [unquote(part) for part in path.split('/')[2:]]
         head = parts[0]
+        if head == 'hub' and parts[1:] == ['parallel']:
+            if method == 'GET':
+                return hub.parallel.status()
+            return hub.parallel.start(body.get('roots') or [], body.get('features') or {},
+                                      body.get('video_features'), force=bool(body.get('force')),
+                                      visual_model=body.get('visual_model'),
+                                      cores=body.get('cores') or None)
+        if head == 'hub' and parts[1:] == ['parallel', 'stop'] and method == 'POST':
+            return hub.parallel.stop()
         if head == 'hub' and method == 'GET':
             return {'cores': hub.cores_payload(), 'sources': self.sources_payload()}
         if head == 'cores':

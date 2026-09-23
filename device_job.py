@@ -48,11 +48,12 @@ ANALYSIS_FEATURES = ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', '
 CATALOG_FEATURES = ('highlights',)
 
 
-def planned_phases(features, remote=False):
+def planned_phases(features, remote=False, shard=False):
     """Этапы задания в том порядке, в котором их на самом деле выполняет run()."""
     plan = []
-    if features.get('inventory') or (
-            not features.get('faces') and any(features.get(name) for name in ANALYSIS_FEATURES)):
+    # Доля параллельного задания не обходит источник: опись уже сделана.
+    if not shard and (features.get('inventory') or (
+            not features.get('faces') and any(features.get(name) for name in ANALYSIS_FEATURES))):
         plan.append('inventory')
         # У ядра при хабе обход источника всегда обновляет превью сетки.
         if remote:
@@ -116,6 +117,7 @@ def publish(args, status, phase, **extra):
         'plan': getattr(args, 'plan', []),
         'phase_history': getattr(args, 'history', {}),
         'timings': getattr(args, 'timings', {}),
+        'shard': getattr(args, 'shard', ''),
         'updated_at': time.time(), **extra,
     }
     write_json(args.progress_file, state)
@@ -225,6 +227,8 @@ def parse_args():
     parser.add_argument('--stop-file', type=Path, required=True)
     parser.add_argument('--force', action='store_true',
                         help='Переделать даже то, что уже посчитано для этой версии файла')
+    parser.add_argument('--shard', default='',
+                        help='«номер/всего»: доля параллельного задания; опись делает хаб отдельно')
     args = parser.parse_args()
     args.catalog = args.catalog.resolve()
     # Ключи источников (pc-x:D:\\Фото) остаются как есть, свои пути — абсолютными.
@@ -257,7 +261,7 @@ def thumbnails(args):
 def run(args):
     args.job_started_at = time.time()
     args.remote = hublink.is_remote(args.catalog)
-    args.plan = planned_phases(args.features, args.remote)
+    args.plan = planned_phases(args.features, args.remote, bool(args.shard))
     args.history = {}
     args.timings = read_json(timings_file(args))
     args.stop_file.unlink(missing_ok=True)
@@ -316,6 +320,9 @@ def run(args):
     audio_python = worker_root / 'audio-venv' / 'Scripts' / 'python.exe'
     imgutils_python = worker_root / 'imgutils-venv' / 'Scripts' / 'python.exe'
     stage = args.progress_file.with_name('device-stage-progress.json')
+    if args.shard:
+        # Этапы ниже берут файлы через pathkeys.scope_sql/shard_sql — только свою долю.
+        os.environ[pathkeys.SHARD_ENV] = args.shard
 
     if args.features.get('faces') and args.path:
         parents = {}
@@ -349,7 +356,7 @@ def run(args):
                 publish(args, 'stopped', 'faces')
                 return
     elif (any(args.features.get(name) for name in ANALYSIS_FEATURES)
-          and not args.features.get('inventory')):
+          and not args.features.get('inventory') and not args.shard):
         # Опись уже прошла в начале задания — второй раз обходить источник незачем.
         if inventory(args).get('stopped'):
             publish(args, 'stopped', 'inventory')

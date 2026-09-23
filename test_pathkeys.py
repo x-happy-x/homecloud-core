@@ -48,6 +48,27 @@ class PathKeysTest(unittest.TestCase):
         self.assertEqual(values, ['netcraze:/Photos', 'netcraze:/Photos/',
                                   'netcraze:/Photos/\uffff', 'pc-x:D:\\a.jpg'])
 
+    def test_shards_split_files(self):
+        import sqlite3
+        from unittest import mock
+        db = sqlite3.connect(':memory:')
+        db.execute('CREATE TABLE photos (path TEXT PRIMARY KEY)')
+        db.executemany('INSERT INTO photos VALUES(?)', [(f'nas:/p/{i}.jpg',) for i in range(10)])
+        db.execute('CREATE TABLE photo_analysis (path TEXT PRIMARY KEY)')
+        db.execute("INSERT INTO photo_analysis SELECT path FROM photos")
+        seen = []
+        for index in range(3):
+            with mock.patch.dict('os.environ', {pathkeys.SHARD_ENV: f'{index}/3'}):
+                where, values = pathkeys.scope_sql(['nas:/p'], (), 'photo_analysis.path')
+                seen.append({row[0] for row in db.execute(
+                    'SELECT path FROM photo_analysis WHERE 1' + where, values)})
+        self.assertEqual(sorted(len(part) for part in seen), [3, 3, 4])
+        self.assertEqual(set().union(*seen), {f'nas:/p/{i}.jpg' for i in range(10)})
+        with mock.patch.dict('os.environ', {pathkeys.SHARD_ENV: '0/1'}):
+            self.assertIsNone(pathkeys.shard())
+        with mock.patch.dict('os.environ', {pathkeys.SHARD_ENV: 'x'}):
+            self.assertEqual(pathkeys.shard_sql(), ('', []))
+
 
 if __name__ == '__main__':
     unittest.main()
