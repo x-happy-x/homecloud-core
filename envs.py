@@ -3,6 +3,9 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# Общие для машины папки прежней раскладки; на PC-X это ссылки.
+SHARED_MODELS = Path(r'C:\cv-models')
+SHARED_OCR = Path(r'C:\cv-ocr')
 
 
 def link_target(path):
@@ -15,6 +18,11 @@ def link_target(path):
         target = target[4:]
     target = Path(target)
     return target if target.is_absolute() else Path(path).parent / target
+
+
+def real(path):
+    """Путь, а если это ссылка — её цель."""
+    return link_target(path) or Path(path)
 
 
 def worker_root(root=ROOT):
@@ -31,3 +39,18 @@ def worker_root(root=ROOT):
 def python(venv, root=ROOT):
     """python.exe рабочего окружения: vision-venv, audio-venv, imgutils-venv…"""
     return worker_root(root) / venv / 'Scripts' / 'python.exe'
+
+
+def models_root(root=ROOT):
+    """Кэш моделей: models/cv-models ядра, иначе общий C:/cv-models (без прохода по ссылке)."""
+    own = real(Path(root) / 'models') / 'cv-models'
+    return own if own.is_dir() else real(SHARED_MODELS)
+
+
+def hf_home(root=ROOT):
+    """HF_HOME для окружений моделей."""
+    return models_root(root) / 'huggingface'
+
+
+def ocr_python():
+    return real(SHARED_OCR) / 'Scripts' / 'python.exe'

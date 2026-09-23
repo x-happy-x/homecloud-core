@@ -317,16 +317,18 @@ class SemanticService:
             self.process.wait(timeout=5)
         self.process = None
         env = os.environ.copy()
-        env['HF_HOME'] = r'C:\cv-models\huggingface'
+        env['HF_HOME'] = str(envs.hf_home(self.root))
         env['HF_HUB_DISABLE_XET'] = '1'
         env['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
         env['PYTHONUTF8'] = '1'
         flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-        self.process = subprocess.Popen(
-            [str(self.python), str(self.root / 'analyze_photos.py'), 'serve',
-             '--catalog', str(self.catalog), '--model', model], cwd=self.root, env=env,
-            creationflags=flags, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding='utf-8', bufsize=1)
+        # Журнал, а не DEVNULL: иначе упавшая модель видна только как пустой ответ.
+        with (self.catalog / 'semantic.log').open('w', encoding='utf-8', errors='replace') as log:
+            self.process = subprocess.Popen(
+                [str(self.python), str(self.root / 'analyze_photos.py'), 'serve',
+                 '--catalog', str(self.catalog), '--model', model], cwd=self.root, env=env,
+                creationflags=flags, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, text=True, encoding='utf-8', bufsize=1)
         ready = json.loads(self.process.stdout.readline())
         if not ready.get('ready'):
             raise RuntimeError('Семантическая модель не запустилась')
@@ -421,7 +423,7 @@ class RouterController:
             self.progress_file.unlink(missing_ok=True)
             self.stop_file.unlink(missing_ok=True)
             env = os.environ.copy()
-            env.update(HF_HOME=r'C:\cv-models\huggingface', HF_HUB_DISABLE_XET='1',
+            env.update(HF_HOME=str(envs.hf_home(self.root)), HF_HUB_DISABLE_XET='1',
                        HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', PYTHONUTF8='1')
             flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             self.process = subprocess.Popen(
@@ -446,7 +448,7 @@ class DeviceController:
 
     def __init__(self, catalog, device_id=None, device_name=None):
         self.root = Path(__file__).resolve().parent
-        self.model_cache = self.root / 'models' / 'cv-models' / 'huggingface'
+        self.model_cache = envs.hf_home(self.root)
         self.catalog = Path(catalog).resolve()
         self.device_id = device_id or socket.gethostname().casefold()
         self.device_name = device_name or socket.gethostname()
@@ -618,7 +620,7 @@ class DeviceController:
                 'faces': self.path_available(self.root / 'models' / 'buffalo_l'),
                 'visual': (self.path_available(vision, 'file')
                            and self.path_available(self.model_cache)),
-                'ocr': self.path_available(Path(r'C:\cv-ocr\Scripts\python.exe'), 'file'),
+                'ocr': self.path_available(envs.ocr_python(), 'file'),
                 'caption': self.path_available(vision, 'file') and self.path_available(
                     self.model_cache / 'hub' / 'models--Qwen--Qwen3-VL-2B-Instruct'),
                 'adult': self.path_available(vision, 'file') and self.path_available(

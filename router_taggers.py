@@ -23,7 +23,7 @@ import router_learning
 import settings as catalog_settings
 
 
-RAM_FOLDER = Path(r'C:\cv-models\ram-plus')
+RAM_FOLDER = envs.models_root() / 'ram-plus'
 RAM_WEIGHTS = RAM_FOLDER / 'ram_plus_swin_large_14m.pth'
 RAM_TOKENIZER = RAM_FOLDER / 'bert-base-uncased'
 RAM_VERSION = 'ram_plus_swin_large_14m'

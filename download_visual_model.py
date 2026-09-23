@@ -3,11 +3,13 @@ import argparse
 import os
 from pathlib import Path
 
+import envs
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('model')
-    parser.add_argument('--cache', type=Path, default=Path(r'C:\cv-models\huggingface'))
+    parser.add_argument('--cache', type=Path, default=envs.hf_home())
     args = parser.parse_args()
 
     args.cache.mkdir(parents=True, exist_ok=True)
