@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import catalogdb
+import components
 import hublink
 import job_features
 import pathkeys
@@ -90,6 +91,7 @@ class CoreApp:
             'router': Task(RouterController(self.folder)),
         }
         self.semantic = SemanticService(self.folder)
+        self.components = components.Components(log_folder=self.folder)
         self.exports = {}
 
     # ----- связь с хабом -----
@@ -409,7 +411,8 @@ class CoreHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         path = self.path.split('?', 1)[0]
-        if path in {'/api/device', '/api/device/job', '/api/core/stage', '/api/core/read'} \
+        if path in {'/api/device', '/api/device/job', '/api/core/stage', '/api/core/read',
+                    '/api/core/components', '/api/core/components/file'} \
                 or path.startswith('/api/core/task/'):
             return
         print(f'{self.address_string()} - {format % args}', flush=True)
@@ -426,8 +429,14 @@ class CoreHandler(BaseHTTPRequestHandler):
     def error_json(self, status, message):
         self.json_response({'error': message}, status)
 
-    def authorized(self):
-        return secrets.compare_digest(self.headers.get('X-Local-Token', ''), self.app.token)
+    # Другое ядро с пропуском от хаба может только читать модели.
+    PEER_PATHS = {'/api/core/components/manifest', '/api/core/components/file'}
+
+    def authorized(self, path=''):
+        if secrets.compare_digest(self.headers.get('X-Local-Token', ''), self.app.token):
+            return True
+        return path in self.PEER_PATHS and self.app.components.ticket_ok(
+            self.headers.get('X-Core-Ticket', ''))
 
     def body(self):
         length = int(self.headers.get('Content-Length') or 0)
@@ -436,12 +445,19 @@ class CoreHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length) or b'{}') if length else {}
 
     def do_GET(self):
-        if not self.authorized():
-            return self.error_json(403, 'Неверный токен ядра')
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path
+        if not self.authorized(path):
+            return self.error_json(403, 'Неверный токен ядра')
         try:
+            if path == '/api/core/components':
+                return self.json_response(self.app.components.status())
+            if path == '/api/core/components/manifest':
+                return self.json_response(self.app.components.manifest(query.get('id', [''])[0]))
+            if path == '/api/core/components/file':
+                return self.send_range(self.app.components.file_path(
+                    query.get('id', [''])[0], query.get('path', [''])[0]))
             if path == '/api/device':
                 return self.json_response(self.app.device.info())
             if path == '/api/device/job':
@@ -491,6 +507,13 @@ class CoreHandler(BaseHTTPRequestHandler):
             if path.startswith('/api/core/task/') and path.endswith('/stop'):
                 task = self.app.tasks[path.split('/')[-2]]
                 return self.json_response({'ok': True, 'job': task.stop()})
+            if path == '/api/core/components/start':
+                return self.json_response(self.app.components.start(
+                    str(body.get('id') or ''), str(body.get('action') or ''), body.get('peer')))
+            if path == '/api/core/components/stop':
+                return self.json_response(self.app.components.stop())
+            if path == '/api/core/components/ticket':
+                return self.json_response(self.app.components.issue_ticket())
             if path == '/api/core/semantic':
                 return self.json_response({'results': self.app.semantic.query(
                     str(body.get('text') or ''), int(body.get('top') or 500))})
