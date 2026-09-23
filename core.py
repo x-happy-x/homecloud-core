@@ -303,6 +303,16 @@ class Task:
         return self.controller.stop()
 
 
+def parse_shard(value):
+    """{'index': i, 'count': n} от хаба → «i/n» для device_job; без деления — ''."""
+    if not value:
+        return ''
+    index, count = int(value.get('index', -1)), int(value.get('count', 0))
+    if not 0 <= index < count <= 64:
+        raise ValueError('Некорректная доля задания')
+    return f'{index}/{count}'
+
+
 class CoreDevice:
     """DeviceController ядра: корни и снимки — ключи источников, а не пути диска."""
 
@@ -327,9 +337,10 @@ class CoreDevice:
         return self.controller.stop()
 
     def start(self, roots, features, paths=None, force=False, visual_model=None,
-              video_features=None):
+              video_features=None, shard=None):
         controller = self.controller
         self.app.refresh()
+        part = parse_shard(shard)
         with controller.lock:
             if controller.status()['active']:
                 raise ValueError('На ядре уже выполняется задание')
@@ -351,7 +362,10 @@ class CoreDevice:
             supported = controller.info()['capabilities']
             selected, kinds = job_features.resolve(features, video_features, supported)
             # Превью сетки и сведения о файлах обновляются при каждом обходе источника.
-            if chosen:
+            # Доля параллельного задания источник не обходит: опись хаб сделал раньше.
+            if part:
+                selected['inventory'] = False
+            elif chosen:
                 selected['inventory'] = True
             if not any(selected.values()):
                 raise ValueError('Выберите хотя бы одну возможность')
@@ -386,6 +400,8 @@ class CoreDevice:
                        '--stop-file', str(controller.stop_file)]
             if force:
                 command.append('--force')
+            if part:
+                command.extend(('--shard', part))
             for key in chosen:
                 command.extend(('--root', key))
             for key in selected_paths:
@@ -496,7 +512,7 @@ class CoreHandler(BaseHTTPRequestHandler):
                 return self.json_response({'ok': True, 'job': self.app.device.start(
                     body.get('roots', []), body.get('features', {}), body.get('paths', []),
                     force=bool(body.get('force')), visual_model=body.get('visual_model'),
-                    video_features=body.get('video_features'))})
+                    video_features=body.get('video_features'), shard=body.get('shard'))})
             if path == '/api/device/job/stop':
                 return self.json_response({'ok': True, 'job': self.app.device.stop()})
             if path.startswith('/api/core/task/') and path.endswith('/start'):

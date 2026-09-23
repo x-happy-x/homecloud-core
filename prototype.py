@@ -295,10 +295,12 @@ def scan(args):
         from catalog_index import bounds
         index = database(data)
         low, high = bounds(root)
+        # При параллельном задании у ядра только своя доля файлов.
+        shard, shard_values = pathkeys.shard_sql('path')
         for found, found_size, found_modified in index.execute(
                 'SELECT path,size,modified FROM photos WHERE path>=? AND path<? '
-                "AND status NOT IN ('excluded','missing') ORDER BY path",
-                (low, high)):
+                "AND status NOT IN ('excluded','missing')" + shard + ' ORDER BY path',
+                (low, high, *shard_values)):
             candidate = found if keyed else Path(found)
             if pathrules.blocked(found, block_rules, allow_rules):
                 continue

@@ -172,8 +172,37 @@ def normalize_arg(value):
     return os.path.abspath(value)
 
 
+# Доля задания на этом ядре при параллельной обработке: «номер/всего». Ставит
+# device_job для этапов после описи; хаб делит одно задание между ядрами.
+SHARD_ENV = 'HOMECLOUD_SHARD'
+
+
+def shard():
+    """(номер, всего) из HOMECLOUD_SHARD, а без деления — None."""
+    match = re.fullmatch(r'(\d+)/(\d+)', os.environ.get(SHARD_ENV, '').strip())
+    if not match:
+        return None
+    index, count = int(match.group(1)), int(match.group(2))
+    return (index, count) if 0 <= index < count and count > 1 else None
+
+
+def shard_sql(column='photos.path'):
+    """Условие «файл из доли этого ядра»: делим по rowid снимка — ровно и без хэшей в SQL."""
+    part = shard()
+    if part is None:
+        return '', []
+    return (f' AND {column} IN (SELECT path FROM photos WHERE photos.rowid % ? = ?)',
+            [part[1], part[0]])
+
+
 def scope_sql(roots=(), paths=(), column='photos.path'):
-    """Условие «снимок внутри выбранных папок или среди выбранных файлов»."""
+    """Условие «снимок внутри выбранных папок или среди выбранных файлов» (и доли ядра)."""
+    where, values = _scope_sql(roots, paths, column)
+    part, part_values = shard_sql(column)
+    return where + part, values + part_values
+
+
+def _scope_sql(roots, paths, column):
     parts, values = [], []
     for root in roots or ():
         low, high = bounds(normalize_arg(root))

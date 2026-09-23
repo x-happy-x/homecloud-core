@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 import unittest
 
 import catalogdb
@@ -268,6 +269,77 @@ class TrustKeyTest(unittest.TestCase):
     def test_odd_key_is_refused(self):
         with self.assertRaises(ValueError):
             hub.trust_key_script("ssh-ed25519 AAAA'; rm -rf /")
+
+
+class FakeCores:
+    """Хаб для Parallel: два ядра, задания заканчиваются после одного опроса."""
+
+    def __init__(self, capabilities, fail=None):
+        self.rows = [{'id': 'pc-x', 'name': 'PC-X', 'primary': True},
+                     {'id': 'pc-a', 'name': 'PC-A'}]
+        self.capabilities = capabilities
+        self.fail = fail
+        self.calls = []
+        self.polls = {}
+
+    def online_cores(self):
+        return [(row, {'online': True, 'device': {'capabilities': self.capabilities[row['id']]},
+                       'job': {'active': False}}) for row in self.rows]
+
+    def pick_core(self, source_id=None):
+        return self.rows[0]
+
+    def core_call(self, core, path, method='GET', body=None, timeout=10):
+        core_id = core if isinstance(core, str) else core['id']
+        self.calls.append((core_id, path, body))
+        self.polls[core_id] = 0
+        return {'job': {}}
+
+    def core_status(self, core_id, max_age=0):
+        self.polls[core_id] += 1
+        if self.polls[core_id] < 2:
+            return {'online': True, 'job': {'active': True, 'phase': 'visual'}}
+        status = 'error' if core_id == self.fail else 'completed'
+        return {'online': True, 'job': {'active': False, 'status': status}}
+
+
+class ParallelTest(unittest.TestCase):
+    def run_job(self, fake, features):
+        from unittest import mock
+        job = hub.Parallel(fake)
+        with mock.patch.object(hub.time, 'sleep'):
+            job.start(['nas:/photo'], features)
+            deadline = time.time() + 10
+            while job.status()['status'] == 'running' and time.time() < deadline:
+                time.sleep(0.01)
+        return job.status()
+
+    def test_inventory_shards_then_highlights(self):
+        both = {'visual': True, 'faces': True}
+        fake = FakeCores({'pc-x': both, 'pc-a': both})
+        state = self.run_job(fake, {'visual': True, 'faces': True, 'highlights': True})
+        self.assertEqual(state['status'], 'completed', state)
+        starts = [(core, body) for core, path, body in fake.calls if path == '/api/device/job/start']
+        self.assertEqual(starts[0][0], 'pc-x')
+        self.assertEqual(starts[0][1]['features'], {'inventory': True})
+        shards = {core: body['shard'] for core, body in starts[1:3]}
+        self.assertEqual(shards, {'pc-x': {'index': 0, 'count': 2}, 'pc-a': {'index': 1, 'count': 2}})
+        self.assertEqual(starts[1][1]['features'], {'faces': True, 'visual': True})
+        self.assertEqual(starts[3][1]['features'], {'highlights': True})
+        self.assertEqual(starts[3][1]['shard'], {'index': 0, 'count': 1})
+
+    def test_core_without_capability_is_left_out(self):
+        fake = FakeCores({'pc-x': {'visual': True, 'caption': True}, 'pc-a': {'visual': True}})
+        state = self.run_job(fake, {'visual': True, 'caption': True})
+        self.assertEqual(state['cores'], ['pc-x'])
+        self.assertIn('PC-A: нет caption', state['skipped'])
+
+    def test_failed_share_fails_job(self):
+        both = {'visual': True}
+        fake = FakeCores({'pc-x': both, 'pc-a': both}, fail='pc-a')
+        state = self.run_job(fake, {'visual': True})
+        self.assertEqual(state['status'], 'error')
+        self.assertIn('PC-A', state['error'])
 
 
 class HostCheckTest(unittest.TestCase):
