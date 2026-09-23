@@ -20,6 +20,7 @@ import heapq
 
 import numpy as np
 
+import face_crops
 import face_quality
 import video_identities as identities
 
@@ -228,9 +229,12 @@ def find_tracks(path, models, step_seconds=0.5, gap_seconds=1.2, best_frames=8,
             # Вырезаем и уменьшаем кадр сразу: трек держит до `best_frames`
             # штук в памяти, и полные кадры (особенно 4K) там неуместны —
             # только маленькое превью, которое всё равно пойдёт в файл.
-            crop = video_media.to_image(frame).crop(tuple(int(v) for v in box[:4]))
-            crop.thumbnail((160, 160))
-            blur = face_quality.face_blur(crop)
+            image = video_media.to_image(frame)
+            tight = image.crop(tuple(int(v) for v in box[:4]))
+            tight.thumbnail((face_crops.SIZE, face_crops.SIZE))
+            blur = face_quality.face_blur(tight)
+            # В файл уйдёт квадрат с полями, резкость — по самому лицу.
+            crop = face_crops.cut(image, box[:4])
             metadata = identities.quality(box[:4], float(box[4]), blur, landmarks[number], options)
             rank = max(metadata['quality'], .001)
             detections.append((box[:4].tolist(), embedding, rank, {'crop': crop, 'quality': metadata}))

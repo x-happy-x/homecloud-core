@@ -16,6 +16,7 @@ os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
 
 import catalogdb
 import catalogfiles
+import face_crops
 import pathkeys
 import pathrules
 import settings as catalog_settings
@@ -415,6 +416,21 @@ def scan(args):
                 return False
         return True
 
+    def original_image(key, moment):
+        local = Path(sources.local(key)) if keyed else Path(key)
+        if video_media.is_video(key):
+            return video_media.to_image(video_media.poster(local, moment or 0))
+        with Image.open(local) as original:
+            return ImageOps.exif_transpose(original).convert('RGB')
+
+    # Миниатюры лиц прежних прогонов были вырезаны вплотную по рамке —
+    # переобрезаем их с полями, модели для этого не нужны.
+    recut = face_crops.recut(
+        db, data, paths, original_image,
+        publish=lambda key, number, total: publish('running', key),
+        stop=lambda: bool(stop_file and stop_file.exists()))
+    if recut:
+        print(f'Face thumbnails recut with margins: {recut}.', flush=True)
     publish('running', force=True)
     for path in paths:
         key = str(path)
@@ -474,10 +490,11 @@ def scan(args):
                         token = hashlib.sha256(
                             f'{key}:{stat.st_mtime_ns}:{kind_signature}:{tag}{number}'
                             .encode()).hexdigest()
-                        thumbnail = f'thumbnails/{token}.jpg'
+                        thumbnail = face_crops.name_for(token)
+                        # Резкость — по самому лицу, а в файл — квадрат с полями.
                         crop = image.crop(tuple(int(value) for value in box[:4]))
-                        crop.thumbnail((160, 160))
-                        crop.save(data / thumbnail)
+                        crop.thumbnail((face_crops.SIZE, face_crops.SIZE))
+                        face_crops.cut(image, box[:4]).save(data / thumbnail)
                         catalogfiles.publish(data, thumbnail)
                         import face_quality
                         blur = face_quality.face_blur(crop)
@@ -531,7 +548,7 @@ def scan(args):
                         token = hashlib.sha256(
                             f'{key}:{stat.st_mtime_ns}:{kind_signature}:{number}'.encode()
                         ).hexdigest()
-                        thumbnail = f'thumbnails/{token}.jpg'
+                        thumbnail = face_crops.name_for(token)
                         track['extra']['crop'].save(data / thumbnail)
                         catalogfiles.publish(data, thumbnail)
                         results.append((

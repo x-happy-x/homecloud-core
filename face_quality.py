@@ -28,6 +28,7 @@ from pathlib import Path
 import numpy as np
 
 import catalogfiles
+import face_crops
 
 # Поменялся расчёт — подними версию, и оценки пересчитаются по миниатюрам.
 VERSION = 1
@@ -157,6 +158,8 @@ def measure(db, folder, face_ids=None):
         blur = None
         if thumbnail:
             image = read_thumbnail(thumbnail_file(folder, thumbnail))
+            if image is not None and face_crops.padded(thumbnail):
+                image = face_crops.face_part(image)
             if image is not None:
                 blur = face_blur(image)
         found.append((face_id, None if blur is None else round(blur, 4),
