@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -371,6 +372,27 @@ class PathRulesTest(unittest.TestCase):
                                           'allow_paths': 'D:\\trash\\Наши'})
         self.assertTrue(pathrules.enter('pc-x:D:\\trash', block, allow))
         self.assertFalse(pathrules.blocked('pc-x:D:\\trash\\Наши\\a.jpg', block, allow))
+
+
+class JunctionLoopTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'win32', 'junction есть только в Windows')
+    def test_walk_skips_junction_loop(self):
+        import subprocess
+        import catalog_index
+        with tempfile.TemporaryDirectory() as temp:
+            photos = Path(temp) / 'Users' / 'All Users'
+            photos.mkdir(parents=True)
+            (photos / 'a.jpg').write_bytes(b'1')
+            # Как в старом профиле Windows: «Application Data» ведёт на свою же папку.
+            made = subprocess.run(['cmd', '/c', 'mklink', '/J', str(photos / 'Application Data'),
+                                   str(photos)], capture_output=True)
+            if made.returncode:
+                self.skipTest('mklink /J недоступен')
+            record = sources.validate({'id': 'box', 'type': 'local', 'path': temp})
+            found, stopped = catalog_index.walk_source(
+                pathkeys.make('box', temp), [], access=sources.Access([record]))
+            self.assertFalse(stopped)
+            self.assertEqual(list(found), [pathkeys.make('box', str(photos / 'a.jpg'))])
 
 
 class InventoryTest(unittest.TestCase):
