@@ -357,6 +357,72 @@ class HostCheckTest(unittest.TestCase):
         self.assertTrue(allowed(request('192.168.1.10:18311', None)))
 
 
+class PersonFilterTest(unittest.TestCase):
+    def test_photos_of_person_take_size_from_thumbs(self):
+        import types
+        import web_server
+        db = sqlite3.connect(':memory:')
+        db.executescript('''
+            CREATE TABLE photos (path TEXT PRIMARY KEY, status TEXT, modified INTEGER,
+                kind TEXT, duration REAL, size INTEGER);
+            CREATE TABLE faces (id INTEGER PRIMARY KEY, path TEXT);
+            CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE face_people (face_id INTEGER, person_id INTEGER);
+            CREATE TABLE photo_analysis (path TEXT, content_type TEXT, blur_score REAL,
+                caption TEXT, ocr_text TEXT, ocr_status TEXT, caption_status TEXT,
+                caption_short TEXT, caption_search TEXT, caption_tags_json TEXT,
+                caption_json TEXT, width INTEGER, height INTEGER);
+            CREATE TABLE photo_adult_analysis (path TEXT, rating TEXT, adult_score REAL,
+                tags_json TEXT, regions_json TEXT, description TEXT);
+            CREATE TABLE video_speech (path TEXT, text TEXT);''')
+        db.executescript(hub.THUMBS_SCHEMA)
+        db.execute("INSERT INTO photos VALUES ('pc-x:D:\\a.jpg','ok',1,'photo',NULL,10)")
+        db.execute("INSERT INTO faces VALUES (1,'pc-x:D:\\a.jpg')")
+        db.execute("INSERT INTO people VALUES (1,'Хамис')")
+        db.execute('INSERT INTO face_people VALUES (1,1)')
+        db.execute("INSERT INTO photo_thumbs(path,size,modified,width,height,created_at) "
+                   "VALUES ('pc-x:D:\\a.jpg',10,1,4000,3000,0)")
+        app = types.SimpleNamespace(store=types.SimpleNamespace(db=db),
+                                    PHOTO_COLUMNS=web_server.App.PHOTO_COLUMNS)
+        rows = web_server.App._search_rows(app, ['Хамис'], '', " AND photos.status='ok'", [])
+        self.assertEqual([(row[0], row[-2], row[-1]) for row in rows],
+                         [('pc-x:D:\\a.jpg', 4000, 3000)])
+
+
+class FaceCropsTest(unittest.TestCase):
+    def test_square_with_margins_stays_inside_frame(self):
+        import face_crops
+        self.assertEqual(face_crops.square([100, 100, 200, 150], 1000, 800),
+                         (70, 45, 230, 205))
+        # У края квадрат сдвигается внутрь кадра, а не обрезается.
+        self.assertEqual(face_crops.square([0, 0, 100, 100], 1000, 800), (0, 0, 160, 160))
+        self.assertEqual(face_crops.square([0, 0, 100, 100], 120, 90), (5, 0, 95, 90))
+
+    def test_recut_replaces_tight_thumbnails(self):
+        import face_crops
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            (data / 'thumbnails').mkdir()
+            db = sqlite3.connect(':memory:')
+            db.execute('CREATE TABLE faces (id INTEGER PRIMARY KEY, path TEXT, box TEXT, '
+                       'frame_time REAL, thumbnail TEXT)')
+            db.execute("INSERT INTO faces VALUES (1,'box:a.jpg','[10,10,50,50]',NULL,'thumbnails/old.jpg')")
+            db.execute("INSERT INTO faces VALUES (2,'box:a.jpg','[60,60,90,90]',NULL,'thumbnails/x-p.jpg')")
+            opened = []
+
+            def open_image(key, moment):
+                opened.append((key, moment))
+                return Image.new('RGB', (200, 100))
+            self.assertEqual(face_crops.recut(db, data, ['box:a.jpg'], open_image), 1)
+            self.assertEqual(opened, [('box:a.jpg', None)])
+            name = db.execute('SELECT thumbnail FROM faces WHERE id=1').fetchone()[0]
+            self.assertTrue(face_crops.padded(name))
+            with Image.open(data / name) as thumb:
+                self.assertEqual(thumb.size, (64, 64))
+            self.assertEqual(face_crops.recut(db, data, ['box:a.jpg'], open_image), 0)
+
+
 class PathRulesTest(unittest.TestCase):
     def test_rules_with_and_without_source(self):
         import pathrules

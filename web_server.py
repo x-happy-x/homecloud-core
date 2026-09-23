@@ -1738,6 +1738,7 @@ class App:
                 f'FROM faces JOIN photos ON photos.path=faces.path '
                 f'JOIN face_people ON face_people.face_id=faces.id '
                 f'JOIN people ON people.id=face_people.person_id '
+                f'LEFT JOIN photo_thumbs ON photo_thumbs.path=faces.path '
                 f'LEFT JOIN photo_analysis ON photo_analysis.path=faces.path '
                 f'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=faces.path '
                 f'LEFT JOIN video_speech ON video_speech.path=faces.path '
@@ -3326,7 +3327,12 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError):
             return self.error_json(404, 'Лицо не найдено')
         if not original:
-            path = (self.app.store.folder / row[3]).resolve()
+            # Имя файла берём из каталога: переобрезка миниатюры (face_crops)
+            # меняет его, не меняя числа лиц, и запомненные строки отстают.
+            with self.app.lock:
+                current = self.app.store.db.execute(
+                    'SELECT thumbnail FROM faces WHERE id=?', (face_id,)).fetchone()
+            path = (self.app.store.folder / ((current and current[0]) or row[3])).resolve()
             if not path.is_file():
                 return self.error_json(404, 'Файл не найден')
             return self.send_stream(path, mimetypes.guess_type(path.name)[0] or 'image/jpeg')

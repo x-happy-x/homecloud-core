@@ -91,7 +91,8 @@ SQLite-файл `catalog.sqlite` внутри папки каталога (по 
 
 - **опись:** `photos` (путь, размер, mtime, `kind` фото/видео, `duration`,
   `status`), `photo_dirs`, `scan_roots`, `scan_exclusions`, `scan_runs`
-- **лица:** `faces` (рамка, эмбеддинг, миниатюра, `frame_time`,
+- **лица:** `faces` (рамка, эмбеддинг, миниатюра — квадрат с полями вокруг
+  рамки, `face_crops.py`; прежние тесные этап «Лица» переобрезает, `frame_time`,
   `track_start`/`track_stop` — у фотографий NULL), `face_clusters`,
   `face_people`, `people`, `face_exclusions`, `face_authenticity`,
   `face_quality` (резкость миниатюры, размер, `keep`), `group_avatars`,
