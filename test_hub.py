@@ -79,6 +79,22 @@ class RemoteCatalogTest(unittest.TestCase):
         self.assertEqual(local.execute('SELECT COUNT(*) FROM t').fetchone()[0], 3001)
         local.close()
 
+    def test_heartbeat_keeps_open_transaction(self):
+        # Heartbeat ядра раз в 5 минут не должен рвать транзакцию задания,
+        # а запуск ядра — закрывает прежние соединения.
+        db = catalogdb.connect(self.work, timeout=5)
+        db.executescript('CREATE TABLE t (id INTEGER PRIMARY KEY);')
+        db.execute('INSERT INTO t(id) VALUES(1)')
+        link = hublink.link_for(self.work)
+        link.json('POST', '/hello', {'version': 'x', 'startup': False})
+        db.commit()
+        self.assertEqual(db.execute('SELECT COUNT(*) FROM t').fetchone()[0], 1)
+        db.execute('INSERT INTO t(id) VALUES(2)')
+        link.json('POST', '/hello', {'version': 'x', 'startup': True})
+        with self.assertRaises(sqlite3.OperationalError):
+            db.commit()
+        db.close()
+
     def test_unknown_core_is_refused(self):
         (self.work / 'hub.json').write_text(json.dumps({
             'url': f'http://127.0.0.1:{self.server.server_port}', 'token': 'bad'}),
