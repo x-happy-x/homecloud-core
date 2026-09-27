@@ -1052,9 +1052,30 @@ class HighlightService:
         with self.lock:
             self.state.update(values)
 
+    def _prompts(self):
+        """Векторы описаний тем и оценки — в окружении визуального индекса, один раз на модель.
+
+        Уже посчитанные скрипт не трогает и модель не грузит. Нет окружения
+        или модели — подборки соберутся без тем.
+        """
+        root = Path(__file__).resolve().parent
+        python = envs.python('vision-venv', root)
+        if not python.is_file():
+            return
+        env = {**os.environ, 'HF_HOME': str(envs.hf_home(root)), 'HF_HUB_OFFLINE': '1', 'PYTHONUTF8': '1'}
+        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        try:
+            subprocess.run([str(python), str(root / 'photo_curation.py'), 'prompts',
+                            '--catalog', str(self.catalog), '--indexed'],
+                           cwd=root, env=env, capture_output=True, timeout=900, creationflags=flags)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f'Theme prompts failed: {exc}', file=sys.stderr, flush=True)
+
     def _run(self, kinds, curate, force, allow_unchecked_adult, today):
         result = {}
         try:
+            self._set(step='prompts', current='')
+            self._prompts()
             if curate:
                 result['curation'] = photo_curation.curate(
                     self.catalog, force=force, stop=lambda: self.stopping,
