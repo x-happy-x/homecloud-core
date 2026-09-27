@@ -55,7 +55,7 @@ def ensure_schema(db):
 def write_progress(path, **values):
     if path is None:
         return
-    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')  # свой у каждого процесса
     temporary.write_text(json.dumps({**values, 'updated_at': time.time(), 'pid': os.getpid()},
                                     ensure_ascii=False), encoding='utf-8')
     for attempt in range(5):

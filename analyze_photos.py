@@ -103,7 +103,7 @@ def write_progress(path, **payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload['updated_at'] = time.time()
     payload['pid'] = os.getpid()
-    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')  # свой у каждого процесса
     temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
     # Файл прогресса читает device_job.py каждые полсекунды — os.replace изредка
     # натыкается на этот момент чтения (WinError 5), несколько попыток решают дело.

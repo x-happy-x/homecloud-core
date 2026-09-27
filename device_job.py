@@ -22,7 +22,7 @@ from catalog_index import EXCLUDED_NAMES, SUPPORTED, connect as index_db, take_i
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')  # свой у каждого процесса
     temporary.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
     # На Windows os.replace изредка натыкается на файл, который в этот момент
     # читает веб-сервер (опрос статуса) — это долей секунды, а не зависание,

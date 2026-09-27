@@ -137,10 +137,17 @@ try {
 if ($busy) {
     $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
     foreach ($listener in $listeners) {
-        # Вместе со службой уходят и её задания: device_job — дочерний процесс.
-        Get-CimInstance Win32_Process -Filter "ParentProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Stop-Process -Id $listener.OwningProcess -Force -ErrorAction SilentlyContinue
+        # Вместе со службой уходят и её задания со всеми потомками: этап
+        # (prototype.py и др.) — внук службы и иначе продолжал бы работать
+        # рядом с новым заданием, деля с ним файл прогресса.
+        $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+        $tree = @($listener.OwningProcess)
+        for ($i = 0; $i -lt $tree.Count; $i++) {
+            $tree += @($all | Where-Object { $_.ParentProcessId -eq $tree[$i] -and $tree -notcontains $_.ProcessId } |
+                ForEach-Object { $_.ProcessId })
+        }
+        [array]::Reverse($tree)
+        foreach ($id in $tree) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
     }
     Start-Sleep -Seconds 1
 }

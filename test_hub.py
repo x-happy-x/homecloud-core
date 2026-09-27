@@ -298,6 +298,11 @@ class FakeCores:
         self.fail = fail
         self.calls = []
         self.polls = {}
+        records = {'nas': {'id': 'nas', 'type': 'smb', 'name': 'NAS'},
+                   'pc-a-disk': {'id': 'pc-a-disk', 'type': 'device', 'device': 'pc-a',
+                                 'name': 'Диск PC-A'}}
+        from types import SimpleNamespace
+        self.sources = SimpleNamespace(get=records.get)
 
     def online_cores(self):
         return [(row, {'online': True, 'device': {'capabilities': self.capabilities[row['id']]},
@@ -350,6 +355,21 @@ class ParallelTest(unittest.TestCase):
         state = self.run_job(fake, {'visual': True, 'caption': True})
         self.assertEqual(state['cores'], ['pc-x'])
         self.assertIn('PC-A: нет caption', state['skipped'])
+
+    def test_device_disk_goes_only_to_its_core(self):
+        # Ядро не читает диск другого компьютера: PC-X не берёт долю файлов PC-A.
+        both = {'visual': True}
+        fake = FakeCores({'pc-x': both, 'pc-a': both})
+        job = hub.Parallel(fake)
+        from unittest import mock
+        with mock.patch.object(hub.time, 'sleep'):
+            job.start(['pc-a-disk:F:\\'], {'visual': True})
+            deadline = time.time() + 10
+            while job.status()['status'] == 'running' and time.time() < deadline:
+                time.sleep(0.01)
+        state = job.status()
+        self.assertEqual(state['cores'], ['pc-a'])
+        self.assertIn('PC-X: не читает диск Диск PC-A', state['skipped'])
 
     def test_failed_share_fails_job(self):
         both = {'visual': True}
