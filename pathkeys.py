@@ -202,6 +202,13 @@ def scope_sql(roots=(), paths=(), column='photos.path'):
     return where + part, values + part_values
 
 
+def analysis_scope_sql(roots=(), paths=(), column='photos.path'):
+    """Как scope_sql, но без копий файлов (filekeys.photo_copies): этапы анализа и
+    лиц считают только оригинал, результаты на копии переносит filekeys propagate."""
+    where, values = scope_sql(roots, paths, column)
+    return where + f' AND {column} NOT IN (SELECT path FROM photo_copies)', values
+
+
 def _scope_sql(roots, paths, column):
     parts, values = [], []
     for root in roots or ():

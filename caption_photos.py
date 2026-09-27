@@ -154,7 +154,7 @@ def main():
     args = parser.parse_args()
     db = connect(args.catalog.resolve())
     # Папки и снимки задания — ключи источников (см. pathkeys.py).
-    root_sql, root_values = pathkeys.scope_sql(args.root, args.path, 'photo_analysis.path')
+    root_sql, root_values = pathkeys.analysis_scope_sql(args.root, args.path, 'photo_analysis.path')
     candidate_sql = '' if args.path else " AND photo_analysis.content_type IN ('photo','document','screenshot')"
     fresh_sql = '' if args.force else " AND (photo_analysis.caption_status IS NULL OR photo_analysis.caption_status='error')"
     rows = db.execute('''

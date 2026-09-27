@@ -531,7 +531,9 @@ def signature(row, prompts_stamp):
 
 def candidates(db, roots=(), paths=(), limit=None):
     """Снимки с готовым визуальным анализом — только у них есть тип и эмбеддинг."""
-    where, values = pathkeys.scope_sql(roots, paths, 'photos.path')
+    # Копии файлов не оцениваем: оценку им переносит filekeys propagate.
+    scope = pathkeys.analysis_scope_sql if _table_exists(db, 'photo_copies') else pathkeys.scope_sql
+    where, values = scope(roots, paths, 'photos.path')
     adult = _table_exists(db, 'photo_adult_analysis')
     hashes = _table_exists(db, 'photo_hashes')
     sql = f'''

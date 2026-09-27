@@ -10,7 +10,9 @@ import sys
 import time
 import traceback
 
+import catalogdb
 import envs
+import filekeys
 import hublink
 import pathkeys
 import pathrules
@@ -58,13 +60,20 @@ def planned_phases(features, remote=False, shard=False):
         # У ядра при хабе обход источника всегда обновляет превью сетки.
         if remote:
             plan.append('thumbs')
+    # Ключи файлов и копии — один раз, у хозяина задания, не в долях.
+    if not shard and (features.get('faces') or any(features.get(name) for name in ANALYSIS_FEATURES)):
+        plan.append('copies')
     if features.get('faces'):
         plan.append('faces')
     if any(features.get(name) for name in ('visual', 'ocr', 'caption')):
         plan.append('visual')
     plan.extend(name for name in ('ocr', 'adult', 'caption', 'speech', 'authenticity', 'diarize',
-                                  'curation', 'highlights')
+                                  'curation')
                 if features.get(name))
+    if features.get('faces') or any(features.get(name) for name in ANALYSIS_FEATURES):
+        plan.append('propagate')
+    if features.get('highlights'):
+        plan.append('highlights')
     return plan
 
 
@@ -324,6 +333,25 @@ def run(args):
         # Этапы ниже берут файлы через pathkeys.scope_sql/shard_sql — только свою долю.
         os.environ[pathkeys.SHARD_ENV] = args.shard
 
+    per_file = args.features.get('faces') or any(args.features.get(name) for name in ANALYSIS_FEATURES)
+    root_keys = [item for root in args.root for item in ('--root', str(root))] +         [item for path in args.path for item in ('--path', str(path))]
+    if per_file:
+        # Таблица копий нужна этапам и в долях задания — создаём её, даже если
+        # ключи считает не это ядро.
+        db = catalogdb.connect(args.catalog, timeout=60)
+        try:
+            filekeys.ensure_schema(db)
+        finally:
+            db.close()
+    if per_file and not args.shard:
+        # Копии файлов этапы не считают: оригинал — один раз, результат переносится.
+        run_child(args, [str(face_python), str(here / 'filekeys.py'), 'keys',
+                  '--catalog', str(args.catalog), '--progress-file', str(stage),
+                  '--stop-file', str(args.stop_file), *force, *root_keys], 'copies')
+        if args.stop_file.exists():
+            publish(args, 'stopped', 'copies')
+            return
+
     if args.features.get('faces') and args.path:
         parents = {}
         for path in args.path:
@@ -487,6 +515,14 @@ def run(args):
                   *force, *root_args], 'curation')
     if args.stop_file.exists():
         publish(args, 'stopped', 'curation')
+        return
+
+    if per_file:
+        run_child(args, [str(face_python), str(here / 'filekeys.py'), 'propagate',
+                  '--catalog', str(args.catalog), '--progress-file', str(stage),
+                  '--stop-file', str(args.stop_file)], 'propagate')
+    if args.stop_file.exists():
+        publish(args, 'stopped', 'propagate')
         return
 
     # Подборки строятся по всему каталогу из готовых оценок: без файлов и моделей.

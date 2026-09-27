@@ -340,7 +340,8 @@ class PipelineTests(unittest.TestCase):
     def test_phase_order(self):
         plan = device_job.planned_phases({'visual': True, 'adult': True, 'curation': True,
                                           'highlights': True})
-        self.assertEqual(plan, ['inventory', 'visual', 'adult', 'curation', 'highlights'])
+        self.assertEqual(plan, ['inventory', 'copies', 'visual', 'adult', 'curation', 'propagate',
+                                'highlights'])
         self.assertEqual(device_job.planned_phases({'highlights': True}), ['highlights'])
 
 

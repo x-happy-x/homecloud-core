@@ -41,6 +41,8 @@ def ensure_schema(db):
         CREATE TABLE IF NOT EXISTS photos (
           path TEXT PRIMARY KEY, size INTEGER, modified INTEGER, model TEXT,
           status TEXT, error TEXT);
+        CREATE TABLE IF NOT EXISTS photo_copies (
+          path TEXT PRIMARY KEY, original TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS photo_dirs (
           path TEXT PRIMARY KEY, parent TEXT, name TEXT,
           files INTEGER NOT NULL DEFAULT 0, subtree INTEGER NOT NULL DEFAULT 0,

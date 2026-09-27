@@ -84,7 +84,7 @@ def progress(path, **state):
 
 def scope_sql(roots, paths):
     """Условие «только выбранные папки и файлы» — как в остальных этапах."""
-    return pathkeys.scope_sql(roots, paths, 'path')
+    return pathkeys.analysis_scope_sql(roots, paths, 'path')
 
 
 def pending(db, args):
