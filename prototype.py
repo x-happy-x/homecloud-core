@@ -254,6 +254,9 @@ def scan(args):
     # Версия файла источника — из описи: копия во временной папке ядра имеет
     # своё время, и по ней каждый скан считал бы файл изменённым.
     listed = {}
+    # Строка описи (size, modified, model, status) — чтобы не спрашивать каталог
+    # хаба о каждом уже обработанном файле по отдельности.
+    known = {}
 
     def publish(status, current='', force=False):
         nonlocal last_progress_write
@@ -305,8 +308,8 @@ def scan(args):
         has_copies = index.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='photo_copies'").fetchone()
         copies = ' AND path NOT IN (SELECT path FROM photo_copies)' if has_copies else ''
-        for found, found_size, found_modified in index.execute(
-                'SELECT path,size,modified FROM photos WHERE path>=? AND path<? '
+        for found, found_size, found_modified, found_model, found_status in index.execute(
+                'SELECT path,size,modified,model,status FROM photos WHERE path>=? AND path<? '
                 "AND status NOT IN ('excluded','missing')" + shard + copies + ' ORDER BY path',
                 (low, high, *shard_values)):
             candidate = found if keyed else Path(found)
@@ -321,6 +324,7 @@ def scan(args):
                 continue
             if keyed:
                 listed[found] = (found_size or 0, found_modified or 0)
+            known[found] = (found_size, found_modified, found_model, found_status)
             paths.append(candidate)
         index.close()
         print(f'Using catalog inventory: {len(paths)} files.', flush=True)
@@ -456,8 +460,6 @@ def scan(args):
         stat = None
         try:
                 if keyed:
-                    # Сам файл — на этой машине: свой диск, UNC или временная копия.
-                    local = Path(sources.local(key))
                     size, modified = listed[key]
                     stat = type('Stat', (), {'st_size': size, 'st_mtime_ns': modified})()
                 else:
@@ -468,8 +470,8 @@ def scan(args):
                     continue
                 is_video = video_media.is_video(key)
                 kind_signature = video_signature if is_video else signature
-                old = db.execute('SELECT size,modified,model,status FROM photos WHERE path=?',
-                                 (key,)).fetchone()
+                old = known.get(key) or db.execute(
+                    'SELECT size,modified,model,status FROM photos WHERE path=?', (key,)).fetchone()
                 if old and old[3] == 'excluded':
                     skipped += 1
                     publish('running', str(path))
@@ -480,6 +482,10 @@ def scan(args):
                     skipped += 1
                     publish('running', str(path))
                     continue
+                if keyed:
+                    # Сам файл — на этой машине: свой диск, UNC или временная копия.
+                    # Берётся только теперь: уже обработанный файл не скачивается.
+                    local = Path(sources.local(key))
 
                 def find_faces(image, moment=None, tag=''):
                     """Лица одного кадра: рамка, вектор и вырезанный портрет."""

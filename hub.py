@@ -1036,7 +1036,8 @@ class LinkHandler(BaseHTTPRequestHandler):
                 return self.reply(200, self.hub.core_config(core))
             if method == 'POST' and path == '/hello':
                 payload = json.loads(self.body() or b'{}')
-                self.hub.sessions.close_owner(core['id'])
+                if payload.get('startup'):
+                    self.hub.sessions.close_owner(core['id'])
                 self.hub.cores.update(core['id'], version=str(payload.get('version') or ''),
                                       hello={**payload, 'at': time.time()})
                 with self.hub.status_lock:

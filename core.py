@@ -83,7 +83,7 @@ class CoreApp:
         self.stage = sources.Stage(self.folder / 'stage', self.access)
         sources.set_resolver(self.resolve)
         self.lock = threading.RLock()
-        self.hello()
+        self.hello(startup=True)
         self.device = CoreDevice(self, DeviceController)
         shim = SimpleNamespace(store=SimpleNamespace(folder=self.folder, min_cluster_size=8),
                                lock=threading.RLock(), identity_reload_pending=False)
@@ -101,9 +101,11 @@ class CoreApp:
 
     # ----- связь с хабом -----
 
-    def hello(self):
+    def hello(self, startup=False):
+        # startup — ядро только что запустилось: хаб закроет его прежние соединения
+        # с каталогом. Heartbeat их не трогает, иначе рвёт транзакцию задания.
         info = {'version': self.version, 'hostname': socket.gethostname(),
-                'port': self.port, 'legacy': self.legacy_info()}
+                'port': self.port, 'legacy': self.legacy_info(), 'startup': startup}
         try:
             config = self.link.json('POST', '/hello', info, timeout=30)
         except hublink.HubError as exc:
