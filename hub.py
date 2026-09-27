@@ -216,12 +216,26 @@ class SourceMedia:
         self._info = None
 
     def driver(self):
+        source_id = pathkeys.source_of(self.key)
+        if not self.hub.health.available(source_id):
+            raise sources.SourceError(f'Источник «{source_id}» сейчас недоступен')
         return self.hub.access.resolve(self.key)
+
+    def _watch(self, call):
+        """Ошибка связи (не «нет файла») — источник недоступен до следующей проверки."""
+        try:
+            return call()
+        except FileNotFoundError:
+            raise
+        except (sources.SourceError, OSError) as exc:
+            if not isinstance(exc, (PermissionError, IsADirectoryError, NotADirectoryError)):
+                self.hub.health.failed(pathkeys.source_of(self.key), exc)
+            raise
 
     def info(self):
         if self._info is None:
             driver, native = self.driver()
-            self._info = driver.stat(native)
+            self._info = self._watch(lambda: driver.stat(native))
         return self._info
 
     def exists(self):
@@ -241,7 +255,7 @@ class SourceMedia:
 
     def open(self):
         driver, native = self.driver()
-        return driver.open(native)
+        return self._watch(lambda: driver.open(native))
 
     def read_bytes(self, limit=None):
         with self.open() as stream:
@@ -249,7 +263,8 @@ class SourceMedia:
 
     def local(self):
         """Путь на хабе для библиотек, которым нужен файл (cv2, EXIF)."""
-        return self.hub.stage.path(self.key)
+        self.driver()
+        return self._watch(lambda: self.hub.stage.path(self.key))
 
     def resolve(self):
         return self
@@ -259,6 +274,94 @@ class SourceMedia:
 
     def __fspath__(self):
         return self.local()
+
+# ---------- доступность источников ----------
+
+class SourceHealth:
+    """Доступен ли источник — по проверке раз в пять минут, а не на каждый кадр.
+
+    Выключенный компьютер или уснувшее хранилище иначе стоят каждому снимку
+    таймаута подключения (SSH ждёт 3–6 с), и страница из сотни плиток
+    собирается минутами. Проверка идёт в фоне (start), вручную — check_all
+    («Проверить сейчас» в настройках). Настоящее чтение, упавшее на связи,
+    сразу помечает источник недоступным (failed). Пока источник не проверяли
+    ни разу, он считается доступным.
+    """
+    INTERVAL = 300
+    TIMEOUT = 8
+
+    def __init__(self, hub):
+        self.hub = hub
+        self.lock = threading.Lock()
+        self.state = {}
+        self.stopped = threading.Event()
+
+    def start(self):
+        def loop():
+            while not self.stopped.is_set():
+                try:
+                    self.check_all()
+                except Exception as exc:
+                    print(f'Проверка источников: {exc}', file=sys.stderr, flush=True)
+                self.stopped.wait(self.INTERVAL)
+        threading.Thread(target=loop, name='source-health', daemon=True).start()
+
+    def available(self, source_id):
+        with self.lock:
+            item = self.state.get(source_id)
+        return item is None or item['online']
+
+    def status(self, source_id):
+        with self.lock:
+            item = self.state.get(source_id)
+        return dict(item) if item else None
+
+    def failed(self, source_id, error):
+        with self.lock:
+            self.state[source_id] = {'online': False, 'error': str(error)[:300],
+                                     'checked_at': time.time(), 'passive': True}
+
+    def check(self, record):
+        """Один источник: список корней с таймаутом. Драйвер иногда висит дольше
+        своего таймаута (SMB, SFTP), поэтому ждём его в отдельном потоке."""
+        outcome = {}
+
+        def probe():
+            try:
+                self.hub.access.driver(record['id']).test()
+                outcome['ok'] = True
+            except Exception as exc:
+                outcome['error'] = str(exc) or type(exc).__name__
+
+        started = time.monotonic()
+        worker = threading.Thread(target=probe, daemon=True)
+        worker.start()
+        worker.join(self.TIMEOUT)
+        online = bool(outcome.get('ok'))
+        error = '' if online else outcome.get('error') or f'не ответил за {self.TIMEOUT} с'
+        value = {'online': online, 'error': error[:300], 'checked_at': time.time(),
+                 'ms': round((time.monotonic() - started) * 1000)}
+        with self.lock:
+            self.state[record['id']] = value
+        return value
+
+    def check_all(self):
+        """Все источники разом, параллельно; заодно заново спрашиваются ядра."""
+        with self.hub.status_lock:
+            self.hub.status_cache.clear()
+        records = [record for record in self.hub.sources.load() if record.get('enabled', True)]
+        workers = [threading.Thread(target=self.check, args=(record,), daemon=True)
+                   for record in records]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(self.TIMEOUT + 2)
+        with self.lock:
+            known = {record['id'] for record in self.hub.sources.load()}
+            for source_id in list(self.state):
+                if source_id not in known:
+                    self.state.pop(source_id)
+            return {key: dict(value) for key, value in self.state.items()}
 
 
 # ---------- хаб ----------
@@ -282,6 +385,7 @@ class Hub:
         self.sessions = catalogdb.Sessions(self.database)
         self.status_cache = {}
         self.status_lock = threading.Lock()
+        self.health = SourceHealth(self)
         self.installs = {}
         self.parallel = Parallel(self)
         db = sqlite3.connect(self.database, timeout=60)
@@ -421,11 +525,18 @@ class Hub:
                                'ticket': ticket}
         return self.core_call(core, '/api/core/components/start', 'POST', payload, timeout=30)
 
+    # Ядро не ответило — не спрашиваем его снова пять минут: каждый запрос
+    # стоил бы 4–8 с таймаута. Включённое ядро само приходит с /hello, и тогда
+    # отметка снимается сразу; вручную — «Проверить сейчас» (SourceHealth.check_all).
+    OFFLINE_TTL = 300
+
     def core_status(self, core_id, max_age=2.0):
         with self.status_lock:
             cached = self.status_cache.get(core_id)
-            if cached and time.monotonic() - cached[0] < max_age:
-                return cached[1]
+            if cached:
+                age = time.monotonic() - cached[0]
+                if age < max_age or (not cached[1].get('online') and age < self.OFFLINE_TTL):
+                    return cached[1]
         core = self.cores.get(core_id)
         if core is None:
             return {'online': False, 'error': 'Устройство не найдено'}
@@ -1615,7 +1726,8 @@ class HubApi:
         rows = []
         for record in hub.sources.load():
             rows.append({**sources.public(record), 'rootKey': sources.root_key(record),
-                         'stats': stats.get(record['id'], {})})
+                         'stats': stats.get(record['id'], {}),
+                         'health': hub.health.status(record['id'])})
         return {'sources': rows, 'types': sources.TYPES,
                 'devices': [{'id': row['id'], 'name': row['name']} for row in hub.cores.load()]}
 
@@ -1630,9 +1742,14 @@ class HubApi:
         hub = self.hub
         if not parts and method == 'GET':
             return self.sources_payload()
+        if parts == ['health'] and method == 'POST':
+            hub.health.check_all()
+            return self.sources_payload()
         if parts == ['save'] and method == 'POST':
             record = hub.sources.save(body)
             hub.refresh_sources()
+            # Поменяли подключение — старый вердикт о доступности больше не про него.
+            threading.Thread(target=hub.health.check, args=(record,), daemon=True).start()
             return {'ok': True, 'source': sources.public(record)}
         if parts == ['remove'] and method == 'POST':
             source_id = str(body.get('id') or '')

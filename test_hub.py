@@ -537,5 +537,95 @@ class CompanionsTest(unittest.TestCase):
         self.assertEqual(result['companions'][0]['avatar'], '/media/face-crop/4?size=200')
 
 
+class SourceHealthTest(unittest.TestCase):
+    """Доступность источников: проверка раз в пять минут, а не на каждый кадр."""
+
+    def make_hub(self, drivers):
+        import threading
+        from types import SimpleNamespace
+        records = [{'id': key, 'type': 'smb', 'enabled': True} for key in drivers]
+        fake = SimpleNamespace(
+            sources=SimpleNamespace(load=lambda: records),
+            access=SimpleNamespace(driver=lambda source_id: drivers[source_id],
+                                   resolve=lambda key: (drivers[pathkeys.source_of(key)],
+                                                        pathkeys.native(key))),
+            status_lock=threading.Lock(), status_cache={'pc-a': (0, {'online': False})})
+        fake.health = hub.SourceHealth(fake)
+        fake.health.TIMEOUT = 0.3
+        return fake
+
+    def test_check_all_marks_down_and_hanging_sources(self):
+        from types import SimpleNamespace
+
+        def broken():
+            raise sources.SourceError('SMB nas: нет связи')
+
+        def hang():
+            time.sleep(2)
+        fake = self.make_hub({'ok': SimpleNamespace(test=lambda: True),
+                              'down': SimpleNamespace(test=broken),
+                              'slow': SimpleNamespace(test=hang)})
+        started = time.monotonic()
+        state = fake.health.check_all()
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertTrue(state['ok']['online'])
+        self.assertFalse(state['down']['online'])
+        self.assertIn('нет связи', state['down']['error'])
+        self.assertFalse(state['slow']['online'])
+        self.assertEqual(fake.status_cache, {}, 'ручная проверка заново спрашивает ядра')
+        self.assertTrue(fake.health.available('never-checked'))
+
+    def test_unavailable_source_is_not_touched(self):
+        from types import SimpleNamespace
+        calls = []
+        driver = SimpleNamespace(stat=lambda native: calls.append(native))
+        fake = self.make_hub({'nas': driver})
+        fake.health.failed('nas', 'timeout')
+        media = hub.SourceMedia(fake, 'nas:/HDD/a.jpg')
+        self.assertFalse(media.exists())
+        with self.assertRaises(sources.SourceError):
+            media.open()
+        self.assertEqual(calls, [])
+
+    def test_connection_error_marks_source_down(self):
+        from types import SimpleNamespace
+
+        def stat(native):
+            raise sources.SourceError('SSH 192.168.1.20: Unable to connect')
+
+        def missing(native):
+            raise FileNotFoundError(native)
+        fake = self.make_hub({'pc-a': SimpleNamespace(stat=stat), 'nas': SimpleNamespace(stat=missing)})
+        self.assertFalse(hub.SourceMedia(fake, 'pc-a:F:\a.jpg').exists())
+        self.assertFalse(fake.health.available('pc-a'))
+        self.assertFalse(hub.SourceMedia(fake, 'nas:/HDD/b.jpg').exists())
+        self.assertTrue(fake.health.available('nas'), 'нет файла — это не недоступность')
+
+
+class CoreStatusCacheTest(unittest.TestCase):
+    def test_offline_core_is_remembered(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            catalog = root / 'catalog'
+            catalog.mkdir()
+            sqlite3.connect(catalog / 'catalog.sqlite').close()
+            state = hub.Hub(catalog, root / 'data', link_url='')
+            core = state.cores.save({'id': 'pc-t', 'name': 'PC-T', 'host': '127.0.0.1'})
+            calls = []
+
+            def unreachable(*args, **kwargs):
+                calls.append(args[1])
+                raise RuntimeError('PC-T недоступно')
+            state.core_call = unreachable
+            self.assertFalse(state.core_status(core['id'])['online'])
+            time.sleep(0.05)
+            self.assertFalse(state.core_status(core['id'], max_age=0)['online'])
+            self.assertEqual(len(calls), 1, 'второй раз ядро не спрашивали')
+            with state.status_lock:
+                state.status_cache.pop(core['id'])
+            state.core_status(core['id'])
+            self.assertEqual(len(calls), 2)
+
+
 if __name__ == '__main__':
     unittest.main()
