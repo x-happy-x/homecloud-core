@@ -575,6 +575,19 @@ class SourceHealthTest(unittest.TestCase):
         self.assertEqual(fake.status_cache, {}, 'ручная проверка заново спрашивает ядра')
         self.assertTrue(fake.health.available('never-checked'))
 
+    def test_health_payload_has_no_connection_details(self):
+        from types import SimpleNamespace
+        fake = self.make_hub({'nas': SimpleNamespace(test=lambda: True)})
+        fake.sources = SimpleNamespace(load=lambda: [
+            {'id': 'nas', 'name': 'Netcraze', 'type': 'smb', 'host': '10.0.0.5', 'password': 'x'},
+            {'id': 'pc-a', 'name': 'PC-A', 'type': 'device', 'device': 'pc-a'}])
+        fake.health.failed('pc-a', 'SSH 10.0.0.9: Unable to connect')
+        payload = hub.HubApi(None, fake).health_payload()['sources']
+        self.assertEqual(payload['nas'], {'name': 'Netcraze', 'online': True, 'checked_at': None})
+        self.assertFalse(payload['pc-a']['online'])
+        self.assertNotIn('10.0.0.5', json.dumps(payload))
+        self.assertNotIn('10.0.0.9', json.dumps(payload))
+
     def test_unavailable_source_is_not_touched(self):
         from types import SimpleNamespace
         calls = []
