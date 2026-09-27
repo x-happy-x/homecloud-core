@@ -1,5 +1,6 @@
 """Fully local quality, classification and semantic indexing for the photo catalog."""
 import argparse
+import base64
 from datetime import datetime, timezone
 import json
 import os
@@ -374,10 +375,14 @@ def serve(args):
     for line in sys.stdin:
         try:
             request = json.loads(line)
-            text = str(request.get('text', '')).strip()
             top = min(1000, max(1, int(request.get('top', 500))))
-            with torch.inference_mode():
-                vector = processor.texts([text]).float().cpu().numpy()[0]
+            if request.get('vector'):
+                # Похожие снимки: вектор готового снимка, модель не нужна.
+                vector = np.frombuffer(base64.b64decode(request['vector']), dtype='<f4')
+            else:
+                text = str(request.get('text', '')).strip()
+                with torch.inference_mode():
+                    vector = processor.texts([text]).float().cpu().numpy()[0]
             paths, matrix = library()
             if len(paths):
                 scores = matrix @ vector

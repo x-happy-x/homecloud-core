@@ -38,6 +38,7 @@ import face_stacks
 import highlight_generator
 import job_features
 import media_metadata
+import adult_manual
 import pathkeys
 import pathrules
 import photo_curation
@@ -335,18 +336,20 @@ class SemanticService:
             raise RuntimeError('Семантическая модель не запустилась')
         self.model = model
 
-    def query(self, text, top=500):
+    def query(self, text, top=500, vector=''):
+        """Смысловой поиск по тексту или, с vector (base64 float32), — похожие на снимок."""
         model = catalog_settings.load(self.catalog)['visual_model']
         text_key = text.casefold().strip()
-        if not text_key:
+        if not text_key and not vector:
             return []
-        key = model + '\0' + text_key
+        key = model + '\0' + (('v:' + hashlib.sha1(vector.encode()).hexdigest()) if vector else text_key)
+        request = {'vector': vector, 'top': top} if vector else {'text': text, 'top': top}
         with self.lock:
             if key in self.cache:
                 return self.cache[key]
             try:
                 self._start()
-                self.process.stdin.write(json.dumps({'text': text, 'top': top}) + '\n')
+                self.process.stdin.write(json.dumps(request) + '\n')
                 self.process.stdin.flush()
                 response = json.loads(self.process.stdout.readline())
                 if response.get('error'):
@@ -2036,6 +2039,14 @@ class App:
                 marks = ','.join('?' * len(batch))
                 hidden_by_path.update(self.store.db.execute(
                     f'SELECT path,owner FROM hidden_photos WHERE path IN ({marks})', batch))
+            manual_adult = adult_manual.manual_ratings(self.store.db, paths)
+            # Копии того же файла (photo_copies) — только в карточке одного снимка.
+            copies_of = {}
+            if exact_path and paths:
+                group = [item for item in adult_manual.copy_group(self.store.db, paths[:1])
+                         if item != paths[0]]
+                copies_of[paths[0]] = [{'path': item, 'source': pathkeys.source_of(item)}
+                                       for item in group]
         people_by_path = {path: [] for path in paths}
         face_counts = {path: 0 for path in paths}
         faces_by_path = {path: [] for path in paths}
@@ -2162,6 +2173,10 @@ class App:
             'kind': kind or 'photo', 'duration': duration or 0,
             'speech_text': speech_text or '',
             'hidden_owner': hidden_by_path.get(path, ''),
+            # Отметка 18+ человеком: safe или explicit; None — оценка автоматическая.
+            'adult_manual': manual_adult.get(path),
+            **({'copies': [{**item, 'source_name': source_names.get(item['source'], item['source'])}
+                           for item in copies_of[path]]} if path in copies_of else {}),
             'video': (f'/media/video?path={quote(path, safe="")}' if kind == 'video' else ''),
             # Время файла в миллисекундах: галерее нужна дата снимка.
             'taken': round((modified or 0) / 1e6) or None,
@@ -2345,6 +2360,29 @@ class App:
         if group['cover_path'] not in visible and group['photos']:
             group['cover_path'] = group['photos'][0]['path']
         return {'group': group}
+
+    def similar_photos(self, raw_path, limit, viewer='', admin=False):
+        """Похожие снимки по сохранённому вектору: считает ядро по своей матрице."""
+        with self.lock:
+            model = catalog_settings.read(self.store.db)['visual_model']
+            row = self.store.db.execute(
+                'SELECT embedding FROM photo_embeddings WHERE path=? AND model=?',
+                (raw_path, model)).fetchone()
+            skip = set(adult_manual.copy_group(self.store.db, [raw_path])) | {raw_path}
+        if not row or not row[0]:
+            return {'photos': [], 'ready': False}
+        found = self.semantic.query('', limit * 3 + len(skip),
+                                    vector=base64.b64encode(row[0]).decode('ascii'))
+        rank = {}
+        for item in found:
+            if item['path'] not in skip and item['path'] not in rank:
+                rank[item['path']] = item['score']
+        wanted = list(rank)[:limit * 2]
+        if not wanted:
+            return {'photos': [], 'ready': True}
+        cards, _ = self.photo_payloads(limit=len(wanted), wanted=wanted, viewer=viewer, admin=admin)
+        cards.sort(key=lambda card: -rank.get(card['path'], 0))
+        return {'photos': cards[:limit], 'ready': True}
 
     def hydrate_payloads(self, paths):
         """Карточки снимков для готового списка путей, одним запросом на порцию."""
@@ -3019,6 +3057,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not photos:
                     return self.error_json(404, 'Фотография не найдена')
                 return self.json_response({'photo': photos[0]})
+            if parsed.path == '/api/photos/similar':
+                query = parse_qs(parsed.query)
+                raw_path = query.get('path', [''])[0]
+                limit = min(max(int(query.get('limit', ['24'])[0] or 24), 1), 60)
+                viewer, admin = self.viewer
+                return self.json_response(self.app.similar_photos(raw_path, limit, viewer, admin))
             if parsed.path == '/api/photo/metadata':
                 # EXIF и параметры потока — только тем, кому виден сам снимок.
                 query = parse_qs(parsed.query)
@@ -3285,6 +3329,18 @@ class Handler(BaseHTTPRequestHandler):
                         catalog_settings.read(self.app.store.db),
                         move=self.app.hub is None)
                 return self.json_response({'ok': True, **result})
+            if path == '/api/photos/adult':
+                # Человек поправляет оценку 18+: safe — «не 18+», explicit — «18+», null — вернуть.
+                rating = body.get('rating')
+                paths = [str(item) for item in body.get('paths', []) if item][:2000]
+                viewer, admin = self.viewer
+                try:
+                    with self.app.lock:
+                        adult_manual.ensure_schema(self.app.store.db)
+                        changed = adult_manual.mark(self.app.store.db, paths, rating, viewer)
+                except ValueError as exc:
+                    return self.error_json(400, str(exc))
+                return self.json_response({'ok': True, 'changed': len(changed)})
             if path == '/api/photos/reveal':
                 viewer, admin = self.viewer
                 with self.app.lock:

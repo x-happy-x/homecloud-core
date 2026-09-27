@@ -228,6 +228,13 @@ def evaluate_path(detector, torch, model, transform, labels, path, threshold, ta
     return best
 
 
+def manual_clause(db):
+    """Отмеченное человеком вручную (adult_manual) этап не пересчитывает, даже с --force."""
+    known = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                       "AND name='photo_adult_manual'").fetchone()
+    return ' AND photos.path NOT IN (SELECT path FROM photo_adult_manual) ' if known else ''
+
+
 def scoped_rows(db, args):
     scope, values = pathkeys.analysis_scope_sql(args.root, args.path, 'photos.path')
     freshness = '' if args.force else ''' AND (
@@ -238,7 +245,7 @@ def scoped_rows(db, args):
     rows = db.execute('''SELECT photos.path,photos.size,photos.modified FROM photos
       LEFT JOIN photo_adult_analysis USING(path)
       WHERE photos.status='ok'
-        AND COALESCE(photos.blocked,0)=0 ''' + scope +
+        AND COALESCE(photos.blocked,0)=0 ''' + manual_clause(db) + scope +
       freshness + ' ORDER BY photos.path LIMIT ?',
       (*values, *extra, args.limit)).fetchall()
     return video_media.only(args.kinds, rows)
@@ -249,7 +256,8 @@ def recheck(args):
     db = connect(args.catalog.resolve())
     rows = db.execute("""SELECT photo_adult_analysis.path,rating,tags_json,regions_json,
         photo_analysis.width,photo_analysis.height FROM photo_adult_analysis
-        LEFT JOIN photo_analysis USING(path) WHERE photo_adult_analysis.status='ok'""").fetchall()
+        LEFT JOIN photo_analysis USING(path) WHERE photo_adult_analysis.status='ok'
+        AND COALESCE(photo_adult_analysis.detector_model,'')<>'manual'""").fetchall()
     changes = []
     for path, rating, tags_json, regions_json, width, height in rows:
         payload = json.loads(tags_json or '{}')
