@@ -276,7 +276,8 @@ def scan(args):
             'video_position': video_position,
             'pid': os.getpid(), 'started_at': started_at, 'updated_at': now,
         }
-        temporary = progress_file.with_suffix(progress_file.suffix + '.tmp')
+        temporary = progress_file.with_name(
+            f'{progress_file.name}.{os.getpid()}.tmp')  # свой у каждого процесса
         temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
         # Файл прогресса читает device_job.py каждые полсекунды — os.replace изредка
         # натыкается на этот момент чтения (WinError 5), несколько попыток решают дело.

@@ -1250,6 +1250,15 @@ class Parallel:
         participants, skipped = self.eligible(per_file)
         if cores:
             participants = [core for core in participants if core['id'] in set(cores)]
+        # Диск компьютера читает только его ядро: другим ядрам дороги к нему
+        # нет, и их доля файлов вся ушла бы в ошибки «не подключено к хабу».
+        for source_id in {pathkeys.source_of(root) for root in roots}:
+            record = self.hub.sources.get(source_id) or {}
+            if record.get('type') == 'device' and record.get('device'):
+                for core in participants:
+                    if core['id'] != record['device']:
+                        skipped.append(f"{core['name']}: не читает диск {record.get('name') or source_id}")
+                participants = [core for core in participants if core['id'] == record['device']]
         if not participants:
             raise ValueError('Нет свободного ядра, умеющего все выбранные этапы'
                              + (f" ({'; '.join(skipped)})" if skipped else ''))
