@@ -52,6 +52,9 @@ def database(folder, check_same_thread=True):
         CREATE TABLE IF NOT EXISTS photos (
           path TEXT PRIMARY KEY, size INTEGER, modified INTEGER, model TEXT,
           status TEXT, error TEXT);
+        -- Копии файлов (filekeys): этапы их не считают, результаты переносятся.
+        CREATE TABLE IF NOT EXISTS photo_copies (
+          path TEXT PRIMARY KEY, original TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS faces (
           id INTEGER PRIMARY KEY, path TEXT REFERENCES photos(path),
           box TEXT, embedding BLOB, thumbnail TEXT);
@@ -298,9 +301,13 @@ def scan(args):
         low, high = bounds(root)
         # При параллельном задании у ядра только своя доля файлов.
         shard, shard_values = pathkeys.shard_sql('path')
+        # Копии файлов лица не ищут: иначе одно фото даёт несколько одинаковых лиц.
+        has_copies = index.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='photo_copies'").fetchone()
+        copies = ' AND path NOT IN (SELECT path FROM photo_copies)' if has_copies else ''
         for found, found_size, found_modified in index.execute(
                 'SELECT path,size,modified FROM photos WHERE path>=? AND path<? '
-                "AND status NOT IN ('excluded','missing')" + shard + ' ORDER BY path',
+                "AND status NOT IN ('excluded','missing')" + shard + copies + ' ORDER BY path',
                 (low, high, *shard_values)):
             candidate = found if keyed else Path(found)
             if pathrules.blocked(found, block_rules, allow_rules):

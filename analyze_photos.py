@@ -219,7 +219,7 @@ def analyze(args):
     catalog = args.catalog.resolve()
     db = connect(catalog)
     # Папки и снимки задания — ключи источников (см. pathkeys.py).
-    root_sql, root_values = pathkeys.scope_sql(args.root, args.path, 'photos.path')
+    root_sql, root_values = pathkeys.analysis_scope_sql(args.root, args.path, 'photos.path')
     # Пересчитываем только новое и изменившееся: снимок версии файла — размер и mtime.
     fresh_sql = '' if args.force else '''
         AND (selected_embedding.path IS NULL OR selected_embedding.size != photos.size OR

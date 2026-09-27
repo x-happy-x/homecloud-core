@@ -60,7 +60,7 @@ def main():
     args = parser.parse_args()
     db = connect(args.catalog.resolve())
     # Папки и снимки задания — ключи источников (см. pathkeys.py).
-    root_sql, root_values = pathkeys.scope_sql(args.root, args.path, 'path')
+    root_sql, root_values = pathkeys.analysis_scope_sql(args.root, args.path, 'path')
     candidate_sql = '' if args.path else ''' AND
           (content_type IN ('screenshot','document','meme') OR
            lower(path) LIKE '%screenshot%' OR lower(path) LIKE '%скриншот%')'''

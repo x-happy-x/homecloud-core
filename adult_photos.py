@@ -229,7 +229,7 @@ def evaluate_path(detector, torch, model, transform, labels, path, threshold, ta
 
 
 def scoped_rows(db, args):
-    scope, values = pathkeys.scope_sql(args.root, args.path, 'photos.path')
+    scope, values = pathkeys.analysis_scope_sql(args.root, args.path, 'photos.path')
     freshness = '' if args.force else ''' AND (
       photo_adult_analysis.path IS NULL OR photo_adult_analysis.size != photos.size OR
       photo_adult_analysis.modified != photos.modified OR photo_adult_analysis.status != 'ok'
