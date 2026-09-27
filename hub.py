@@ -1731,6 +1731,17 @@ class HubApi:
         return {'sources': rows, 'types': sources.TYPES,
                 'devices': [{'id': row['id'], 'name': row['name']} for row in hub.cores.load()]}
 
+    def health_payload(self):
+        """Только доступность и имена источников — для плиток и просмотрщика любого
+        зрителя: без адресов, логинов и статистики, и дёшево (ничего не проверяет)."""
+        result = {}
+        for record in self.hub.sources.load():
+            status = self.hub.health.status(record['id']) or {'online': True, 'checked_at': None}
+            # Текст ошибки не отдаём: в нём бывают адреса и логины.
+            result[record['id']] = {'name': record.get('name') or record['id'],
+                                    'online': status['online'], 'checked_at': status['checked_at']}
+        return {'sources': result}
+
     def storage_brief(self):
         db = sqlite3.connect(self.hub.database, timeout=30)
         try:
@@ -1742,6 +1753,8 @@ class HubApi:
         hub = self.hub
         if not parts and method == 'GET':
             return self.sources_payload()
+        if parts == ['health'] and method == 'GET':
+            return self.health_payload()
         if parts == ['health'] and method == 'POST':
             hub.health.check_all()
             return self.sources_payload()
