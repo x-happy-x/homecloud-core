@@ -342,7 +342,7 @@ class CoreDevice:
         return self.controller.stop()
 
     def start(self, roots, features, paths=None, force=False, visual_model=None,
-              video_features=None, shard=None):
+              video_features=None, shard=None, resume=False):
         controller = self.controller
         self.app.refresh()
         part = parse_shard(shard)
@@ -368,7 +368,8 @@ class CoreDevice:
             selected, kinds = job_features.resolve(features, video_features, supported)
             # Превью сетки и сведения о файлах обновляются при каждом обходе источника.
             # Доля параллельного задания источник не обходит: опись хаб сделал раньше.
-            if part:
+            # Продолжение упавшего задания источник заново не обходит.
+            if part or resume:
                 selected['inventory'] = False
             elif chosen:
                 selected['inventory'] = True
@@ -405,6 +406,8 @@ class CoreDevice:
                        '--stop-file', str(controller.stop_file)]
             if force:
                 command.append('--force')
+            if resume:
+                command.append('--resume')
             if part:
                 command.extend(('--shard', part))
             for key in chosen:
@@ -525,7 +528,8 @@ class CoreHandler(BaseHTTPRequestHandler):
                 return self.json_response({'ok': True, 'job': self.app.device.start(
                     body.get('roots', []), body.get('features', {}), body.get('paths', []),
                     force=bool(body.get('force')), visual_model=body.get('visual_model'),
-                    video_features=body.get('video_features'), shard=body.get('shard'))})
+                    video_features=body.get('video_features'), shard=body.get('shard'),
+                    resume=bool(body.get('resume')))})
             if path == '/api/device/job/stop':
                 return self.json_response({'ok': True, 'job': self.app.device.stop()})
             if path.startswith('/api/core/task/') and path.endswith('/start'):

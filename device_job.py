@@ -50,18 +50,22 @@ ANALYSIS_FEATURES = ('visual', 'ocr', 'caption', 'adult', 'speech', 'diarize', '
 CATALOG_FEATURES = ('highlights',)
 
 
-def planned_phases(features, remote=False, shard=False):
-    """Этапы задания в том порядке, в котором их на самом деле выполняет run()."""
+def planned_phases(features, remote=False, shard=False, resume=False):
+    """Этапы задания в том порядке, в котором их на самом деле выполняет run().
+
+    resume — продолжение упавшего задания: опись и ключи копий уже сделаны.
+    """
     plan = []
     # Доля параллельного задания не обходит источник: опись уже сделана.
-    if not shard and (features.get('inventory') or (
+    if not shard and not resume and (features.get('inventory') or (
             not features.get('faces') and any(features.get(name) for name in ANALYSIS_FEATURES))):
         plan.append('inventory')
         # У ядра при хабе обход источника всегда обновляет превью сетки.
         if remote:
             plan.append('thumbs')
     # Ключи файлов и копии — один раз, у хозяина задания, не в долях.
-    if not shard and (features.get('faces') or any(features.get(name) for name in ANALYSIS_FEATURES)):
+    if not shard and not resume and (
+            features.get('faces') or any(features.get(name) for name in ANALYSIS_FEATURES)):
         plan.append('copies')
     if features.get('faces'):
         plan.append('faces')
@@ -238,6 +242,8 @@ def parse_args():
                         help='Переделать даже то, что уже посчитано для этой версии файла')
     parser.add_argument('--shard', default='',
                         help='«номер/всего»: доля параллельного задания; опись делает хаб отдельно')
+    parser.add_argument('--resume', action='store_true',
+                        help='Продолжить упавшее задание: без описи и ключей копий, этапы доделают своё')
     args = parser.parse_args()
     args.catalog = args.catalog.resolve()
     # Ключи источников (pc-x:D:\\Фото) остаются как есть, свои пути — абсолютными.
@@ -270,7 +276,7 @@ def thumbnails(args):
 def run(args):
     args.job_started_at = time.time()
     args.remote = hublink.is_remote(args.catalog)
-    args.plan = planned_phases(args.features, args.remote, bool(args.shard))
+    args.plan = planned_phases(args.features, args.remote, bool(args.shard), args.resume)
     args.history = {}
     args.timings = read_json(timings_file(args))
     args.stop_file.unlink(missing_ok=True)
@@ -343,7 +349,7 @@ def run(args):
             filekeys.ensure_schema(db)
         finally:
             db.close()
-    if per_file and not args.shard:
+    if per_file and not args.shard and not args.resume:
         # Копии файлов этапы не считают: оригинал — один раз, результат переносится.
         run_child(args, [str(face_python), str(here / 'filekeys.py'), 'keys',
                   '--catalog', str(args.catalog), '--progress-file', str(stage),
@@ -384,7 +390,7 @@ def run(args):
                 publish(args, 'stopped', 'faces')
                 return
     elif (any(args.features.get(name) for name in ANALYSIS_FEATURES)
-          and not args.features.get('inventory') and not args.shard):
+          and not args.features.get('inventory') and not args.shard and not args.resume):
         # Опись уже прошла в начале задания — второй раз обходить источник незачем.
         if inventory(args).get('stopped'):
             publish(args, 'stopped', 'inventory')
