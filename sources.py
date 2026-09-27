@@ -264,6 +264,10 @@ class Driver:
     def makedirs(self, native):
         raise SourceError('Создание папок в этом источнике не поддерживается')
 
+    def put(self, native, local_file):
+        """Записать новый файл в источник; существующий не перезаписывается."""
+        raise SourceError('Запись в этот источник не поддерживается')
+
     def exists(self, native):
         try:
             self.stat(native)
@@ -364,6 +368,11 @@ class LocalDriver(Driver):
 
     def makedirs(self, native):
         os.makedirs(native, exist_ok=True)
+
+    def put(self, native, local_file):
+        os.makedirs(os.path.dirname(native), exist_ok=True)
+        with open(local_file, 'rb') as stream, open(native, 'xb') as output:
+            shutil.copyfileobj(stream, output, 4 * 1024 * 1024)
 
 
 class SmbDriver(Driver):
@@ -483,6 +492,22 @@ class SmbDriver(Driver):
 
     def makedirs(self, native):
         self._client().makedirs(self.unc(native), exist_ok=True)
+
+    def put(self, native, local_file):
+        client = self._client()
+        folder = native.rsplit('/', 1)[0]
+        if folder:
+            client.makedirs(self.unc(folder), exist_ok=True)
+        try:
+            with open(local_file, 'rb') as stream, \
+                    client.open_file(self.unc(native), mode='xb') as output:
+                shutil.copyfileobj(stream, output, 4 * 1024 * 1024)
+        except FileExistsError:
+            raise SourceError('Файл с таким именем уже есть') from None
+        except OSError:
+            raise
+        except Exception as exc:
+            raise SourceError(f'SMB {self.host}: {exc}') from exc
 
 
 def python_ntlm():
@@ -680,6 +705,12 @@ class SftpDriver(Driver):
     def rename(self, old, new):
         self.makedirs(posixpath.dirname(self.remote(new)))
         self._connect().rename(self.remote(old), self.remote(new))
+
+    def put(self, native, local_file):
+        if self.exists(native):
+            raise SourceError('Файл с таким именем уже есть')
+        self.makedirs(posixpath.dirname(self.remote(native)))
+        self._connect().put(str(local_file), self.remote(native))
 
 
 class DeviceSftpDriver(SftpDriver):
@@ -904,6 +935,13 @@ class FtpDriver(Driver):
         self.makedirs(posixpath.dirname(new))
         self._ftp().rename(old, new)
 
+    def put(self, native, local_file):
+        if self.exists(native):
+            raise SourceError('Файл с таким именем уже есть')
+        self.makedirs(posixpath.dirname(native))
+        with open(local_file, 'rb') as stream:
+            self._ftp().storbinary('STOR ' + native, stream, 4 * 1024 * 1024)
+
 
 class WebdavDriver(Driver):
     """WebDAV: PROPFIND для списков, GET с Range для чтения."""
@@ -1014,8 +1052,31 @@ class WebdavDriver(Driver):
         if status >= 400:
             raise SourceError(f'WebDAV ответил {status}')
 
+    def put(self, native, local_file):
+        if self.exists(native):
+            raise SourceError('Файл с таким именем уже есть')
+        self.makedirs(posixpath.dirname(native))
+        with open(local_file, 'rb') as stream:
+            status, _response, _data = self._request(
+                'PUT', native, {'Content-Length': str(os.path.getsize(local_file)),
+                                'If-None-Match': '*'}, stream)
+        if status >= 400:
+            raise SourceError(f'WebDAV ответил {status}')
+
 
 # ---------- выбор драйвера ----------
+
+TRASH = '.homecloud-trash'
+
+
+def trash_native(record, native, stamp):
+    """Куда в источнике уходит удалённый файл: папка .homecloud-trash в корне
+    (у SMB — в корне шары), дальше тот же путь. stamp — папка дня, ГГГГММДД."""
+    parts = [part for part in re.split(r'[\\/]', native) if part]
+    if (record or {}).get('type') == 'smb' and parts:
+        return '/' + '/'.join([parts[0], TRASH, stamp, *parts[1:]])
+    return '/' + '/'.join([TRASH, stamp, *parts])
+
 
 class Access:
     """Как этой машине добраться до источников.

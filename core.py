@@ -11,7 +11,9 @@ hub.json), превью и миниатюры лиц уходят туда же.
   хаба (/api/core/list|stat|read), удаление и перенос (/api/core/fileop);
 * временные копии файлов с источников, которые нельзя открыть как путь
   (/api/core/stage) — для этапов в других окружениях;
-* перенос старого каталога этого устройства в общий (/api/core/export-legacy).
+* перенос старого каталога этого устройства в общий (/api/core/export-legacy);
+* обработка роликов через ffmpeg (/api/core/media/…, video_tools.py):
+  перекодирование с заменой в источнике, фрагмент, сжатие, поворот, кадр, звук.
 
 Все запросы — с X-Local-Token ядра: его знает только хаб.
 """
@@ -31,7 +33,7 @@ import tempfile
 import threading
 import time
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import catalogdb
 import components
@@ -40,6 +42,7 @@ import job_features
 import pathkeys
 import settings as catalog_settings
 import sources
+import video_tools
 
 ROOT = Path(__file__).resolve().parent
 
@@ -93,6 +96,8 @@ class CoreApp:
         self.semantic = SemanticService(self.folder)
         self.components = components.Components(log_folder=self.folder)
         self.exports = {}
+        self.media = video_tools.MediaJobs(self.folder / 'media-out', self.access, self.resolve,
+                                           video_tools.trash_original(device_id))
 
     # ----- связь с хабом -----
 
@@ -428,7 +433,8 @@ class CoreHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         path = self.path.split('?', 1)[0]
         if path in {'/api/device', '/api/device/job', '/api/core/stage', '/api/core/read',
-                    '/api/core/components', '/api/core/components/file'} \
+                    '/api/core/components', '/api/core/components/file',
+                    '/api/core/media/job', '/api/core/media/file'} \
                 or path.startswith('/api/core/task/'):
             return
         print(f'{self.address_string()} - {format % args}', flush=True)
@@ -493,6 +499,13 @@ class CoreHandler(BaseHTTPRequestHandler):
                 return self.json_response({'path': self.app.stage.path(query.get('key', [''])[0])})
             if path == '/api/core/export-legacy':
                 return self.json_response(self.app.exports.get('legacy') or {'status': 'idle'})
+            if path == '/api/core/media/probe':
+                return self.json_response(self.app.media.probe(query.get('key', [''])[0]))
+            if path == '/api/core/media/job':
+                return self.json_response(self.app.media.status(query.get('id', [''])[0]))
+            if path == '/api/core/media/file':
+                file, name = self.app.media.file(query.get('id', [''])[0])
+                return self.send_range(file, download=name)
             return self.error_json(404, 'Нет такого адреса')
         except FileNotFoundError as exc:
             return self.error_json(404, f'Нет файла: {exc}')
@@ -540,6 +553,12 @@ class CoreHandler(BaseHTTPRequestHandler):
                 return self.json_response({'ok': True})
             if path == '/api/core/export-legacy':
                 return self.json_response(self.app.export_legacy())
+            if path == '/api/core/media/start':
+                self.app.refresh()
+                return self.json_response(self.app.media.start(
+                    str(body.get('key') or ''), str(body.get('op') or ''), body.get('params')))
+            if path == '/api/core/media/cancel':
+                return self.json_response(self.app.media.cancel(str(body.get('id') or '')))
             return self.error_json(404, 'Нет такого адреса')
         except (KeyError, ValueError, sources.SourceError) as exc:
             return self.error_json(400, str(exc))
@@ -547,7 +566,7 @@ class CoreHandler(BaseHTTPRequestHandler):
             print(f'POST {path} failed: {exc}', file=sys.stderr, flush=True)
             return self.error_json(500, str(exc))
 
-    def send_range(self, path):
+    def send_range(self, path, download=None):
         total = path.stat().st_size
         header = self.headers.get('Range', '')
         start, end, partial = 0, total - 1, False
@@ -574,6 +593,9 @@ class CoreHandler(BaseHTTPRequestHandler):
                          or 'application/octet-stream')
         self.send_header('Content-Length', str(length))
         self.send_header('Accept-Ranges', 'bytes')
+        if download:
+            self.send_header('Content-Disposition',
+                             "attachment; filename*=UTF-8''" + quote(download, safe=''))
         if partial:
             self.send_header('Content-Range', f'bytes {start}-{end}/{total}')
         self.end_headers()

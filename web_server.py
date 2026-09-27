@@ -50,6 +50,7 @@ import sources
 import speaker_diarization
 import speech_videos
 import video as video_media
+import video_tools
 from people_gui import CatalogStore
 from analyze_photos import connect as analysis_database
 from prototype import cluster_embeddings, database as open_catalog_db
@@ -631,6 +632,7 @@ class DeviceController:
                            and (self.path_available(self.model_cache)
                                 or self.path_available(self.root / 'hf-token.txt', 'file'))),
                 'authenticity': self.path_available(imgutils, 'file'),
+                'video': video_tools.available(self.root),
                 # Оценка и подборки идут в основном окружении по готовым данным.
                 'curation': True,
                 'highlights': True,
@@ -2405,6 +2407,55 @@ class App:
         'video_speakers', 'video_speech', 'video_speech_segments',
         'photo_curation', 'photo_thumbs', 'video_people_hints', 'highlight_photos')
 
+    def video_key(self, path, replace=False):
+        """Ролик из каталога для обработки; заменять скрытый нельзя — он лежит не на месте."""
+        path = str(path or '').strip()
+        with self.lock:
+            row = self.store.db.execute(
+                "SELECT kind FROM photos WHERE path=? AND status='ok'", (path,)).fetchone()
+            hidden = replace and self.store.db.execute(
+                'SELECT 1 FROM hidden_photos WHERE path=?', (path,)).fetchone()
+        if row is None:
+            raise KeyError('Ролик не найден в каталоге')
+        if row[0] != 'video':
+            raise ValueError('Это не видео')
+        if hidden:
+            raise ValueError('Ролик в скрытом альбоме: сначала верните его из скрытого')
+        return path
+
+    def replaced_video(self, result):
+        """Ядро заменило ролик в источнике: ключи каталога — на новый файл, размер и
+        время — его, чтобы следующая опись не посчитала ролик изменённым."""
+        old, new = result['old'], result['new']
+        with self.lock, self.store.db:
+            if new != old:
+                self._rekey([(old, new)])
+            self.store.db.execute('UPDATE photos SET size=?,modified=? WHERE path=?',
+                                  (result['size'], result['modified'], new))
+            try:
+                self.store.db.execute('UPDATE photo_thumbs SET size=?,modified=? WHERE path=?',
+                                      (result['size'], result['modified'], new))
+            except sqlite3.Error:
+                pass
+        if new != old and self.hub is not None:
+            self.hub.rename_thumbs([(old, new)])
+        with self.lock:
+            self.group_cache.clear()
+            self.dup_cache.clear()
+            self.store.reload_faces()
+        self.folders.refresh(force=True)
+
+    def _rekey(self, pairs):
+        """Путь снимка сменился: во всех таблицах каталога. Вызывать под lock и в транзакции."""
+        for old, new in pairs:
+            for table in self.RENAMED_TABLES:
+                try:
+                    self.store.db.execute(f'UPDATE {table} SET path=? WHERE path=?', (new, old))
+                except sqlite3.Error:
+                    pass
+            self.store.db.execute('UPDATE photos SET path=?,dir=? WHERE path=?',
+                                  (new, pathkeys.parent(new), old))
+
     def _hub_move(self, moves, target):
         """Перенос внутри источника: файлы двигает источник, ключи — каталог."""
         if not moves:
@@ -2426,15 +2477,7 @@ class App:
         done, errors = self.hub.move_originals(moves)
         if done:
             with self.lock, self.store.db:
-                for old, new in done:
-                    for table in self.RENAMED_TABLES:
-                        try:
-                            self.store.db.execute(
-                                f'UPDATE {table} SET path=? WHERE path=?', (new, old))
-                        except sqlite3.Error:
-                            pass
-                    self.store.db.execute('UPDATE photos SET path=?,dir=? WHERE path=?',
-                                          (new, pathkeys.parent(new), old))
+                self._rekey(done)
             self.hub.rename_thumbs(done)
             with self.lock:
                 self.store.reload_faces()
@@ -2998,6 +3041,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == '/media/video':
                 query = parse_qs(parsed.query)
                 return self.send_video(query.get('path', [''])[0])
+            if parsed.path == '/media/job' and self.app.hub is not None:
+                return self.send_media_job(parse_qs(parsed.query).get('id', [''])[0])
             if parsed.path == '/media/photo':
                 query = parse_qs(parsed.query)
                 path = query.get('path', [''])[0]
@@ -3539,6 +3584,27 @@ class Handler(BaseHTTPRequestHandler):
     # Соединение с каталогом одно на все потоки, поэтому даже короткое чтение —
     # под замком: плитки галереи грузятся параллельно с запросами групп, и без
     # него кэш запросов sqlite3 ломается насовсем (KeyError с текстом SQL).
+    def send_media_job(self, hub_id):
+        """Готовый файл операции с роликом: с ядра через хаб, с докачкой."""
+        try:
+            upstream = self.app.media.open_file(hub_id, self.headers.get('Range', ''))
+        except KeyError as exc:
+            return self.error_json(404, str(exc).strip("'"))
+        except RuntimeError as exc:
+            return self.error_json(502, str(exc))
+        with upstream:
+            self.send_response(upstream.status)
+            for name in ('Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges',
+                         'Content-Disposition'):
+                if upstream.headers.get(name):
+                    self.send_header(name, upstream.headers[name])
+            self.send_header('Cache-Control', 'private, max-age=3600')
+            self.end_headers()
+            try:
+                shutil.copyfileobj(upstream, self.wfile, 1024 * 1024)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     def send_video(self, raw_path):
         with self.app.lock:
             row = self.app.store.db.execute(
@@ -3700,6 +3766,7 @@ def main():
     if hub is not None:
         import hub as hub_module
         server.app.hub_api = hub_module.HubApi(server.app, hub)
+        server.app.media = hub_module.HubMedia(hub, server.app.replaced_video)
         args.no_browser = True
     browser_host = '127.0.0.1' if args.host == '0.0.0.0' else args.host
     url = f'http://{browser_host}:{server.server_port}/'

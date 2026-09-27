@@ -6,6 +6,10 @@ requirements-*.txt. Модель с Hugging Face качается snapshot_downl
 хаб берёт у ядра-источника пропуск (ticket) только на чтение моделей и отдаёт
 его ядру-получателю, так что токены ядер друг другу не достаются.
 
+Инструмент ffmpeg для обработки роликов (video_tools.py) — тоже «модель» с
+base tools: качается архивом сборки BtbN (с NVENC) и так же копируется с
+другого ядра.
+
 Одновременно идёт одна операция; её ход — в status()['operation'].
 """
 import json
@@ -13,10 +17,13 @@ import os
 from pathlib import Path, PurePosixPath
 import secrets
 import subprocess
+import shutil
 import sys
+import tarfile
 import threading
 import time
 from urllib.parse import quote
+import zipfile
 from urllib.request import Request, urlopen
 
 import envs
@@ -35,8 +42,16 @@ VENVS = (
      'requirements': 'requirements-ocr.txt', 'features': ['ocr']},
 )
 
+# Сборки ffmpeg BtbN: GPL, с NVENC и libx264; ветка 8.1 — выпуск, а не master.
+FFMPEG_BUILDS = {
+    'win32': 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/'
+             'ffmpeg-n8.1-latest-win64-gpl-8.1.zip',
+    'linux': 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/'
+             'ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz',
+}
+
 # base: hf — кэш Hugging Face (repo и extra), cache — папка кэша моделей,
-# models — папка models ядра.
+# models — папка models ядра, tools — папка tools ядра (скачивается по url).
 MODELS = (
     {'id': 'faces', 'title': 'Лица: InsightFace buffalo_l', 'base': 'models',
      'paths': ['buffalo_l'], 'features': ['faces']},
@@ -64,6 +79,9 @@ MODELS = (
     {'id': 'ram-plus', 'title': 'Разметчик RAM++', 'base': 'cache', 'paths': ['ram-plus'],
      'features': [],
      'note': 'загрузка — setup-ram.ps1'},
+    {'id': 'ffmpeg', 'title': 'Видео: ffmpeg', 'base': 'tools', 'paths': ['ffmpeg'],
+     'url': FFMPEG_BUILDS.get(sys.platform, FFMPEG_BUILDS['linux']), 'features': ['video'],
+     'note': 'перекодирование, фрагменты, кадры и звук из роликов'},
 )
 
 
@@ -76,6 +94,8 @@ def model_base(item, root=envs.ROOT):
         return envs.hf_home(root)
     if item['base'] == 'models':
         return envs.real(Path(root) / 'models')
+    if item['base'] == 'tools':
+        return Path(root) / 'tools'
     return envs.models_root(root)
 
 
@@ -166,7 +186,8 @@ class Components:
                 'id': item['id'], 'kind': 'model', 'title': item['title'],
                 'features': item['features'], 'installed': installed,
                 'bytes': self.model_bytes(item) if installed else 0,
-                'downloadable': item['base'] == 'hf', 'gated': bool(item.get('gated')),
+                'downloadable': item['base'] == 'hf' or bool(item.get('url')),
+                'gated': bool(item.get('gated')),
                 'note': item.get('note', '')})
         with self.lock:
             operation = dict(self.operation) if self.operation else None
@@ -226,7 +247,7 @@ class Components:
             raise ValueError('Неизвестное действие')
         if action == 'install' and item not in VENVS:
             raise ValueError('Устанавливаются окружения; модели — скачать или скопировать')
-        if action == 'download' and item.get('base') != 'hf':
+        if action == 'download' and item.get('base') != 'hf' and not item.get('url'):
             raise ValueError(f'«{item["title"]}» не качается отсюда: '
                              + (item.get('note') or 'скопируйте с другого ядра'))
         if action == 'copy':
@@ -334,6 +355,8 @@ class Components:
                            'сначала установите «Визуальный поиск»')
 
     def _download(self, state, item):
+        if item.get('url'):
+            return self._fetch_tool(state, item)
         python = self.hub_python()
         token_file = self.root / 'hf-token.txt'
         token = token_file.read_text(encoding='utf-8').strip() if token_file.is_file() else ''
@@ -353,6 +376,53 @@ class Components:
             env['HF_TOKEN'] = token
         self._command(state, [python, '-c', script, cache, item['repo'],
                               *item.get('extra', [])], env=env)
+
+    def _fetch_tool(self, state, item):
+        """Архив инструмента по url: скачать, распаковать в tools/<id>, старое заменить."""
+        base = model_base(item, self.root)
+        base.mkdir(parents=True, exist_ok=True)
+        archive = base / (item['id'] + '-download' + ('.zip' if item['url'].endswith('.zip')
+                                                      else '.tar.xz'))
+        self.log(state, f'Качаю {item["url"]}')
+        with urlopen(Request(item['url'], headers={'User-Agent': 'HomeCloud'}),
+                     timeout=120) as response, archive.open('wb') as output:
+            with self.lock:
+                state['total'] = int(response.headers.get('Content-Length') or 0)
+            done = 0
+            while True:
+                if self.stop_requested:
+                    break
+                chunk = response.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                done += len(chunk)
+                with self.lock:
+                    state['done'] = done
+        if self.stop_requested:
+            archive.unlink(missing_ok=True)
+            raise RuntimeError('Остановлено')
+        target = base / item['paths'][0]
+        unpacked = base / (item['id'] + '-new')
+        shutil.rmtree(unpacked, ignore_errors=True)
+        self.log(state, f'Распаковываю {done / 1e6:.0f} МБ')
+        try:
+            if archive.suffix == '.zip':
+                with zipfile.ZipFile(archive) as bundle:
+                    bundle.extractall(unpacked)
+            else:
+                with tarfile.open(archive) as bundle:
+                    bundle.extractall(unpacked, filter='data')
+            shutil.rmtree(target, ignore_errors=True)
+            os.replace(unpacked, target)
+        finally:
+            archive.unlink(missing_ok=True)
+            shutil.rmtree(unpacked, ignore_errors=True)
+        if os.name != 'nt':
+            for path in target.rglob('*'):
+                if path.is_file() and path.parent.name == 'bin':
+                    path.chmod(0o755)
+        self.log(state, f'ffmpeg в {target}')
 
     def _copy(self, state, item, peer):
         url = peer['url'].rstrip('/')
