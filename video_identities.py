@@ -494,11 +494,16 @@ def capture_years(db):
     return result
 
 
-def prototype_profiles(db, tracks, options=None, exclude_path=None, years=None):
-    """Several quality-only prototype banks per person and capture period."""
+def profile_samples(db, tracks, options=None, years=None):
+    """Samples of manually named faces: (person, period, path, weight, vector).
+
+    Read once per rebuild: on a core the catalog is remote, and reading every
+    named face again for each photo made the rebuild crawl for hours.
+    """
     p = {**DEFAULTS, **(options or {})}
     years = capture_years(db) if years is None else years
-    samples = defaultdict(list)
+    width = max(1, int(p['identity_profile_years']))
+    result = []
     has_quality = db.execute("SELECT 1 FROM sqlite_master WHERE name='face_quality'").fetchone()
     quality_rows = dict((r[0], r[1:]) for r in db.execute(
         'SELECT face_id,blur,size,confidence,geometry FROM face_quality')) if has_quality else {}
@@ -509,15 +514,12 @@ def prototype_profiles(db, tracks, options=None, exclude_path=None, years=None):
         LEFT JOIN face_track_data t ON t.face_id=f.id
         LEFT JOIN face_exclusions e ON e.face_id=f.id
         WHERE e.face_id IS NULL AND p.status='ok' AND COALESCE(t.active,1)=1'''):
-        if path == exclude_path:
-            continue
-        width = max(1, int(p['identity_profile_years']))
         year = years.get(path)
         period = year - year % width if year is not None else 0
         if start is not None or moment is not None:
             if fid in tracks:
-                samples[person, period].extend(
-                    (s['quality'], s['embedding']) for s in tracks[fid]['samples'] if s['reliable'])
+                result.extend((person, period, path, s['quality'], s['embedding'])
+                              for s in tracks[fid]['samples'] if s['reliable'])
         else:
             blur, size, confidence, geometry = quality_rows.get(fid, (None, None, None, None))
             vector = unit(blob)
@@ -527,10 +529,30 @@ def prototype_profiles(db, tracks, options=None, exclude_path=None, years=None):
                     and (size is None or size >= p['identity_profile_min_size'])
                     and (confidence is None or confidence >= p['identity_min_confidence'])
                     and (geometry is None or geometry > 0)):
-                samples[person, period].append((1 - (blur if blur is not None else 0.), vector))
+                result.append((person, period, path, 1 - (blur if blur is not None else 0.), vector))
+    return result
+
+
+def profiles_from(samples, options=None, exclude_path=None, base=None):
+    """Prototype banks per person and period from profile_samples().
+
+    With base (the profiles without exclusions) only people named in
+    exclude_path are rebuilt; everyone else is taken from base as is.
+    """
+    p = {**DEFAULTS, **(options or {})}
+    affected = None
+    if exclude_path is not None and base is not None:
+        affected = {item[0] for item in samples if item[2] == exclude_path}
+        if not affected:
+            return base
+    grouped = defaultdict(list)
+    for person, period, path, weight, vector in samples:
+        if path == exclude_path or (affected is not None and person not in affected):
+            continue
+        grouped[person, period].append((weight, vector))
     profiles = defaultdict(dict)
     counts = defaultdict(dict)
-    for (person, period), items in samples.items():
+    for (person, period), items in grouped.items():
         profiles[person][period] = diverse_bank(items, p)
         counts[person][period] = len(items)
     result = {}
@@ -541,7 +563,16 @@ def prototype_profiles(db, tracks, options=None, exclude_path=None, years=None):
                                              for b in centers[i + 1:]) < .86
         result[person] = {'periods': periods, 'counts': counts[person],
                           'age_sensitive': sensitive}
+    if affected is not None:
+        result = {**{person: value for person, value in base.items() if person not in affected},
+                  **result}
     return result
+
+
+def prototype_profiles(db, tracks, options=None, exclude_path=None, years=None):
+    """Several quality-only prototype banks per person and capture period."""
+    p = {**DEFAULTS, **(options or {})}
+    return profiles_from(profile_samples(db, tracks, p, years), p, exclude_path)
 
 
 def profile_match(candidate, profiles, year, options=None):
@@ -598,14 +629,22 @@ def split_photo_partition(partition, units, floor):
     return refined
 
 
-def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, scope='all'):
-    """Pure read/compute phase. Caller publishes only if data_version still matches."""
+def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, scope='all',
+          progress=None):
+    """Pure read/compute phase. Caller publishes only if data_version still matches.
+
+    progress(message, done, total) reports the current stage to the UI.
+    """
     from prototype import cluster_embeddings
     p = {**DEFAULTS, **(options or {})}
+    def report(message, done=0, total=0):
+        if progress:
+            progress(message, done, total)
     def check():
         if stop_check and stop_check():
             raise InterruptedError('Identity rebuild stopped before publication')
     check()
+    report('Загружаю лица и треки')
     old = dict(db.execute('SELECT face_id,label FROM face_clusters'))
     all_tracks = load_tracks(db, p)
     eligible = {r[0] for r in db.execute('SELECT id FROM faces')
@@ -620,6 +659,7 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
             if not members <= eligible:
                 eligible -= members
     tracks = {i:t for i,t in all_tracks.items() if i in eligible}
+    report('Склеиваю треки роликов', 0, len(tracks))
     identities, unresolved, cannot = stitch(tracks, p, debug, stop_check)
     cannot = catalog_conflicts(db, all_tracks)
     hints = dict(db.execute('SELECT path,count FROM video_people_hints'))
@@ -644,16 +684,22 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
     years = capture_years(db)
     named_paths = {row[0] for row in db.execute('''SELECT DISTINCT f.path FROM faces f
         JOIN face_people fp ON fp.face_id=f.id AND fp.source='human' ''')}
-    global_profiles = prototype_profiles(db, all_tracks, p, years=years)
-    # Leave-one-video-out prototypes prevent self-confirmation of a video.
-    current_path, profiles = None, {}
-    for ident in identities:
+    samples = profile_samples(db, all_tracks, p, years)
+    global_profiles = profiles_from(samples, p)
+    # Leave-one-file-out prototypes prevent self-confirmation of a video or photo.
+    path_profiles = {}
+    def profiles_for(path):
+        if path not in named_paths:
+            return global_profiles
+        if path not in path_profiles:
+            path_profiles[path] = profiles_from(samples, p, exclude_path=path, base=global_profiles)
+        return path_profiles[path]
+    for number, ident in enumerate(identities):
         check()
+        if number % 50 == 0:
+            report('Узнаю людей в роликах', number, len(identities))
         path = ident['path']
-        if path != current_path:
-            profiles = (prototype_profiles(db, all_tracks, p, exclude_path=path, years=years)
-                        if path in named_paths else global_profiles)
-            current_path = path
+        profiles = profiles_for(path)
         manual = {named[i] for i in ident['members'] if i in named}
         scores = profile_match(ident['bank'], profiles, years.get(path), p)
         person, confidence = None, 0.
@@ -678,12 +724,16 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
     quality_rows = {}
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='face_quality'").fetchone():
         quality_rows = {r[0]: r[1:] for r in db.execute('SELECT face_id,blur,size FROM face_quality')}
-    photo_profiles = {}
-    for fid, path, blob in db.execute('''SELECT f.id,f.path,f.embedding FROM faces f
+    photo_total = len(eligible)
+    report('Узнаю людей на снимках', 0, photo_total)
+    for number, (fid, path, blob) in enumerate(db.execute('''SELECT f.id,f.path,f.embedding FROM faces f
         LEFT JOIN face_exclusions e ON e.face_id=f.id JOIN photos p ON p.path=f.path
         LEFT JOIN face_track_data t ON t.face_id=f.id
         WHERE f.track_start IS NULL AND f.frame_time IS NULL AND e.face_id IS NULL
-          AND p.status='ok' AND COALESCE(t.active,1)=1'''):
+          AND p.status='ok' AND COALESCE(t.active,1)=1''')):
+        if number % 500 == 0:
+            check()
+            report('Узнаю людей на снимках', number, photo_total)
         if fid not in eligible:
             continue
         blur, size = quality_rows.get(fid, (None, None))
@@ -693,9 +743,7 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
         person = named.get(fid)
         confidence = 1. if person is not None else 0.
         if person is None:
-            profiles = (photo_profiles.setdefault(path, prototype_profiles(
-                     db, all_tracks, p, exclude_path=path, years=years))
-                     if path in named_paths else global_profiles)
+            profiles = profiles_for(path)
             scores = profile_match([vector], profiles, years.get(path), p)
             if scores:
                 confidence, support, margin, candidate = scores[0]
@@ -709,6 +757,7 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
                         auto_names[fid] = (candidate, confidence)
         units.append({'members': {fid}, 'vector': vector, 'identity': None, 'person': person})
     labels = [-1] * len(units)
+    report('Группирую лица', 0, len(units))
     if len(units) >= 2:
         # The photo-only minimum is applied after constraints. Two video units
         # must be allowed to meet even when the old detection minimum was eight.
@@ -718,8 +767,10 @@ def build(db, options=None, min_cluster_size=8, stop_check=None, debug=None, sco
     for index, label in enumerate(labels):
         coarse[int(label) if label >= 0 else ('noise', index)].append(index)
     groups = []
-    for indices in coarse.values():
+    for number, indices in enumerate(coarse.values()):
         check()
+        if number % 100 == 0:
+            report('Проверяю группы', number, len(coarse))
         partitions = []
         for index in indices:
             candidate = units[index]
@@ -831,12 +882,14 @@ def publish(db, result, data_version):
         db.rollback(); raise
 
 
-def rebuild(db, options=None, min_cluster_size=8, stop_check=None, scope='all'):
+def rebuild(db, options=None, min_cluster_size=8, stop_check=None, scope='all', progress=None):
     ensure_schema(db)
     version = db.execute('PRAGMA data_version').fetchone()[0]
-    result = build(db, options, min_cluster_size, stop_check, scope=scope)
+    result = build(db, options, min_cluster_size, stop_check, scope=scope, progress=progress)
     if stop_check and stop_check():
         raise InterruptedError('Identity rebuild stopped before publication')
+    if progress:
+        progress('Сохраняю группы', 0, 0)
     publish(db, result, version)
     return result
 

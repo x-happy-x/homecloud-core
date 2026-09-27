@@ -973,7 +973,9 @@ class ReclusterController:
             face_quality.measure(db, self.app.store.folder)
             self._set(step='cluster', step_index=3, message='Склеиваю треки и проверяю ограничения')
             minimum = int(options['noise_cluster_size']) if scope == 'noise' else self.app.store.min_cluster_size
-            result = video_identities.rebuild(db, options, minimum, self._should_stop, scope=scope)
+            result = video_identities.rebuild(
+                db, options, minimum, self._should_stop, scope=scope,
+                progress=lambda message, done, total: self._set(message=message, done=done, total=total))
             db.close()
             db = None
             with self.app.lock:
