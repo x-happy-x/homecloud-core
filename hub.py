@@ -630,7 +630,7 @@ class Hub:
 
     # ----- файлы в источниках -----
 
-    TRASH = '.homecloud-trash'
+    TRASH = sources.TRASH
 
     def _by_source(self, keys):
         groups = {}
@@ -652,12 +652,8 @@ class Hub:
     def trash_key(self, key):
         """Куда в источнике уходит удалённый файл: папка .homecloud-trash в корне."""
         source, native = pathkeys.split(key)
-        record = self.sources.get(source) or {}
-        stamp = datetime.now().strftime('%Y%m%d')
-        parts = [part for part in re.split(r'[\\/]', native) if part]
-        if record.get('type') == 'smb' and parts:
-            return pathkeys.make(source, '/' + '/'.join([parts[0], self.TRASH, stamp, *parts[1:]]))
-        return pathkeys.make(source, '/' + '/'.join([self.TRASH, stamp, *parts]))
+        return pathkeys.make(source, sources.trash_native(
+            self.sources.get(source), native, datetime.now().strftime('%Y%m%d')))
 
     def remove_originals(self, targets):
         """Удалённое уходит в корзину: у диска устройства — в корзину Windows,
@@ -1337,6 +1333,134 @@ class Idle:
     stop = start
 
 
+# ---------- обработка роликов на ядрах ----------
+
+class HubMedia:
+    """Операции с роликами через ffmpeg ядра (video_tools.py на ядре).
+
+    Хаб выбирает ядро с возможностью video, пересылает запросы и хранит,
+    какое задание на каком ядре. Замену в источнике (op replace) доводит сам:
+    следит за заданием и, когда ядро записало новый файл, переносит записи
+    каталога через on_replaced(result).
+    """
+    TERMINAL = {'done', 'error', 'cancelled'}
+
+    def __init__(self, hub, on_replaced):
+        self.hub = hub
+        self.on_replaced = on_replaced
+        self.lock = threading.RLock()
+        self.jobs = {}
+
+    def pick(self, key, op):
+        source_id = pathkeys.source_of(key)
+        core = self.hub.pick_core('video', source_id)
+        record = self.hub.sources.get(source_id) or {}
+        if op == 'replace' and record.get('type') == 'device' and core['id'] != record.get('device'):
+            raise RuntimeError(f'Ролик лежит на диске «{record.get("device")}»: заменить его может '
+                               'только его ядро — установите на нём «Видео: ffmpeg»')
+        return core
+
+    def probe(self, key):
+        try:
+            core = self.pick(key, 'probe')
+        except RuntimeError as exc:
+            raise RuntimeError(f'{exc}. Для обработки видео нужно ядро с ffmpeg') from exc
+        info = self.hub.core_call(core, '/api/core/media/probe?key=' + quote(key, safe=''),
+                                  timeout=300)
+        return {**info, 'core': core['name']}
+
+    def start(self, key, op, params):
+        core = self.pick(key, op)
+        job = self.hub.core_call(core, '/api/core/media/start', 'POST',
+                                 {'key': key, 'op': op, 'params': params or {}}, timeout=60)
+        hub_id = f"{core['id']}.{job['id']}"
+        with self.lock:
+            self.jobs[hub_id] = {'core': core['id'], 'job': job['id'], 'key': key, 'op': op,
+                                 'finalized': False, 'final': None}
+        if op == 'replace':
+            threading.Thread(target=self._watch, args=(hub_id,), daemon=True).start()
+        return self._public(hub_id, job)
+
+    def _entry(self, hub_id):
+        with self.lock:
+            entry = self.jobs.get(hub_id)
+        if entry is None:
+            core_id, _, job_id = str(hub_id).partition('.')
+            if not core_id or not job_id:
+                raise KeyError('Задание не найдено')
+            # Хаб перезапускали: скачать готовое всё ещё можно.
+            entry = {'core': core_id, 'job': job_id, 'key': '', 'op': '', 'finalized': True,
+                     'final': None}
+        return entry
+
+    def status(self, hub_id):
+        entry = self._entry(hub_id)
+        job = self.hub.core_call(entry['core'], '/api/core/media/job?id=' + quote(entry['job']),
+                                 timeout=20)
+        if job.get('op') == 'replace' and job.get('status') == 'done':
+            job = self._finalize(hub_id, job)
+        return self._public(hub_id, job)
+
+    def cancel(self, hub_id):
+        entry = self._entry(hub_id)
+        job = self.hub.core_call(entry['core'], '/api/core/media/cancel', 'POST',
+                                 {'id': entry['job']}, timeout=20)
+        return self._public(hub_id, job)
+
+    def open_file(self, hub_id, range_header=''):
+        """Ответ ядра с готовым файлом — хаб отдаёт его дальше потоком."""
+        entry = self._entry(hub_id)
+        core = self.hub.cores.get(entry['core'])
+        if core is None:
+            raise KeyError('Устройство не найдено')
+        request = Request(f"http://{core['host']}:{core['port']}/api/core/media/file?id="
+                          + quote(entry['job']),
+                          headers={'X-Local-Token': core['token'],
+                                   **({'Range': range_header} if range_header else {})})
+        try:
+            return urlopen(request, timeout=60)
+        except Exception as exc:
+            raise RuntimeError(f"{core['name']} не отдал файл: {exc}") from exc
+
+    def _finalize(self, hub_id, job):
+        """Ядро заменило файл в источнике — каталог переходит на новый путь. Один раз."""
+        with self.lock:
+            entry = self.jobs.get(hub_id)
+            if entry is None:
+                return job
+            if not entry['finalized']:
+                try:
+                    self.on_replaced(job['result'])
+                    entry['final'] = None
+                except Exception as exc:
+                    entry['final'] = f'Файл заменён, но каталог не обновился: {exc}'
+                    print(f'media replace {hub_id}: {exc}', file=sys.stderr, flush=True)
+                entry['finalized'] = True
+            if entry['final']:
+                job = {**job, 'status': 'error', 'error': entry['final']}
+        return job
+
+    def _watch(self, hub_id):
+        """Замена доводится и без открытого окна: опрашиваем ядро до конца."""
+        failures = 0
+        while failures < 200:
+            time.sleep(3)
+            try:
+                job = self.status(hub_id)
+                failures = 0
+            except Exception:
+                failures += 1
+                continue
+            if job.get('status') in self.TERMINAL:
+                return
+
+    def _public(self, hub_id, job):
+        core = self.hub.cores.get(self._entry(hub_id)['core']) or {}
+        return {**job, 'id': hub_id, 'core': core.get('name', ''),
+                'download': f'/media/job?id={quote(hub_id)}'
+                if job.get('status') == 'done' and job.get('op') != 'replace' else ''}
+
+
 # ---------- API для интерфейса ----------
 
 class HubApi:
@@ -1346,7 +1470,7 @@ class HubApi:
     проверяет он, а здесь — только токен server.js.
     """
     PREFIXES = ('/api/hub', '/api/cores', '/api/sources', '/api/storage', '/api/imports',
-                '/api/scan/history')
+                '/api/scan/history', '/api/media')
 
     def __init__(self, app, hub):
         self.app = app
@@ -1404,10 +1528,26 @@ class HubApi:
                 db.close()
         if head == 'imports':
             return self.imports(method, parts[1:], body)
+        if head == 'media':
+            return self.media(method, parts[1:], query, body)
         if head == 'scan' and parts[1:] == ['history'] and method == 'GET':
             return self.app.device.history()
         if head == 'scan' and parts[1:] == ['history', 'forget'] and method == 'POST':
             return self.app.device.forget(body.get('id'))
+        raise KeyError('Нет такого адреса')
+
+    def media(self, method, parts, query, body):
+        media = self.app.media
+        if parts == ['probe'] and method == 'GET':
+            return media.probe(self.app.video_key(query.get('path', '')))
+        if parts == ['start'] and method == 'POST':
+            op = str(body.get('op') or '')
+            key = self.app.video_key(body.get('path', ''), replace=op == 'replace')
+            return media.start(key, op, body.get('params') or {})
+        if len(parts) == 2 and parts[0] == 'jobs' and method == 'GET':
+            return media.status(parts[1])
+        if len(parts) == 3 and parts[0] == 'jobs' and parts[2] == 'cancel' and method == 'POST':
+            return media.cancel(parts[1])
         raise KeyError('Нет такого адреса')
 
     def after_change(self):
