@@ -96,6 +96,19 @@ class ParamsTest(unittest.TestCase):
                          'Отпуск 1.05–1.02.05.mp4')
         self.assertEqual(video_tools.output_name(key, 'audio', {}), 'Отпуск.mp3')
 
+    def test_hdr_gets_tonemapped_before_other_filters(self):
+        info = fake_info(video='hevc')
+        info['video']['hdr'] = True
+        command = video_tools.build_command('ffmpeg', 'rotate', {'angle': 90}, 'a.mp4', 'b.mp4',
+                                            info, 'libx264')
+        chain = command[command.index('-vf') + 1]
+        self.assertTrue(chain.startswith('zscale=t=linear'))
+        self.assertTrue(chain.endswith('transpose=1'))
+        self.assertIn('bt709', command)
+        plain = video_tools.build_command('ffmpeg', 'trim', {'start': 0, 'end': 1}, 'a.mp4',
+                                          'b.mp4', fake_info(video='hevc'), 'libx264')
+        self.assertNotIn('-vf', plain)
+
     def test_replace_command_copies_when_it_can(self):
         command = video_tools.build_command('ffmpeg', 'replace', {}, 'a.mkv', 'b.mp4',
                                             fake_info(container='matroska,webm'), 'libx264')
@@ -157,7 +170,11 @@ class FfmpegJobsTest(unittest.TestCase):
                 ('ok.mkv', ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac']),
                 ('download.mkv', ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac']),
                 ('phone.mp4', ['-c:v', 'libx265', '-preset', 'ultrafast', '-tag:v', 'hvc1',
-                               '-c:a', 'aac'])):
+                               '-c:a', 'aac']),
+                ('hdr.mp4', ['-c:v', 'libx265', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p10le',
+                             '-x265-params',
+                             'colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc',
+                             '-tag:v', 'hvc1', '-c:a', 'aac'])):
             subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', *source,
                             *codecs, '-shortest', str(cls.videos / name)], check=True,
                            creationflags=video_tools.NO_WINDOW)
@@ -207,6 +224,13 @@ class FfmpegJobsTest(unittest.TestCase):
         self.assertTrue(info['browser'])
         self.assertAlmostEqual(info['duration'], 4, delta=0.5)
         self.assertEqual(job['result']['size'], new.stat().st_size)
+
+    def test_hdr_becomes_sdr(self):
+        self.assertTrue(self.jobs.probe(self.key('hdr.mp4'))['video']['hdr'])
+        job = self.run_job('hdr.mp4', 'replace')
+        video = video_tools.probe(pathkeys.native(job['result']['new']))['video']
+        self.assertEqual((video['codec'], video['pix_fmt'], video['transfer'], video['hdr']),
+                         ('h264', 'yuv420p', 'bt709', False))
 
     def test_replace_mp4_keeps_name(self):
         job = self.run_job('phone.mp4', 'replace')

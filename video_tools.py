@@ -37,6 +37,12 @@ OUTPUT_TTL = 24 * 3600
 OPS = ('replace', 'trim', 'compress', 'rotate', 'frame', 'audio')
 HEIGHTS = (720, 480, 360)
 ROTATIONS = {90: 'transpose=1', 180: 'transpose=1,transpose=1', 270: 'transpose=2'}
+# HDR (PQ и HLG, у телефонов — ещё и Dolby Vision поверх) в обычный BT.709: без
+# этого H.264 из HDR-ролика выходит серым и блёклым. zscale — из libzimg сборки.
+HDR_TRANSFERS = {'smpte2084', 'arib-std-b67'}
+TONEMAP = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,'
+           'tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p')
+SDR_TAGS = ['-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709']
 
 # Что браузеры играют без плагинов: контейнер (как его называет ffprobe) и кодеки.
 BROWSER_CONTAINERS = ('mov', 'mp4', 'm4a', 'webm', 'matroska')
@@ -144,7 +150,8 @@ def summarize(raw):
             'codec': video.get('codec_name', ''), 'profile': video.get('profile', ''),
             'width': int(video.get('width') or 0), 'height': int(video.get('height') or 0),
             'pix_fmt': video.get('pix_fmt', ''), 'fps': round(_rate(video.get('avg_frame_rate')), 3),
-            'rotation': rotation}
+            'rotation': rotation, 'transfer': video.get('color_transfer', ''),
+            'hdr': video.get('color_transfer', '') in HDR_TRANSFERS}
     info['browser'] = browser_ok(info)
     return info
 
@@ -250,6 +257,14 @@ def check_params(op, params, info=None):
     return params
 
 
+def video_filters(info, *extra):
+    """-vf для перекодирования: у HDR сначала тонмаппинг, потом остальное."""
+    chain = [TONEMAP] if (info.get('video') or {}).get('hdr') else []
+    chain.extend(item for item in extra if item)
+    tags = SDR_TAGS if chain and chain[0] == TONEMAP else []
+    return (['-vf', ','.join(chain)] if chain else []) + tags
+
+
 def build_command(ffmpeg, op, params, source, target, info, encoder):
     """Команда ffmpeg для операции. Прогресс — в stdout (-progress pipe:1)."""
     head = [str(ffmpeg), '-hide_banner', '-nostdin', '-y', '-loglevel', 'error',
@@ -258,7 +273,7 @@ def build_command(ffmpeg, op, params, source, target, info, encoder):
     audio_aac = ['-c:a', 'aac', '-b:a', '192k']
     if op == 'frame':
         return [*head, '-ss', str(params['time']), '-i', str(source), '-frames:v', '1',
-                '-q:v', '2', '-f', 'image2', str(target)]
+                *video_filters(info), '-q:v', '2', '-f', 'image2', str(target)]
     if op == 'audio':
         if not info.get('audio'):
             raise ValueError('В ролике нет звука')
@@ -272,20 +287,22 @@ def build_command(ffmpeg, op, params, source, target, info, encoder):
             return [*head, '-i', str(source), *maps, '-c', 'copy', *mp4]
         audio = (['-c:a', 'copy'] if all(track['codec'] == 'aac' for track in info['audio'])
                  else audio_aac)
-        return [*head, '-i', str(source), *maps, *video_codec_args(encoder, 20), *audio, *mp4]
+        return [*head, '-i', str(source), *maps, *video_filters(info),
+                *video_codec_args(encoder, 20), *audio, *mp4]
     if op == 'trim':
         return [*head, '-ss', str(params['start']), '-to', str(params['end']), '-i', str(source),
-                '-map', '0:v:0', '-map', '0:a:0?', *video_codec_args(encoder, 20), *audio_aac,
-                *mp4]
+                '-map', '0:v:0', '-map', '0:a:0?', *video_filters(info),
+                *video_codec_args(encoder, 20), *audio_aac, *mp4]
     if op == 'compress':
         height = params['height']
         # Не увеличиваем: у ролика ниже заданной высоты размер остаётся своим.
         scale = f"scale=-2:'min({height},ih)'"
-        return [*head, '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-vf', scale,
-                *video_codec_args(encoder, 28), '-c:a', 'aac', '-b:a', '128k', *mp4]
+        return [*head, '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?',
+                *video_filters(info, scale), *video_codec_args(encoder, 28),
+                '-c:a', 'aac', '-b:a', '128k', *mp4]
     if op == 'rotate':
         return [*head, '-i', str(source), '-map', '0:v:0', '-map', '0:a?',
-                '-vf', ROTATIONS[params['angle']], '-metadata:s:v:0', 'rotate=0',
+                *video_filters(info, ROTATIONS[params['angle']]), '-metadata:s:v:0', 'rotate=0',
                 *video_codec_args(encoder, 20), '-c:a', 'copy', *mp4]
     raise ValueError('Неизвестная операция с видео')
 
