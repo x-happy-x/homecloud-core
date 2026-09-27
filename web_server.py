@@ -468,7 +468,9 @@ class DeviceController:
 
     def history_db(self):
         """Список источников заданий живёт рядом с каталогом, в нём же."""
-        db = catalogdb.connect(self.catalog, timeout=10)
+        # Пересборка групп держит запись в каталог десятки секунд — запуск
+        # задания ждёт её, но укладывается в минуту, которую ждёт хаб.
+        db = catalogdb.connect(self.catalog, timeout=45)
         db.execute('''CREATE TABLE IF NOT EXISTS scan_runs (
             id INTEGER PRIMARY KEY,
             roots_json TEXT NOT NULL, paths_json TEXT NOT NULL,
