@@ -46,6 +46,23 @@ class PeopleGuiStoreTests(unittest.TestCase):
         db.close()
         return people_gui.CatalogStore(folder, min_cluster_size=2)
 
+    def test_rejected_candidate_is_not_offered_again(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vectors = [*clump(0, 4), *clump(90, 3), [0.995, 0.02], [0.99, -0.03]]
+            store = self.make_store(temp, vectors)
+            store.assign([1, 2, 3, 4], 'Анна', None)
+            person = store.db.execute("SELECT id FROM people WHERE name='Анна'").fetchone()[0]
+            offered = {item['face_id'] for item in store.person_candidates(person)}
+            self.assertTrue({8, 9} <= offered, offered)
+            self.assertEqual(store.reject_candidates(person, [8]), 1)
+            store.reject_candidates(person, [8])
+            offered = {item['face_id'] for item in store.person_candidates(person)}
+            self.assertNotIn(8, offered)
+            self.assertIn(9, offered)
+            with self.assertRaises(KeyError):
+                store.reject_candidates(person + 100, [9])
+            store.db.close()
+
     def test_assign_merge_exclude_and_undo(self):
         with tempfile.TemporaryDirectory() as temp:
             store = self.make_store(temp)

@@ -502,5 +502,40 @@ class InventoryTest(unittest.TestCase):
             self.assertEqual(kinds, {'a.jpg': 'photo', 'b.MP4': 'video'})
 
 
+class CompanionsTest(unittest.TestCase):
+    """«Часто рядом»: общие файлы, а не лица; скрытые группы не показываются."""
+
+    def test_counts_shared_files(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest import mock
+        import web_server
+        by_id = {1: (0, 'a:/1.jpg'), 2: (0, 'a:/2.mp4'), 3: (0, 'a:/2.mp4'),
+                 4: (0, 'a:/1.jpg'), 5: (0, 'a:/2.mp4'), 6: (0, 'a:/2.mp4'),
+                 7: (0, 'a:/2.mp4'), 8: (0, 'a:/3.jpg'), 9: (0, 'a:/1.jpg')}
+        groups = [
+            {'key': 'person:1', 'kind': 'person', 'name': 'Анна', 'title': 'Анна',
+             'face_ids': [1, 2, 3], 'avatar_face': 1},
+            {'key': 'person:2', 'kind': 'person', 'name': 'Сергей', 'title': 'Сергей',
+             'face_ids': [4, 5, 6, 7], 'avatar_face': None},
+            {'key': 'auto:3', 'kind': 'auto', 'name': None, 'title': 'Без имени',
+             'face_ids': [8], 'avatar_face': None},
+            {'key': 'person:4', 'kind': 'person', 'name': 'Тайна', 'title': 'Тайна',
+             'face_ids': [9], 'avatar_face': None},
+            {'key': 'noise', 'kind': 'noise', 'name': None, 'title': 'Шум',
+             'face_ids': [9], 'avatar_face': None},
+        ]
+        app = SimpleNamespace(
+            lock=threading.RLock(), COMPANION_KINDS=web_server.App.COMPANION_KINDS,
+            store=SimpleNamespace(db=None, by_id=by_id, groups=lambda: groups),
+            masked_faces=lambda *args: set(), without=web_server.App.without)
+        with mock.patch('people_albums.hidden_group_keys', return_value={'person:4'}):
+            result = web_server.App.person_companions(app, 'person:1')
+        self.assertEqual(result['files'], 2)
+        self.assertEqual([(item['key'], item['shared']) for item in result['companions']],
+                         [('person:2', 2)])
+        self.assertEqual(result['companions'][0]['avatar'], '/media/face-crop/4?size=200')
+
+
 if __name__ == '__main__':
     unittest.main()
