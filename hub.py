@@ -542,11 +542,17 @@ class Hub:
             return {'online': False, 'error': 'Устройство не найдено'}
         try:
             device = self.core_call(core, '/api/device', timeout=4)
-            job = self.core_call(core, '/api/device/job', timeout=4)
-            value = {'online': True, 'device': device, 'job': job,
-                     'legacy': device.get('role') != 'core'}
         except Exception as exc:
             value = {'online': False, 'error': str(exc)}
+        else:
+            # В сети ли ядро, решает /api/device. Статус задания бывает медленным
+            # (ядро считает его по каталогу хаба) — тогда остаётся прошлый.
+            try:
+                job = self.core_call(core, '/api/device/job', timeout=10)
+            except Exception:
+                job = ((cached[1].get('job') if cached else None) or {'status': 'unknown', 'active': False})
+            value = {'online': True, 'device': device, 'job': job,
+                     'legacy': device.get('role') != 'core'}
         with self.status_lock:
             self.status_cache[core_id] = (time.monotonic(), value)
         return value

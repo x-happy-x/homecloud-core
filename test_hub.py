@@ -639,6 +639,30 @@ class CoreStatusCacheTest(unittest.TestCase):
             state.core_status(core['id'])
             self.assertEqual(len(calls), 2)
 
+    def test_slow_job_status_keeps_core_online(self):
+        # Ядро отвечает, а статус задания не успел: ядро в сети, задание — прошлое.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            catalog = root / 'catalog'
+            catalog.mkdir()
+            sqlite3.connect(catalog / 'catalog.sqlite').close()
+            state = hub.Hub(catalog, root / 'data', link_url='')
+            core = state.cores.save({'id': 'pc-s', 'name': 'PC-S', 'host': '127.0.0.1'})
+            slow = {'job': False}
+
+            def call(core_row, path, *args, **kwargs):
+                if path == '/api/device':
+                    return {'role': 'core', 'version': 'v'}
+                if slow['job']:
+                    raise RuntimeError('timed out')
+                return {'status': 'completed', 'active': False}
+            state.core_call = call
+            self.assertEqual(state.core_status(core['id'])['job']['status'], 'completed')
+            slow['job'] = True
+            status = state.core_status(core['id'], max_age=0)
+            self.assertTrue(status['online'])
+            self.assertEqual(status['job']['status'], 'completed')
+
 
 if __name__ == '__main__':
     unittest.main()
