@@ -449,6 +449,8 @@ class RouterController:
 class DeviceController:
     """Expose this computer as a configurable HomeCloud worker device."""
     FEATURES = job_features.FEATURES
+    # Как часто пересчитывать счётчики каталога в статусе задания, секунды.
+    COUNTERS_TTL = 30
 
     def __init__(self, catalog, device_id=None, device_name=None):
         self.root = Path(__file__).resolve().parent
@@ -685,6 +687,14 @@ class DeviceController:
             # Задание закончилось — записываем в историю, какие этапы дошли до конца.
             if self.run_id and not payload['active']:
                 self.finish(payload.get('status', 'interrupted'))
+            # Счётчики каталога — раз в минуту: у ядра каталог на хабе, и тринадцать
+            # COUNT(*) по сети на каждый опрос статуса занимали секунды — хаб
+            # не дожидался ответа и считал ядро выключенным.
+            counters = getattr(self, 'counters', None)
+            if counters and time.monotonic() - counters[0] < self.COUNTERS_TTL:
+                payload.update(counters[1])
+                return payload
+            before = set(payload)
             try:
                 db = catalogdb.connect(self.catalog, timeout=1)
                 payload['catalog_photos'] = db.execute(
@@ -713,6 +723,7 @@ class DeviceController:
                 db.close()
             except sqlite3.Error:
                 pass
+            self.counters = (time.monotonic(), {key: payload[key] for key in payload if key not in before})
             return payload
 
     def start(self, roots, features, paths=None, force=False, visual_model=None,
