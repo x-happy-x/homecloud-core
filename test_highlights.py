@@ -344,6 +344,12 @@ class PipelineTests(unittest.TestCase):
                                 'highlights'])
         self.assertEqual(device_job.planned_phases({'highlights': True}), ['highlights'])
 
+    def test_resume_skips_inventory_and_copies(self):
+        # Продолжение упавшего задания: опись и ключи копий уже сделаны.
+        plan = device_job.planned_phases({'inventory': False, 'adult': True, 'curation': True},
+                                         remote=True, resume=True)
+        self.assertEqual(plan, ['adult', 'curation', 'propagate'])
+
 
 if __name__ == '__main__':
     unittest.main()

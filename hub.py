@@ -1364,7 +1364,7 @@ class RemoteJobs:
         return {'visual_models': [], 'capabilities': {}}
 
     def start(self, roots, features, paths=None, force=False, visual_model=None,
-              video_features=None, core_id=None):
+              video_features=None, core_id=None, resume=False):
         keys = [*(roots or []), *(paths or [])]
         source_ids = {pathkeys.source_of(key) for key in keys}
         if '' in source_ids:
@@ -1376,7 +1376,7 @@ class RemoteJobs:
         return self.hub.core_call(core, '/api/device/job/start', 'POST', {
             'roots': list(roots or []), 'paths': list(paths or []), 'features': features,
             'video_features': video_features, 'force': bool(force),
-            'visual_model': visual_model}, timeout=60).get('job')
+            'visual_model': visual_model, 'resume': bool(resume)}, timeout=60).get('job')
 
     def stop(self, core_id=None):
         targets = [core_id] if core_id else [row['id'] for row in self.hub.cores.load()]
@@ -1708,7 +1708,7 @@ class HubApi:
                                         body.get('paths', []), force=bool(body.get('force')),
                                         visual_model=body.get('visual_model'),
                                         video_features=body.get('video_features'),
-                                        core_id=core_id)
+                                        core_id=core_id, resume=bool(body.get('resume')))
             with hub.status_lock:
                 hub.status_cache.pop(core_id, None)
             return {'ok': True, 'job': job}
