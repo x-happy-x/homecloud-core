@@ -1285,6 +1285,15 @@ class App:
             'track_start': extra.get('track_start'),
             'track_stop': extra.get('track_stop'),
             'blur': extra.get('blur'),
+            # Время съёмки (секунды) и рамка лица [left, top, right, bottom] в
+            # пикселях исходника — для вида «Медиа» карточки человека.
+            'taken': extra.get('taken'),
+            'box': extra.get('box') or None,
+            # Превью всего файла и его рейтинг 18+: интерфейс решает замыливание
+            # тем же photoMediaUrl, что и в галерее.
+            'preview': extra.get('preview') or f'/media/photo?path={quote(row[1], safe="")}',
+            'adult_rating': extra.get('adult_rating'),
+            'duration': extra.get('duration'),
             'video_identity_id': extra.get('video_identity_id'),
             'identity_status': extra.get('identity_status'),
             'assignment_source': extra.get('assignment_source'),
@@ -1302,20 +1311,24 @@ class App:
             batch = face_ids[offset:offset + 900]
             marks = ','.join('?' * len(batch))
             for (face_id, path, track_start, track_stop, blur, taken, modified,
-                 curated_hash, plain_hash, width, height, raw_box) in self.store.db.execute(
+                 curated_hash, plain_hash, width, height, raw_box, rating,
+                 duration) in self.store.db.execute(
                     'SELECT faces.id,faces.path,faces.track_start,faces.track_stop,'
                     'face_quality.blur,photo_curation.taken_ts,photos.modified,'
                     'photo_curation.dhash,photo_hashes.dhash,'
                     'COALESCE(photo_thumbs.width,photo_analysis.width,photo_hashes.width),'
                     'COALESCE(photo_thumbs.height,photo_analysis.height,photo_hashes.height),'
-                    'faces.box FROM faces '
+                    'faces.box,photo_adult_analysis.rating,photos.duration FROM faces '
                     'LEFT JOIN face_quality ON face_quality.face_id=faces.id '
+                    'LEFT JOIN photo_adult_analysis ON photo_adult_analysis.path=faces.path '
+                    "AND photo_adult_analysis.status='ok' "
                     'LEFT JOIN photo_thumbs ON photo_thumbs.path=faces.path '
                     'LEFT JOIN photo_curation ON photo_curation.path=faces.path '
                     'LEFT JOIN photo_hashes ON photo_hashes.path=faces.path '
                     'LEFT JOIN photos ON photos.path=faces.path '
                     'LEFT JOIN photo_analysis ON photo_analysis.path=faces.path '
                     f'WHERE faces.id IN ({marks})', batch):
+                stamp = modified
                 if taken is None and modified:
                     taken = modified / 1e9
                 try:
@@ -1338,7 +1351,10 @@ class App:
                 details[face_id] = {
                     'path': path, 'track_start': track_start, 'track_stop': track_stop,
                     'blur': blur, 'taken': taken, 'dhash': curated_hash or plain_hash,
-                    'width': width, 'height': height}
+                    'width': width, 'height': height, 'box': box if len(box) == 4 else None,
+                    'adult_rating': rating, 'duration': duration,
+                    'preview': f'/media/photo?path={quote(path, safe="")}'
+                               f'&v={round((stamp or 0) / 1e6)}'}
             for fid, identity, status, source in self.store.db.execute(
                     'SELECT f.id,t.identity_id,t.status,p.source FROM faces f '
                     'LEFT JOIN face_track_identities t ON t.face_id=f.id '
@@ -1393,6 +1409,53 @@ class App:
                 face['score'] = scores[face['id']]['score']
                 face['group'] = scores[face['id']]['group']
             return {'key': key, 'faces': faces}
+
+    COMPANION_KINDS = {'person', 'auto'}
+
+    def person_companions(self, key, viewer='', admin=False, hide_adult=False, limit=8):
+        """С кем человек (или группа) чаще всего в одном файле: снимке или ролике.
+
+        Считаются общие файлы, а не лица: в ролике человек мелькает десятки раз.
+        Безымянные группы идут после названных людей с тем же числом.
+        """
+        masked = self.masked_faces(viewer, admin, hide_adult)
+        with self.lock:
+            hidden = people_albums.hidden_group_keys(self.store.db)
+            groups = [self.without(group, masked) for group in self.store.groups()]
+            own = next((group for group in groups if group['key'] == key), None)
+            if own is None:
+                raise KeyError('Группа больше не существует')
+            mine = {self.store.by_id[face_id][1] for face_id in own['face_ids']
+                    if face_id in self.store.by_id}
+            found = []
+            for group in groups:
+                if (group['key'] == key or group['kind'] not in self.COMPANION_KINDS
+                        or group['key'] in hidden or not group['face_ids']):
+                    continue
+                paths = {self.store.by_id[face_id][1] for face_id in group['face_ids']
+                         if face_id in self.store.by_id}
+                shared = len(paths & mine)
+                if shared:
+                    found.append((shared, group, paths))
+            found.sort(key=lambda item: (-item[0], item[1]['kind'] != 'person', item[1]['title']))
+            return {'key': key, 'files': len(mine), 'companions': [{
+                'key': group['key'], 'title': group['title'], 'name': group['name'],
+                'kind': group['kind'], 'bigfam_id': group.get('bigfam_id'),
+                'shared': shared, 'count': len(group['face_ids']), 'files': len(paths),
+                'avatar': (f"/media/face-crop/{group['avatar_face']}?size=200"
+                           if group.get('avatar_face')
+                           else f"/media/face-crop/{group['face_ids'][0]}?size=200"),
+            } for shared, group, paths in found[:limit]]}
+
+    def reject_candidates(self, key, face_ids):
+        if not str(key).startswith('person:'):
+            raise ValueError('Отклонять кандидатов можно только у названного человека')
+        try:
+            person_id = int(str(key).split(':', 1)[1])
+        except ValueError:
+            raise ValueError('Неверный ключ человека') from None
+        with self.lock:
+            return {'ok': True, 'rejected': self.store.reject_candidates(person_id, face_ids)}
 
     def state(self, viewer='', admin=False, hide_adult=False):
         masked = self.masked_faces(viewer, admin, hide_adult)
@@ -2822,6 +2885,13 @@ class Handler(BaseHTTPRequestHandler):
                     query.get('key', [''])[0], viewer, admin,
                     query.get('adult', [''])[0] == 'hide',
                     int(query.get('limit', ['120'])[0])))
+            if parsed.path == '/api/person-companions':
+                query = parse_qs(parsed.query)
+                viewer, admin = self.viewer
+                return self.json_response(self.app.person_companions(
+                    query.get('key', [''])[0], viewer, admin,
+                    query.get('adult', [''])[0] == 'hide',
+                    int(query.get('limit', ['8'])[0])))
             if parsed.path == '/api/similar-pairs':
                 query = parse_qs(parsed.query)
                 return self.json_response(self.app.similar_pairs(
@@ -3322,6 +3392,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/photos/move':
                 return self.json_response({'ok': True, **self.app.move_photos(
                     body.get('paths', []), body.get('target', ''))})
+            if path == '/api/person-candidates/reject':
+                return self.json_response(self.app.reject_candidates(
+                    body.get('key', ''), body.get('face_ids', [])))
             with self.app.lock:
                 if path == '/api/assign-groups':
                     self.app.store.assign(self.app.resolve_groups(body.get('group_keys', [])),

@@ -46,6 +46,12 @@ class CatalogStore:
             CREATE TABLE IF NOT EXISTS face_exclusions (
               face_id INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
               created_at TEXT NOT NULL);
+            -- «Это не он»: лицо больше не предлагается этому человеку в кандидатах.
+            CREATE TABLE IF NOT EXISTS face_person_rejects (
+              face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+              person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (face_id, person_id));
             CREATE TABLE IF NOT EXISTS group_avatars (
               group_key TEXT PRIMARY KEY,
               face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE);
@@ -442,8 +448,10 @@ class CatalogStore:
         if not mine:
             return []
         groups = self.groups()
+        rejected = {row[0] for row in self.db.execute(
+            'SELECT face_id FROM face_person_rejects WHERE person_id=?', (person_id,))}
         wanted = [face_id for group in groups if group['kind'] in {'auto', 'noise'}
-                  for face_id in group['face_ids']]
+                  for face_id in group['face_ids'] if face_id not in rejected]
         if not wanted:
             return []
         bank, bank_ids = self._vectors(sorted(named))
@@ -467,6 +475,21 @@ class CatalogStore:
         found.sort(reverse=True)
         return [{'face_id': face_id, 'score': round(score, 3), 'group': group_of.get(face_id, '')}
                 for score, face_id in found[:limit]]
+
+    def reject_candidates(self, person_id, face_ids):
+        """«Это не он»: лица больше не предлагаются человеку. Группы не трогаются."""
+        ids = sorted({int(face_id) for face_id in face_ids})
+        if not ids:
+            raise ValueError('Не выбраны лица')
+        if self.db.execute('SELECT 1 FROM people WHERE id=?', (int(person_id),)).fetchone() is None:
+            raise KeyError('Человек не найден')
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self.db:
+            self.db.executemany(
+                'INSERT OR IGNORE INTO face_person_rejects(face_id,person_id,created_at) '
+                'SELECT id,?,? FROM faces WHERE id=?',
+                [(int(person_id), stamp, face_id) for face_id in ids])
+        return len(ids)
 
     def set_avatar(self, group_key, face_id):
         """Закрепить кадр как аватарку группы."""
