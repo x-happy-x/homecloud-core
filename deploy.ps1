@@ -79,6 +79,6 @@ Invoke-Remote ("sudo mkdir -p $DataPath/core-packages && sudo mv /tmp/$name $Dat
     "&& ls -1t $DataPath/core-packages/homecloud-core-*.zip | tail -n +6 | sudo xargs -r rm -f")
 
 if ($SkipRestart) { Write-Host 'Пакет и исходники на месте, хаб не перезапускался.'; return }
-Invoke-Remote "cd $ComposePath && sudo docker compose up -d --build homecloud-hub"
+Invoke-Remote "cd $ComposePath && sudo docker compose up -d --build --no-deps homecloud-hub"
 Invoke-Remote 'for i in $(seq 1 60); do curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18401/config | grep -q 403 && exit 0; sleep 2; done; exit 1'
 Write-Host "Готово: хаб поднят, пакет ядра $version опубликован."
