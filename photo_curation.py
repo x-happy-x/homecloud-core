@@ -638,7 +638,8 @@ def curate(catalog, roots=(), paths=(), force=False, limit=None, progress=None, 
         models = {model for (model,) in db.execute('SELECT DISTINCT model FROM photo_embeddings')}
         prompts_by_model = {model: vectors for model in models
                             if (vectors := prompt_vectors(db, model)) is not None}
-        prompts_stamp = {model: db.execute('SELECT MAX(computed_at) FROM curation_prompts WHERE model=?',
+        prompts_stamp = {model: db.execute('SELECT MAX(computed_at) FROM curation_prompts WHERE model=? '
+                                           "AND name NOT LIKE 'theme:%'",
                                            (model,)).fetchone()[0] for model in prompts_by_model}
         vectors = embeddings_for(db, by_path)
         existing = {row[0]: dict(zip(COLUMNS, row)) for row in db.execute(
@@ -716,17 +717,22 @@ def curate(catalog, roots=(), paths=(), force=False, limit=None, progress=None, 
 
 
 def compute_prompts(catalog, model, force=False):
-    """Векторы текстовых описаний для модели. Запускается в vision-venv."""
+    """Векторы текстовых описаний для модели: оценки кадра и тем подборок. Запускается в vision-venv."""
+    import highlight_themes
     catalog = Path(catalog).resolve()
     db = connect(catalog)
     try:
-        if not force and prompt_vectors(db, model) is not None:
+        wanted = []
+        if force or prompt_vectors(db, model) is None:
+            wanted += [(name, weight, text) for name, (weight, text) in PROMPTS.items()]
+        if force or not highlight_themes.prompts_up_to_date(db, model):
+            wanted += [(name, 0.0, text) for name, text in highlight_themes.prompt_rows()]
+        if not wanted:
             print(f'prompts for {model} are up to date')
             return False
         from analyze_photos import VisualEncoder
         encoder = VisualEncoder(model)
-        names = list(PROMPTS)
-        vectors = encoder.texts([PROMPTS[name][1] for name in names]).float().cpu().numpy()
+        vectors = encoder.texts([text for _, _, text in wanted]).float().cpu().numpy()
         now = datetime.now(timezone.utc).isoformat()
         with db:
             db.executemany(
@@ -734,10 +740,9 @@ def compute_prompts(catalog, model, force=False):
                 'VALUES(?,?,?,?,?,?,?) ON CONFLICT(model,name) DO UPDATE SET weight=excluded.weight,'
                 'prompt=excluded.prompt,embedding=excluded.embedding,dims=excluded.dims,'
                 'computed_at=excluded.computed_at',
-                [(model, name, PROMPTS[name][0], PROMPTS[name][1],
-                  np.asarray(vector, dtype='<f4').tobytes(), len(vector), now)
-                 for name, vector in zip(names, vectors)])
-        print(f'prompts for {model}: {len(names)} stored')
+                [(model, name, weight, text, np.asarray(vector, dtype='<f4').tobytes(), len(vector), now)
+                 for (name, weight, text), vector in zip(wanted, vectors)])
+        print(f'prompts for {model}: {len(wanted)} stored')
         return True
     finally:
         db.close()

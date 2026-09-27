@@ -32,8 +32,10 @@ import time
 import numpy as np
 
 import catalogdb
+import highlight_themes
 import pathkeys
 import photo_curation
+import places
 import sources
 
 SCHEMA = '''
@@ -63,7 +65,7 @@ CREATE TABLE IF NOT EXISTS highlight_photos (
 CREATE INDEX IF NOT EXISTS highlight_photos_path ON highlight_photos(path);
 '''
 
-KINDS = ('month', 'year', 'event', 'on-this-day')
+KINDS = ('month', 'year', 'event', 'trip', 'theme', 'place', 'on-this-day')
 
 # Все коэффициенты в одном месте: их удобно крутить и видно в meta подборки.
 PARAMS = {
@@ -93,15 +95,23 @@ PARAMS = {
     'quality_floor': 0.50,        # ниже — в подборку не берём, даже чтобы добрать размер
     'shortlist_factor': 6,
     'min_event_score': 0.50,      # событие из одних проходных кадров не показываем
+    # темы и места
+    'theme_share': 0.40,          # такая доля кадров события в одной теме — событие называется по ней
+    'place_min': 10,              # столько кандидатов в городе — у него своя подборка
+    'trip_km': 100.0,             # событие дальше этого от дома — поездка
+    'theme_year_min': 15,         # столько кадров темы за год — ещё и подборка «Котики · 2023»
 }
 
 # Меньше стольких кадров после отбора подборка выглядит случайной — не сохраняем.
-MIN_PHOTOS = {'month': 4, 'year': 8, 'event': 3, 'on-this-day': 2}
+MIN_PHOTOS = {'month': 4, 'year': 8, 'event': 3, 'trip': 3, 'theme': 6, 'place': 6, 'on-this-day': 2}
 
 BUCKET_WEIGHTS = {
     'month': {'event': 0.25, 'day': 0.08},
     'year': {'event': 0.25, 'month': 0.20},
     'event': {'hour': 0.04},
+    'trip': {'hour': 0.04, 'day': 0.04},
+    'theme': {'event': 0.35, 'month': 0.10},
+    'place': {'event': 0.30, 'month': 0.10},
     'on-this-day': {'event': 0.25},
 }
 
@@ -137,7 +147,11 @@ def _table_exists(db, name):
 class Candidate:
     __slots__ = ('path', 'taken', 'ts', 'source', 'trust', 'base', 'visual', 'technical',
                  'personal', 'score', 'dhash', 'model', 'vector', 'lat', 'lon', 'people',
-                 'faces', 'event', 'series')
+                 'faces', 'event', 'series', 'place', 'theme', 'theme_z')
+
+    def __init__(self):
+        # Место и тема ставятся позже, по всем кандидатам сразу.
+        self.place, self.theme, self.theme_z = None, None, 0.0
 
     def reasons(self):
         return {'base': round(self.base, 3),
@@ -202,8 +216,50 @@ def load_candidates(db, params):
         item.series = []
         found.append(item)
     _attach_vectors(db, found)
+    _attach_coords(db, found)
+    stats['with_place'] = _attach_places(found)
+    vectors = {model: highlight_themes.theme_vectors(db, model)
+               for model in {item.model for item in found if item.vector is not None}}
+    stats['themes'] = highlight_themes.assign(
+        found, {model: value for model, value in vectors.items() if value}, params)
     stats['candidates'] = len(found)
     return found, stats
+
+
+def _attach_coords(db, items):
+    """Координат нет в оценке — берём из EXIF, который ядро собрало для превью сетки."""
+    missing = {item.path: item for item in items if item.lat is None or item.lon is None}
+    if not missing or not _table_exists(db, 'photo_thumbs'):
+        return
+    keys = list(missing)
+    for offset in range(0, len(keys), 500):
+        batch = keys[offset:offset + 500]
+        marks = ','.join('?' * len(batch))
+        for path, raw in db.execute(
+                f"SELECT path,metadata_json FROM photo_thumbs WHERE path IN ({marks}) "
+                "AND metadata_json LIKE '%latitude%'", batch):
+            try:
+                coords = (json.loads(raw) or {}).get('coords') or {}
+            except (TypeError, ValueError):
+                continue
+            if coords.get('latitude') is not None and coords.get('longitude') is not None:
+                missing[path].lat = float(coords['latitude'])
+                missing[path].lon = float(coords['longitude'])
+
+
+def _attach_places(items):
+    """Ближайший город по координатам; справочника нет — мест просто не будет."""
+    for item in items:
+        item.place = None
+    located = [item for item in items if item.lat is not None and item.lon is not None]
+    if not located:
+        return 0
+    try:
+        for item in located:
+            item.place = places.nearest(item.lat, item.lon)
+    except OSError:
+        return 0
+    return sum(item.place is not None for item in located)
 
 
 def _attach_vectors(db, items):
@@ -569,17 +625,110 @@ def year_groups(items, params, only=None, trace=None):
     return groups
 
 
-def event_groups(events, params, only=None, trace=None):
+def _majority(values, share, minimum):
+    """Самое частое значение, если оно набирает долю share и не меньше minimum раз."""
+    counts = {}
+    for value in values:
+        if value is not None:
+            counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return None
+    best, count = max(counts.items(), key=lambda pair: pair[1])
+    return best if count >= minimum and count >= share * len(values) else None
+
+
+def home_place(items):
+    """«Дом» — город, где снято больше всего кандидатов."""
+    counts = {}
+    for item in items:
+        if item.place is not None:
+            counts[item.place.id] = counts.get(item.place.id, 0) + 1
+    if not counts:
+        return None
+    ident = max(counts, key=counts.get)
+    return next(item.place for item in items if item.place is not None and item.place.id == ident)
+
+
+def event_groups(events, params, only=None, trace=None, home=None):
+    """События и поездки. Событие далеко от дома — поездка; главная тема — в названии."""
     groups = []
     for members in events:
         key = members[0].event
+        start, end = members[0].taken, members[-1].taken
+        located = [item.place for item in members if item.place is not None]
+        place_id = _majority([place.id for place in located], 0.5, 2)
+        place = next((item for item in located if item.id == place_id), None)
+        theme = _majority([item.theme for item in members], params['theme_share'], 3)
+        away = bool(place and home and places.distance_km(
+            place.lat, place.lon, home.lat, home.lon) >= params['trip_km'])
+        dates = day_range_title(start, end)
+        if away:
+            kind, group_key = 'trip', 'trip:' + key.split(':', 1)[1]
+            title = f'{place.name} · {dates}'
+            subtitle = place.country_name if place.country != home.country else 'Поездка'
+        else:
+            kind, group_key = 'event', key
+            title = f'{highlight_themes.TITLES[theme]} · {dates}' if theme else dates
+            subtitle = 'Событие'
+        if only and only not in (key, group_key):
+            continue
+        extra = {'duration_hours': round((members[-1].ts - members[0].ts) / 3600, 2),
+                 'theme': theme, 'place': place.name if place else None,
+                 'place_id': place.id if place else None}
+        group = build_group(kind, group_key, title, subtitle, members, (1.6, 4, 16), params, trace,
+                            min_representatives=4, extra_meta=extra)
+        if group and group['score'] >= params['min_event_score']:
+            groups.append(group)
+    return groups
+
+
+def theme_groups(items, params, only=None, trace=None):
+    """«Котики» за всё время и, если кадров много, по годам."""
+    by_theme = {}
+    for item in items:
+        if item.theme:
+            by_theme.setdefault(item.theme, []).append(item)
+    groups = []
+    for theme, members in sorted(by_theme.items()):
+        title = highlight_themes.TITLES[theme]
+        wanted = [(f'theme:{theme}', title, 'Лучшее за всё время', members, (2.2, 6, 30))]
+        by_year = {}
+        for item in members:
+            by_year.setdefault(item.taken.year, []).append(item)
+        for year, part in sorted(by_year.items()):
+            if len(part) >= params['theme_year_min'] and len(by_year) > 1:
+                wanted.append((f'theme:{theme}:{year}', f'{title} · {year}', f'Лучшее за {year} год',
+                               part, (1.8, 6, 20)))
+        for key, group_title, subtitle, part, size in wanted:
+            if only and key != only:
+                continue
+            group = build_group('theme', key, group_title, subtitle, part, size, params, trace,
+                                min_representatives=6, extra_meta={'theme': theme})
+            if group:
+                groups.append(group)
+    return groups
+
+
+def place_groups(items, params, only=None, trace=None, home=None):
+    """Подборка на город, где снято достаточно."""
+    by_place = {}
+    for item in items:
+        if item.place is not None:
+            by_place.setdefault(item.place.id, []).append(item)
+    groups = []
+    for ident, members in by_place.items():
+        if len(members) < params['place_min']:
+            continue
+        place = members[0].place
+        key = f'place:{ident}'
         if only and key != only:
             continue
-        start, end = members[0].taken, members[-1].taken
-        group = build_group('event', key, day_range_title(start, end), 'Событие',
-                            members, (1.6, 4, 16), params, trace, min_representatives=4,
-                            extra_meta={'duration_hours': round((members[-1].ts - members[0].ts) / 3600, 2)})
-        if group and group['score'] >= params['min_event_score']:
+        is_home = bool(home and home.id == ident)
+        group = build_group('place', key, place.name, 'Чаще всего снимали здесь' if is_home else place.country_name,
+                            members, (2.0, 6, 30), params, trace, min_representatives=6,
+                            extra_meta={'place_id': ident, 'country': place.country,
+                                        'lat': place.lat, 'lon': place.lon, 'home': is_home})
+        if group:
             groups.append(group)
     return groups
 
@@ -619,10 +768,18 @@ def generate(db, kinds=KINDS, today=None, params=None, stop=None, log=None):
     if log:
         log(f"highlights: {stats['candidates']} candidates, {len(events)} events; filtered {stats}")
     groups = []
+    home = home_place(items)
+    stats['home'] = home.name if home else None
+    eventish = []
+    if 'event' in kinds or 'trip' in kinds:
+        eventish = event_groups(events, params, home=home)
     builders = {
         'month': lambda: month_groups(items, params),
         'year': lambda: year_groups(items, params),
-        'event': lambda: event_groups(events, params),
+        'event': lambda: [group for group in eventish if group['kind'] == 'event'],
+        'trip': lambda: [group for group in eventish if group['kind'] == 'trip'],
+        'theme': lambda: theme_groups(items, params),
+        'place': lambda: place_groups(items, params, home=home),
         'on-this-day': lambda: on_this_day_groups(items, params, today),
     }
     for kind in kinds:
