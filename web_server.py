@@ -1336,18 +1336,12 @@ class App:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     box = []
                 # Старый photo_hashes мог содержать размер служебной миниатюры.
-                # Если рамка в него физически не помещается, берём заголовок
-                # оригинала и не декодируем весь снимок.
-                if (not video_media.is_video(path)
-                        and (not width or not height or
-                             (len(box) == 4 and (box[2] > width or box[3] > height)))):
-                    try:
-                        with self.open_image(self.file_for(path)) as source:
-                            width, height = source.size
-                            if source.getexif().get(274, 1) in {5, 6, 7, 8}:
-                                width, height = height, width
-                    except (OSError, ValueError, sources.SourceError):
-                        pass
+                # Рамка в него не помещается — размер не отдаём: просмотрщик
+                # меряет кадр сам. Оригинал здесь не открываем: на сотни лиц
+                # это сотни походов в источник, а у выключенного — по таймауту.
+                if (not video_media.is_video(path) and len(box) == 4 and width and height
+                        and (box[2] > width or box[3] > height)):
+                    width = height = None
                 details[face_id] = {
                     'path': path, 'track_start': track_start, 'track_stop': track_stop,
                     'blur': blur, 'taken': taken, 'dhash': curated_hash or plain_hash,
@@ -3831,6 +3825,7 @@ def main():
         hub = hub_module.Hub(args.data, args.hub_data or args.data, args.link_url,
                              str(args.ssh_key) if args.ssh_key else None)
         hub_module.serve_link(hub, args.host, args.link_port)
+        hub.health.start()
         print(f'Порт связи ядер: {args.link_port}', flush=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
