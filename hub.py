@@ -1174,16 +1174,18 @@ class RemoteSemantic:
         self.hub = hub
         self.cache = {}
 
-    def query(self, text, top=500):
-        key = text.casefold().strip()
+    def query(self, text, top=500, vector=''):
+        """С vector (base64 float32) — похожие на готовый снимок, модель ядру не нужна."""
+        key = ('v:' + hashlib.sha1(vector.encode()).hexdigest()) if vector else text.casefold().strip()
         if not key:
             return []
         if key in self.cache:
             return self.cache[key]
         try:
             core = self.hub.pick_core('visual')
+            payload = {'vector': vector, 'top': top} if vector else {'text': text, 'top': top}
             result = self.hub.core_call(core, '/api/core/semantic', 'POST',
-                                        {'text': text, 'top': top}, timeout=90).get('results', [])
+                                        payload, timeout=90).get('results', [])
         except Exception as exc:
             print(f'Semantic search unavailable: {exc}', file=sys.stderr, flush=True)
             return []

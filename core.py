@@ -545,7 +545,8 @@ class CoreHandler(BaseHTTPRequestHandler):
                 return self.json_response(self.app.components.issue_ticket())
             if path == '/api/core/semantic':
                 return self.json_response({'results': self.app.semantic.query(
-                    str(body.get('text') or ''), int(body.get('top') or 500))})
+                    str(body.get('text') or ''), int(body.get('top') or 500),
+                    vector=str(body.get('vector') or ''))})
             if path == '/api/core/fileop':
                 return self.json_response(self.app.file_operation(body))
             if path == '/api/core/refresh':
