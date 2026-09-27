@@ -1078,6 +1078,12 @@ class App:
         people_albums.ensure_schema(self.store.db)
         privacy.ensure_schema(self.store.db)
         pathrules.ensure_column(self.store.db)
+        # Лица по пути (страница галереи, карточки) и лента по дате: без этих
+        # индексов SQLite на каждый запрос строил временный или перебирал всё.
+        with self.store.db:
+            self.store.db.execute('CREATE INDEX IF NOT EXISTS faces_path ON faces(path)')
+            self.store.db.execute(
+                'CREATE INDEX IF NOT EXISTS photos_modified ON photos(modified DESC, path)')
         duplicates.ensure_schema(self.store.db)
         router_learning.connect(data).close()
         speaker_diarization.connect(data).close()
@@ -2012,11 +2018,15 @@ class App:
                     viewer, admin, hidden, wanted)
                 total = self.store.db.execute(
                     f'SELECT COUNT(*) {self.LIGHT_SOURCE}{where}', values).fetchone()[0]
-                # Свежие сверху — как в галерее телефона.
-                rows = self.store.db.execute(
-                    f'SELECT {self.PHOTO_COLUMNS} {self.PHOTO_SOURCE}{where} '
-                    'GROUP BY photos.path ORDER BY photos.modified DESC, photos.path '
-                    'LIMIT ? OFFSET ?', [*values, limit, offset]).fetchall()
+                # Свежие сверху — как в галерее телефона. Сначала страница путей
+                # лёгким запросом по индексу даты, потом полные строки только для
+                # неё: соединение всего каталога с лицами ради MIN(faces.id)
+                # стоило 1,6 с на каждую страницу.
+                page = [row[0] for row in self.store.db.execute(
+                    f'SELECT photos.path {self.LIGHT_SOURCE}{where} '
+                    'ORDER BY photos.modified DESC, photos.path '
+                    'LIMIT ? OFFSET ?', [*values, limit, offset])]
+                rows = self.hydrate(page)
         paths = [row[0] for row in rows]
         with self.lock:
             album_by_path = albums.photo_albums(self.store.db, paths)
