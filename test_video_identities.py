@@ -258,6 +258,34 @@ class CatalogTests(unittest.TestCase):
         profiles=vi.prototype_profiles(self.db,vi.load_tracks(self.db))
         self.assertEqual(sum(len(bank) for bank in profiles[1]['periods'].values()),1)
 
+    def test_profiles_without_one_file_match_full_recompute(self):
+        # Пересчёт «без этого файла» трогает только людей из файла, остальных
+        # берёт готовыми — итог тот же, что полный пересчёт из каталога.
+        self.db.execute("INSERT INTO people VALUES(1,'A','now')")
+        self.db.execute("INSERT INTO people VALUES(2,'B','now')")
+        for fid, person, path, angle in [(1,1,'a.jpg',0),(2,1,'b.jpg',.1),(3,2,'b.jpg',1.5),(4,2,'c.jpg',1.6)]:
+            self.db.execute("INSERT OR IGNORE INTO photos(path,status,kind) VALUES(?,'ok','photo')",(path,))
+            self.db.execute('INSERT INTO faces(id,path,box,embedding) VALUES(?,?,?,?)',
+                            (fid,path,'[0,0,100,100]',vector(angle).tobytes()))
+            self.db.execute('INSERT INTO face_people(face_id,person_id) VALUES(?,?)',(fid,person))
+        self.db.commit()
+        tracks=vi.load_tracks(self.db)
+        samples=vi.profile_samples(self.db,tracks)
+        base=vi.profiles_from(samples)
+        for path in ('a.jpg','b.jpg','c.jpg','none.jpg'):
+            fast=vi.profiles_from(samples,exclude_path=path,base=base)
+            full=vi.prototype_profiles(self.db,tracks,exclude_path=path)
+            self.assertEqual(sorted(fast),sorted(full),path)
+            for person in full:
+                self.assertEqual(fast[person]['counts'],full[person]['counts'],path)
+
+    def test_rebuild_reports_progress(self):
+        self.add(1)
+        seen=[]
+        vi.rebuild(self.db,progress=lambda message,done,total:seen.append(message))
+        self.assertIn('Узнаю людей на снимках',seen)
+        self.assertEqual(seen[-1],'Сохраняю группы')
+
     def test_stale_input_cannot_publish(self):
         self.add(1)
         revision=self.db.execute('PRAGMA data_version').fetchone()[0]
